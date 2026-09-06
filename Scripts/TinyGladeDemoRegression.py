@@ -111,7 +111,19 @@ def demo_house_ground():
     check("open arches grow frame bricks", bricks > 0, "bricks=%d" % bricks)
     # 每个洞两条曲线（上边界含门樘 / 下边界），门贴地所以只有上边界那条：
     # 6 个拱 × 一圈砖，砖长 26cm、拱周长约 (2×165 + π×55) ≈ 503cm ⇒ 每拱约 18 块。
-    check("frame brick count is in the right ballpark", 60 <= bricks <= 200, "bricks=%d" % bricks)
+    #
+    # ⚠️ 这个区间量的是 `get_frame_brick_count()`，而它是**四家共用一个组件**的总数。
+    # 2026-08-31 先后加入角石（恒 48）与包边，下限随之动过两次：
+    #   · 加角石 + 上下两道包边时 96(拱缘) + 48(角石) + 114(包边) = 258 ⇒ 下限 200；
+    #   · 同日核对 TG 后确认**墙顶那道压顶线脚在 TG 里根本不存在**，`bTrimTop` 默认改成 false
+    #     ⇒ 包边只剩贴地那道（有门时 40），实测 96 + 48 + 40 = 184 ⇒ 下限回到 150。
+    # 上限仍留 420，把"两道包边都打开"的合法配置圈在里面。
+    # 分家的判据在各自的访问器上（下面几节），这一条只负责"总量没有量级失控 / 没有被静默截断"。
+    check("frame brick count is in the right ballpark", 150 <= bricks <= 420, "bricks=%d" % bricks)
+    check("the four families add up to the frame total",
+          road_house.get_frame_brick_count()
+          == bricks and bricks > road_house.get_quoin_brick_count() + road_house.get_trim_brick_count(),
+          "bricks=%d quoin=%d trim=%d" % (bricks, road_house.get_quoin_brick_count(), road_house.get_trim_brick_count()))
 
     # ---- GPU 侧真值：CPU 记的砖数与 GPU 上那个被 indirect draw 消费的计数器必须相等 ----
     #
@@ -176,8 +188,17 @@ def demo_house_ground():
     road_house.rebuild_house()
     check("erasing the road closes every arch", road_house.get_open_door_count() == 0,
           "doors=%d" % road_house.get_open_door_count())
-    check("closing the arches removes the frame bricks", road_house.get_frame_brick_count() == 0,
-          "bricks=%d" % road_house.get_frame_brick_count())
+    # get_frame_brick_count() 是**四家共用一个组件**的总数：拱缘 + 接缝 + 角石 + 包边
+    # （2026-08-31 先后加入角石与包边）。后两家与路/门无关（包边的墙脚带会被门切段，但砖数只减不增，
+    # 且这里是"没有门"的状态）⇒ 擦掉路之后剩下的应当**恰好**是角石 + 包边。
+    # 写成算术等式而不是 `== 0`：判据的原意是"没有拱就没有拱缘砖"，那句话今天仍然为真，
+    # 只是"没有拱缘砖"不再等于"一块砖都没有"。
+    quoin_only = road_house.get_quoin_brick_count()
+    trim_only = road_house.get_trim_brick_count()
+    no_arch = quoin_only + trim_only
+    check("closing the arches leaves exactly the quoins and the trim",
+          road_house.get_frame_brick_count() == no_arch and quoin_only > 0 and trim_only > 0,
+          "bricks=%d quoin=%d trim=%d" % (road_house.get_frame_brick_count(), quoin_only, trim_only))
 
     # ---- 上一条只证明了 **CPU 的记录**是 0。GPU 上那个计数器呢？----
     #
@@ -197,8 +218,165 @@ def demo_house_ground():
     # 是个偶然。加上它，判据就不依赖"上面那句话恰好会重入几次"。
     road_house.reevaluate_site()
     gpu_bricks = road_house.debug_read_frame_brick_count_gpu_sync()
-    check("erasing the road zeroes the GPU brick counter too, not just the CPU record",
-          gpu_bricks == 0, "gpu=%d cpu=%d" % (gpu_bricks, road_house.get_frame_brick_count()))
+    # 同上：期望值从字面 0 换成角石那一份。**守门作用没有退化** —— 陈旧计数器留着的是
+    # "拱缘 + 角石"那一代的数（演示房子 6 拱时是三位数），与角石数差得很远，照样报红。
+    # ⚠️ 别把它改成 `gpu == get_frame_brick_count()`：那样两边同源，就成了自己跟自己比。
+    check("erasing the road leaves exactly the quoins and the trim on the GPU counter too, not just in the CPU record",
+          gpu_bricks == no_arch,
+          "gpu=%d cpu=%d no_arch=%d" % (gpu_bricks, road_house.get_frame_brick_count(), no_arch))
+
+    # ---- 角石（D7 墙自身转角，2026-08-31）：恒 4 根、与路/门无关 ----
+    check("a rectangular house always grows four quoin columns",
+          road_house.get_quoin_column_count() == 4, "columns=%d" % road_house.get_quoin_column_count())
+    quoin_before = road_house.get_quoin_brick_count()
+    paint_line(ground, loc.x, loc.y - 800.0, loc.x, loc.y + 800.0, 16)
+    road_house.reevaluate_site()
+    check("re-painting the road brings the arches back", road_house.get_open_door_count() > 0,
+          "doors=%d" % road_house.get_open_door_count())
+    # 角石不随门变：它只吃 footprint / 墙高。这条钉住"三家共用一个组件"没有把它们耦合起来。
+    check("the quoins are untouched by the road and the arches",
+          road_house.get_quoin_brick_count() == quoin_before,
+          "quoin=%d before=%d" % (road_house.get_quoin_brick_count(), quoin_before))
+    check("the frame now carries arches on top of the quoins",
+          road_house.get_frame_brick_count() > quoin_before,
+          "bricks=%d quoin=%d" % (road_house.get_frame_brick_count(), quoin_before))
+
+    # ---- 包边石（D7 第三样，2026-08-31）：墙顶整圈、墙脚被门切开 ----
+    #
+    # ⚠️ **墙脚那条带的段数才是这个模块的判据。** 不切洞的话勒脚石会从门口正中一路铺过去，
+    # 而砖数 / 零阻塞 / 三角形数**所有断言都不会红**（本轮加它就是为了防这个）。
+    # 演示关卡的路是南北向、拱开在两面长墙（0/2 号）上，所以门一开墙脚段数必然多出来。
+    # ⚠️ **墙顶压顶石默认已关**（2026-08-31 用户裁决：TG 里没有上沿）。机制留着，所以这里
+    # 先断言默认真的是关的，再打开验一遍整圈 4 段 —— 只断言"关着"会让整条通路失去覆盖，
+    # 而它与墙脚勒脚共用同一份 `CSHouseTrim::BuildBand`。
+    check("the top trim is off by default (TG has no coping course)",
+          road_house.get_trim_top_run_count() == 0, "runs=%d" % road_house.get_trim_top_run_count())
+    road_house.set_editor_property("bTrimTop", True)
+    road_house.rebuild_house()
+    check("switching the top trim on runs it round the whole perimeter",
+          road_house.get_trim_top_run_count() == 4, "runs=%d" % road_house.get_trim_top_run_count())
+    road_house.set_editor_property("bTrimTop", False)
+    road_house.rebuild_house()
+    check("the ground-level arches cut the base trim into more than four runs",
+          road_house.get_trim_base_run_count() > 4,
+          "base_runs=%d doors=%d" % (road_house.get_trim_base_run_count(), road_house.get_open_door_count()))
+    trim_with_doors = road_house.get_trim_brick_count()
+
+    ground.reset_paint()
+    road_house.reevaluate_site()
+
+    # 擦掉路 ⇒ 门没了 ⇒ 墙脚带合回四段、砖也变多。这条与上一条互为对照：只有"切了"才会有差。
+    check("erasing the road heals the base trim back to four runs",
+          road_house.get_trim_base_run_count() == 4, "base_runs=%d" % road_house.get_trim_base_run_count())
+    check("the healed base trim carries more bricks than the cut one",
+          road_house.get_trim_brick_count() > trim_with_doors,
+          "trim=%d with_doors=%d" % (road_house.get_trim_brick_count(), trim_with_doors))
+
+    # ---- 屋面瓦（CSHouseTile，2026-08-31）：四坡的屋面**全部**由瓦铺成 ----
+    #
+    # ⚠️ **`get_roof_tile_undrawable_reason()` 那条才是重点，数量断言只是它的前提。**
+    # 房体三角汤里一片屋面都没有（双坡实体板已随四坡重构删除）⇒ 瓦这条路一断，屋顶就整个消失，
+    # 而三角形数 / 砖数 / 零阻塞**全部照绿**。资产侧刚栽过一次：`RoofTileMesh` 在关卡与 CDO 里
+    # 都是空的（"留空 = 不铺瓦"），从落地到发现之间没有任何断言报红。
+    tiles = road_house.get_roof_tile_count()
+    tile_why = str(road_house.get_roof_tile_undrawable_reason())
+    check("the roof tiles are actually drawable (mesh/material/streams/instancing flag)",
+          tile_why == "", tile_why)
+    check("a hip roof grows tiles", tiles > 0, "tiles=%d" % tiles)
+
+    # 瓦数随 footprint 走：屋面是"内距参数化"的四个梯形，房子拉大 ⇒ 每个坡面都变长 ⇒ 瓦变多。
+    # 这条同时守住"排布真的读了 footprint"——写死份数的实现会在这里报红。
+    tile_base = tiles
+    # ⚠️ **必须把分量快照成浮点数**：`get_editor_property` 回的是活引用，直接留着它当"原值"，
+    # 下面 set 完再拿它还原等于把放大后的值又写了一遍 —— 症状是"还原之后瓦数不回去"，
+    # 看着像重建的哈希漏了缩小方向（第一版就是这么误诊的，实测 tiles 停在 128）。
+    fp_get = road_house.get_editor_property("FootprintSize")
+    fp_x, fp_y = float(fp_get.x), float(fp_get.y)
+    road_house.set_editor_property("FootprintSize", unreal.Vector2D(fp_x * 1.6, fp_y * 1.6))
+    road_house.rebuild_house()
+    check("a bigger footprint grows more tiles",
+          road_house.get_roof_tile_count() > tile_base,
+          "tiles=%d base=%d" % (road_house.get_roof_tile_count(), tile_base))
+    road_house.set_editor_property("FootprintSize", unreal.Vector2D(fp_x, fp_y))
+    road_house.rebuild_house()
+    check("shrinking it back restores the tile count",
+          road_house.get_roof_tile_count() == tile_base,
+          "tiles=%d base=%d" % (road_house.get_roof_tile_count(), tile_base))
+
+    # 关掉即整面消失（出图脚本靠它拍同机位对照；也证明瓦确实是屋面的唯一来源）。
+    road_house.set_editor_property("bRoofTilesEnabled", False)
+    road_house.rebuild_house()
+    check("turning the tiles off empties the roof", road_house.get_roof_tile_count() == 0,
+          "tiles=%d" % road_house.get_roof_tile_count())
+    road_house.set_editor_property("bRoofTilesEnabled", True)
+    road_house.rebuild_house()
+    check("turning them back on refills it", road_house.get_roof_tile_count() == tile_base,
+          "tiles=%d base=%d" % (road_house.get_roof_tile_count(), tile_base))
+
+    # ---- 尖顶（2026-08-31）：脊端点那两处"两条角斜脊 + 一条屋脊"三面交汇的破口 ----
+    #
+    # ⚠️ 同瓦：**`get_roof_finial_undrawable_reason()` 那条才是重点。** 尖顶走的是普通
+    # `UStaticMeshComponent`，材质槽空掉时组件照画（退回引擎默认表面材质）⇒ 画面上一根灰柱子，
+    # 而"根数 == 2"照绿。资产没接上时同样一个断言都不会红（"留空 = 不长"）。
+    finials = road_house.get_roof_finial_count()
+    finial_why = str(road_house.get_roof_finial_undrawable_reason())
+    check("the roof finials are actually drawable (mesh/registration/material slot)",
+          finial_why == "", finial_why)
+    # 矩形底面 ⇒ 脊有长度 ⇒ 两端各一根。
+    check("a hip roof stands a finial at each ridge end", finials == 2, "finials=%d" % finials)
+
+    # **退化那一条**：正方形底面脊长为 0、两端重合 ⇒ 只剩一根（金字塔尖）。这是"不给金字塔写
+    # 特例"的形式化 —— 写了特例的实现会在这里给出 2 或 0。
+    road_house.set_editor_property("FootprintSize", unreal.Vector2D(fp_x, fp_x))
+    road_house.rebuild_house()
+    check("a square footprint degenerates to a single finial at the pyramid tip",
+          road_house.get_roof_finial_count() == 1,
+          "finials=%d" % road_house.get_roof_finial_count())
+    road_house.set_editor_property("FootprintSize", unreal.Vector2D(fp_x, fp_y))
+    road_house.rebuild_house()
+    check("going back to a rectangle brings the second finial back",
+          road_house.get_roof_finial_count() == 2,
+          "finials=%d" % road_house.get_roof_finial_count())
+
+    # 撤资产 ⇒ 组件必须**销毁**而不是留着（留着的话换资产时会先画一帧旧网格），
+    # 且原因串要说得出是哪一环断的。
+    road_house.set_editor_property("RoofFinialMesh", None)
+    road_house.rebuild_house()
+    check("clearing the finial mesh takes them down", road_house.get_roof_finial_count() == 0,
+          "finials=%d" % road_house.get_roof_finial_count())
+    why_off = str(road_house.get_roof_finial_undrawable_reason())
+    check("and the reason string says which link broke", why_off != "", why_off)
+    road_house.set_editor_property("RoofFinialMesh",
+                                   unreal.EditorAssetLibrary.load_asset(
+                                       "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/roof_spire"))
+    road_house.rebuild_house()
+    check("putting the mesh back stands them up again", road_house.get_roof_finial_count() == 2,
+          "finials=%d" % road_house.get_roof_finial_count())
+
+    # ---- 「一块砖都没有」那条分支：角石上线后演示里不再自然可达，必须显式走一遍 ----
+    #
+    # `RebuildFrame` 的 `BrickCount == 0` 分支要在撤实例源**之前**把 GPU counter 清零，否则
+    # 下一次 `EnsureFrameComponent` 会把同一批 buffer 连着陈旧计数器交回去，画面上砖原样立着
+    # 而所有数值断言照绿（那段注释里记了 2026-08-31 出图抓到的现场）。
+    # 角石恒出砖 ⇒ 擦掉路已经不再让总数归零 ⇒ 这条分支从此只能靠关掉角石来触发。
+    # **不补这一段，上面那个守门人就在这一轮悄悄失效了。**
+    road_house.set_editor_property("bQuoinEnabled", False)
+    road_house.set_editor_property("bTrimEnabled", False)
+    road_house.reevaluate_site()
+    check("with no road, no quoins and no trim the frame really is empty",
+          road_house.get_frame_brick_count() == 0, "bricks=%d" % road_house.get_frame_brick_count())
+    road_house.reevaluate_site()
+    empty_gpu = road_house.debug_read_frame_brick_count_gpu_sync()
+    check("the empty frame zeroes the GPU counter too, not just the CPU record",
+          empty_gpu == 0, "gpu=%d cpu=%d" % (empty_gpu, road_house.get_frame_brick_count()))
+    road_house.set_editor_property("bQuoinEnabled", True)
+    road_house.set_editor_property("bTrimEnabled", True)
+    road_house.reevaluate_site()
+    check("turning the quoins back on brings them back",
+          road_house.get_quoin_brick_count() == quoin_before,
+          "quoin=%d before=%d" % (road_house.get_quoin_brick_count(), quoin_before))
+    check("turning the trim back on brings it back",
+          road_house.get_trim_brick_count() > 0, "trim=%d" % road_house.get_trim_brick_count())
 
     # ---- 承重柱：HeightOffset=150 ⇒ 落座 z=150，周界 6 柱 ----
     pillar_house.reevaluate_site()
@@ -254,21 +432,6 @@ def demo_house_ground():
     ground.end_paint_stroke()
     ground.reset_paint()
     road_house.rebuild_house()
-
-    # ---- 脊向滞回：长短轴穿越时屋顶不翻面 ----
-    axis_before = road_house.get_editor_property("RidgeAxis")
-    road_house.set_editor_property("FootprintSize", unreal.Vector2D(600.0, 620.0))   # Y 只长 3%，在滞回带内
-    road_house.reevaluate_site()
-    check("inside the hysteresis band the ridge holds",
-          road_house.get_editor_property("RidgeAxis") == axis_before,
-          "axis=%s (was %s)" % (road_house.get_editor_property("RidgeAxis"), axis_before))
-    road_house.set_editor_property("FootprintSize", unreal.Vector2D(600.0, 900.0))   # 远超 1.15 倍
-    road_house.reevaluate_site()
-    check("clearly past the band the ridge flips",
-          road_house.get_editor_property("RidgeAxis") != axis_before,
-          "axis=%s" % road_house.get_editor_property("RidgeAxis"))
-    road_house.set_editor_property("FootprintSize", unreal.Vector2D(600.0, 400.0))
-    road_house.reevaluate_site()
 
     # ---- P2 验收门：**拉尺寸**期间零阻塞刷新 ----
     # 上面三条同族断言测的是“平移”与“落笔”，**没有一条改过 FootprintSize**，
@@ -474,10 +637,10 @@ def demo_terrain_ops():
 # 星形"的闭式解求半径，接合处那段等值线不属于任何一座，必然断段；marching squares 扫的是
 # 合成之后的场，接合处只是普通的一格。
 # =============================================================================
-STAIR_MESH = "/Game/TinyGlade/Meshes/stairs_step/StaticMeshes/stairs_step.stairs_step"   # 实测 100×100×100 cm 居中立方体
+STAIR_MESH = "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/stairs_step.stairs_step"   # 实测 100×100×100 cm 居中立方体
 # TG 的 15% 支线用的就是这颗（`_rocky_terrain_stairs_stairs.cs:511-547`）。原件最长轴实测 1.352 m，
 # TG 的 mix(0.2, 0.4) 因此是 27–54 cm —— `StairPebbleSize` 的默认值就是这么来的。
-PEBBLE_MESH = "/Game/TinyGlade/Meshes/stairs_pebble/StaticMeshes/stairs_pebble.stairs_pebble"
+PEBBLE_MESH = "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/stairs_pebble.stairs_pebble"
 
 
 def read_stairs(ground):
@@ -705,8 +868,14 @@ def demo_gpu_stairs():
     gpu_pebbles = ground.debug_read_stair_pebble_count_gpu_sync()
     check("erasing the road zeroes the GPU pebble counter too", gpu_pebbles == 0, "gpu=%d" % gpu_pebbles)
 
-    ground.set_editor_property("StairMesh", None)   # 关掉整条路径，别影响后续用例/出图
-    ground.set_editor_property("StairPebbleMesh", None)
+    # ⚠️ 收尾必须把两张网格**放回去**，不能留 None。
+    # `StairMesh` 留空就是「整条石阶路径关闭」那个开关（见 `CSGroundActor.h` 的属性注释），
+    # 也就是说这里的“关掉”是直接把**授权数据**抹了。而后续每一节开头都自己
+    # `load_map`，本来就不会被上一节的内存状态污染 —— 留 None 一点收益都没有，
+    # 只留下一个陷阱：跑完回归后谁在编辑器里顺手 Ctrl+S，这两条引用就永久没了
+    # （2026-09-05 就是这么丢的，连带 CDO 一起空了五个）。
+    ground.set_editor_property("StairMesh", step_mesh)
+    ground.set_editor_property("StairPebbleMesh", pebble_mesh)
     ground.rebuild_stairs()
 
 
@@ -750,8 +919,37 @@ def demo_rock_shell():
     if not (ground and shaper):
         return
 
+    # ---- ⚠️ 这一条必须排在**任何重建之前**，否则它会被自己治好 ----
+    #
+    # 2026-08-31 实测缺陷：加载时序是"塑形物先注册、后落变换"，于是岩壳先按"塑形物在原点"
+    # 披挂了一趟；而镜像是序列化的、本来就对 ⇒ `RefreshHeightsInRegion` 的 `!bChanged`
+    # 早退门直接 return，函数尾部那三条派生链重建**永远到不了** ⇒ 壳永久停在陈旧位移上。
+    # 症状：碎石长在地图另一头，而 SampleHeight 正常、本节原有的三条断言（skirt/plateau/flat
+    # 都是**相对塑形物自身位置**分类的）**全绿**。实测 293 个活三角、质心离土台 81.7 m。
+    #
+    # 本节下面每一句 set_editor_property / rebuild_terrain / reset_paint 都会把它治好，
+    # 所以判据只能放在这里。
+    c0 = shaper.get_actor_location()
+    reach0 = shaper.get_editor_property("Radius") + shaper.get_editor_property("FalloffDistance")
+    _n0, pos0 = read_shell(ground)
+    live0 = [pos0[i * 3] for i in range(len(pos0) // 3) if shell_alive(pos0, i)]
+    if live0:
+        gx = sum(p.x for p in live0) / len(live0)
+        gy = sum(p.y for p in live0) / len(live0)
+        d0 = ((gx - c0.x) ** 2 + (gy - c0.y) ** 2) ** 0.5
+        check("straight after load the shell already hugs the shaper (no rebuild needed)",
+              d0 <= reach0,
+              "alive=%d centroid=(%.0f, %.0f) shaper=(%.0f, %.0f) dist=%.0f reach=%.0f"
+              % (len(live0), gx, gy, c0.x, c0.y, d0, reach0))
+    else:
+        check("straight after load the shell already hugs the shaper (no rebuild needed)",
+              False, "alive=0 —— 加载后一个活三角都没有")
+
     ground.set_editor_property("bRockShell", True)
-    ground.set_editor_property("StairMesh", None)   # 本节量的是岩壳，少一条 GPU 路少一份噪声
+    # 本节量的是岩壳，少一条 GPU 路少一份噪声 —— 但只能**暂关**：
+    # 先存下来，本节末尾原样接回去，别把 None 留在关卡里（同上一节的理由）。
+    stair_mesh_saved = ground.get_editor_property("StairMesh")
+    ground.set_editor_property("StairMesh", None)
     ground.reset_paint()
     shaper.rebuild_terrain()
 
@@ -816,6 +1014,80 @@ def demo_rock_shell():
     check("the shell grows on the steep skirt", on_skirt > 50, "skirt=%d" % on_skirt)
     check("no shell on the flat plateau", on_plateau == 0, "plateau=%d" % on_plateau)
     check("no shell on the flat ground beyond the falloff", on_flat == 0, "flat=%d" % on_flat)
+
+    # ---- 壳的绝对形态：TG 口径（2026-08-31 看图裁决后重写本段）----
+    #
+    # 原来这里是「石头隆起」③ 的执行面（内圈均值必须 > 0）。那组参数的默认已归中性 ——
+    # 1.25 倍无界抬升在演示档下把顶圈顶得比台顶高约 2 m，画面读成一圈**独立的火山口壁**，
+    # 而全部断言照绿（单测在中性档量披挂、只量倍数差值，这里只查了符号）。倍数的差值
+    # 仍由单测 ⓒ' 钉着；本段改钉**默认档的绝对形态**：
+    #   · 反火山口：内圈没有任何顶点高出局部地面一个有界预算（TG 的壳从不离开地形）；
+    #   · ⑧ 外缘不许悬空、平均扎在地面以下。
+    #
+    # ⚠️ 判据量的是「顶点 Z − 该点地面高度」，而顶点 Z 里除了偏移还含**壳自己的厚度**
+    # （`CellRelief` 沿法线 ±，顶圈朝上）与表面起伏。所以外缘那条不能写成"必须为负"——
+    # 正确的口径是"高出去的部分不许超过壳自身的厚度"，也就是石头没有整片飘起来。
+    base_z = ground.get_actor_location().z
+    relief = ground.get_editor_property("RockShellCellRelief")
+    surf_noise = ground.get_editor_property("RockShellNoiseAmount")
+    base_lift = ground.get_editor_property("RockShellBaseLift")
+    # ⚠️ `RockShellNoiseAmount` 自 2026-08-31 起是**坡度 = 1 时的满幅**，不是常幅
+    # （照 TG `displace:721`，幅度 ∝ 坡度）。上界因此要乘本档土台的最大坡度
+    # `Lift × 1.5 / Falloff`（剖面是 smoothstep，最大斜率 1.5）；写成常数会低估上界。
+    max_slope = shaper.get_editor_property("LiftHeight") * 1.5 / max(falloff, 1.0)
+    chip = ground.get_editor_property("RockShellChipAmount")
+    lift_budget = relief + surf_noise * max_slope + chip + 5.0   # 5 cm 给双线性采样与浮点留量
+
+    inner_d, outer_d = [], []
+    for t in range(tri_count):
+        if not shell_alive(pos, t):
+            continue
+        p3 = pos[t * 3]
+        r = math.hypot(p3.x - c.x, p3.y - c.y)
+        if not (radius < r < reach):
+            continue
+        d = p3.z - (base_z + ground.sample_height(unreal.Vector2D(p3.x, p3.y)))
+        if r < radius + 0.45 * falloff:
+            inner_d.append(d)
+        elif r > radius + 0.85 * falloff:
+            outer_d.append(d)
+
+    if inner_d and outer_d:
+        mean_in = sum(inner_d) / len(inner_d)
+        mean_out = sum(outer_d) / len(outer_d)
+        worst_in = max(inner_d)
+        worst_out = max(outer_d)
+        # 反火山口：内圈（含台肩 —— 石墙冠长的地方）最高的顶点也不许超过有界预算。
+        #
+        # ⚠️ 预算里的 √(1+坡度²) 不能省（第一版没乘，在**正确的**壳上误报 161 > 129）：
+        # 厚度与起伏都是**沿地形法线**的位移，而这里量的是「顶点 Z − 顶点自己 XY 处的地面」——
+        # 法线位移把顶点水平推向下坡侧，脚下的地面跟着降，竖直偏差 = 法线位移 × √(1+g²)，
+        # 52° 坡上是 1.65 倍**放大**（直觉里的 ×N.z 衰减是反的）。单测 ⓒ 除以 √(1+g²) 折成
+        # 垂距就是在消同一件事。基准浮起是沿世界 Z 的，不乘。
+        # 火山口缺陷态实测 +260 cm 上下，仍旧一眼红；TG 形态实测 161 ≤ 175。
+        slope_factor = math.sqrt(1.0 + max_slope * max_slope)
+        crown_budget = base_lift + (relief + surf_noise * max_slope + chip) * slope_factor + 40.0
+        check("no rampart crown: the shell never leaves the terrain (TG shape)",
+              worst_in <= crown_budget,
+              "worstInner=%.1f cm budget=%.1f meanInner=%.1f n=%d"
+              % (worst_in, crown_budget, mean_in, len(inner_d)))
+        # ⑧：外圈不许整片飘着；高出去的部分不能超过壳自身厚度。
+        check("the outer edge tucks back into the ground (it never floats)",
+              worst_out <= lift_budget,
+              "worstOuter=%.1f cm budget=%.1f (relief=%.0f noise=%.0f x slope=%.2f) meanOuter=%.1f n=%d"
+              % (worst_out, lift_budget, relief, surf_noise, max_slope, mean_out, len(outer_d)))
+        # ⑧'：上面那条的上界跟着 `NoiseAmount` 一起涨，涨到某个值之后它就不再是个门。
+        # 所以再钉一条**与调参量无关**的：外圈**平均**必须在地面**以下** —— 石头是扎回地里的，
+        # 不是刚好蹭着地面。TG `:563` 的基准偏移在 `Rock → 0` 处取满 −BaseSink，正是它的执行面
+        # （实测：这条在基准偏移落地前也成立，只是余量只有 2.8 cm；落地后是 42 cm）。
+        check("the outer edge sits below the ground on average (not just barely grazing it)",
+              mean_out < 0.0, "meanOuter=%.1f cm n=%d" % (mean_out, len(outer_d)))
+        # 夹具自证：内外两圈**确实**有差，否则上面两条可能只是在同一批点上恒真。
+        check("the inner skirt really does stand higher than the outer edge",
+              mean_in > mean_out, "meanInner=%.1f meanOuter=%.1f" % (mean_in, mean_out))
+    else:
+        check("there are inner and outer skirt samples to measure the rise with",
+              False, "inner=%d outer=%d" % (len(inner_d), len(outer_d)))
 
     # ---- ② 画路 ⇒ **连续下沉**，不是消失 ----
     before = pos
@@ -898,11 +1170,13 @@ def demo_rock_shell():
     shaper.set_editor_property("LiftHeight", saved[5])
     shaper.rebuild_terrain()
 
+    ground.set_editor_property("StairMesh", stair_mesh_saved)   # 本节开头暂关的那条路，原样接回去
+
 
 
 SKIRT_MESHES = ["barrel", "firewood", "basket"]
 SKIRT_MATERIAL = "/PCGPlugins/HouseTest/M_TinyGladeDecor.M_TinyGladeDecor"
-CLUTTER = "/Game/TinyGlade/Meshes/clutter/%s/StaticMeshes/%s.%s"
+CLUTTER = "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/%s.%s"
 
 
 def demo_skirt_decor():
@@ -923,7 +1197,7 @@ def demo_skirt_decor():
     ground = find("Ground_Demo")
     shaper = find("Shaper_Mound")
     material = unreal.load_asset(SKIRT_MATERIAL)
-    meshes = [unreal.load_asset(CLUTTER % (n, n, n)) for n in SKIRT_MESHES]
+    meshes = [unreal.load_asset(CLUTTER % (n, n)) for n in SKIRT_MESHES]
     check("skirt: actors present", ground and shaper)
     check("skirt: the clutter meshes are present", all(m is not None for m in meshes),
           "meshes=%s" % [n for n, m in zip(SKIRT_MESHES, meshes) if m is None])
@@ -1151,21 +1425,6 @@ def demo_house_vine():
     check("vine rebuild is idempotent", house.get_vine_segment_count() == branches,
           "branches=%d" % house.get_vine_segment_count())
 
-    # ---- 山墙三角：藤爬过檐口（第二档）----
-    # ⚠️ 判据是**关掉之后段数必须变少**，不是"开着的时候段数大于某个常数"：后者在
-    # 山墙那两面一段都没多长时照样绿（它只要总数够大就行），而这一条只有山墙真的多长了藤
-    # 才成立。关掉 / 打开各测一次，末了恢复默认，别把状态留给下一节。
-    house.set_editor_property("bVineClimbGable", False)
-    house.rebuild_house()
-    no_gable = house.get_vine_segment_count()
-    house.set_editor_property("bVineClimbGable", True)
-    house.rebuild_house()
-    check("vines climb the gable triangle above the eave", branches > no_gable,
-          "climb=%d no-climb=%d" % (branches, no_gable))
-    check("turning gable climbing back on restores exactly the same vines",
-          house.get_vine_segment_count() == branches,
-          "branches=%d want=%d" % (house.get_vine_segment_count(), branches))
-
     # ---- 开门 ⇒ 藤避让墙洞（TG 的 `ivy_grower` 读集里有 `PrevWallHoles`）----
     loc = house.get_actor_location()
     paint_line(ground, loc.x, loc.y - 800.0, loc.x, loc.y + 800.0, 17)
@@ -1381,10 +1640,13 @@ def demo_house_window():
     win_tris = settle_tris(house.get_tiny_glade_mesh())
     check("the sill boxes add real geometry (holes are clipped, sills are solid)", win_tris > base_tris,
           "tris=%d (was %d)" % (win_tris, base_tris))
-    # 窗台与窗楣那圈砖：一扇窗一条闭合砖路（左樘 + 平顶 + 右樘 + **窗台底边**），
-    # 周长 (110 + 78) x 2 = 376 cm、砖长 26 ⇒ 每扇约 14 块。
+    # ⚠️ **窗不再长框砖**（2026-09-06 裁决翻面）：洞缘归附属物自带的预制框盖，房子再砌一圈
+    # 就是双份几何 —— TG 那边窗洞周围同样一条砖路都没有。所以判据从"多出一圈砖"翻成
+    # **"一块砖都不多"**。⚠️ 这条必须**逐位相等**而不是"不超过"：只判上界的话，将来谁把
+    # 窗又接回框砖那条路，砖数涨回去也照样绿。
     win_bricks = house.get_frame_brick_count()
-    check("each window grows its own ring of frame bricks", win_bricks >= base_bricks + 3 * 10,
+    check("windows grow no frame bricks at all (the prefab frame covers the edge)",
+          win_bricks == base_bricks,
           "bricks=%d (was %d)" % (win_bricks, base_bricks))
 
     # ---- 它真的会被画出来（渲染侧逐环 + 墙材质必须是 Masked）----
@@ -1392,6 +1654,30 @@ def demo_house_window():
     why = str(house.get_window_undrawable_reason())
     check("the window is actually drawable (body/Masked wall material/frame bricks/ISM-capable material)",
           why == "", why)
+
+    # ---- 可画性不许挂在**门**的砖上（2026-09-06 退框砖之后的一枪）----
+    #
+    # ⚠️ 上面那条 `why == ""` 在演示关卡里**会因为错误的理由通过**：老判据要求"排出过框砖"，
+    # 而这栋房的门/角石/包边本来就在排砖。窗自己已经一块砖都不出了，所以必须把那些家全关掉、
+    # 只剩窗，再问一次 —— 老代码在这里会答"一块门框砖都没排出来"。
+    keep = (house.get_editor_property("bQuoinEnabled"),
+            house.get_editor_property("bTrimEnabled"),
+            house.get_editor_property("bSeamEnabled"))
+    house.set_editor_property("bQuoinEnabled", False)
+    house.set_editor_property("bTrimEnabled", False)
+    house.set_editor_property("bSeamEnabled", False)
+    house.rebuild_house()
+    bare_bricks = house.get_frame_brick_count()
+    bare_why = str(house.get_window_undrawable_reason())
+    check("a house with windows but not one single brick still draws its windows",
+          bare_why == "" and house.get_window_count() > 0,
+          "bricks=%d windows=%d why=%s" % (bare_bricks, house.get_window_count(), bare_why or "<ok>"))
+    check("...and that case is real, not vacuous (the brick component really is empty)",
+          bare_bricks == 0, "bricks=%d" % bare_bricks)
+    house.set_editor_property("bQuoinEnabled", keep[0])
+    house.set_editor_property("bTrimEnabled", keep[1])
+    house.set_editor_property("bSeamEnabled", keep[2])
+    house.rebuild_house()
 
     # ---- 幂等：同一世界状态再复评一次，窗一扇都不许变 ----
     house.reevaluate_site()
@@ -1438,8 +1724,9 @@ def demo_house_window():
     #
     # 起始尺寸显式钉死再 rebuild_house()，与藤蔓/摆件那两条同族断言逐字同形：
     # 一次性的容量与包围盒成本付在 rebuild 里，不许落进测量窗口。
-    # 窗让每个洞的砖路多出第四段（窗台底边），容量却仍是常量（FrameReserveCapacity 一次预留）
-    # —— 这条钉的就是"别为了窗把扩容加回来"。
+    # ⚠️ 2026-09-06 起窗**不再长框砖**，所以这一条量的已经不是"第四段砖路的成本"，
+    # 而是纯粹的洞：拉尺寸时每帧重算 clip 场与洞表，容量仍是常量（FrameReserveCapacity
+    # 一次预留）。带标记的那一条在下面单独有一段（`SnapToAnchor` 每帧写 transform）。
     house.set_editor_property("Windows", windows)
     house.set_editor_property("FootprintSize", unreal.Vector2D(600.0, 400.0))
     house.rebuild_house()
@@ -1472,6 +1759,218 @@ def demo_house_window():
     house.set_editor_property("Windows", [])
     ground.reset_paint()
     house.rebuild_house()
+
+    # ---- ACSWindowMarker（D8 主体，2026-08-31）：标记提诉求，房子照旧只认谓词 ----
+    #
+    # 单测已经在裸 world 里把"解析 → 登记 → 被拒 → 换宿主 → 注销"跑通了。这里补的是单测给不了的
+    # 那一维：**真演示房 + 真道路**。两条只有在这里才成立的判据 ——
+    #   ① 标记那份诉求与属性面板那份 `Windows` **并存**，谁也不覆盖谁（两条不同的身份来源）；
+    #   ② 在编辑器 world 里删掉标记，洞必须跟着合拢。`EndPlay` 在编辑器 world 一次都不发
+    #      （那个 world 没有 begun play），只写 `EndPlay` 的症状是"删了标记洞还在"，
+    #      **而 PIE 里一切正常** —— 2026-08-31 就是被单测抓住的，这里再钉一道。
+    sub = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    loc = house.get_actor_location()
+    # 摆到短墙（边 1，+X 侧）外面朝 -X：与上面那三扇窗同一条理由 —— 长墙会被拱整条吃掉。
+    half_x = house.get_editor_property("FootprintSize").x * 0.5
+
+    # ---- 笔刷落笔：一条射线打上墙，出一扇窗（2026-09-06 用户裁决：笔刷是唯一入口）----
+    #
+    # 测的是**执行面** `PlaceMarkerAlongRay`，不是 EdMode —— 与抓手族纪律 ⑤ 同型：编辑器那层
+    # （`FCSWindowBrushEdMode`）只是触发器，无头这边直接调它要调的那个函数，不需要视口和 Slate。
+    #
+    # ⚠️ 这条替掉的是原来「把窗蓝图拖进视口」那条路的断言。拖放脆在**朝向什么时候被应用**：
+    # `UEditorEngine::AddActor` 把 Rotation 一起传给 `SpawnActor`（回调时朝向已对），而
+    # `EditorActorSubsystem` 那条是先放置、回调之后才 `SetActorLocationAndRotation`（回调那一刻
+    # forward 还是默认 +X，实测咬上 11 m 外的另一栋房）。点击给的是相机射线 + 精确命中点，
+    # 不依赖 actor 自身朝向 —— 从根上没有那个问题，所以那条路连同它的三道闸一起退役了。
+    hs = unreal.CSHouseSubsystem.get_house_subsystem(house)
+    check("the house subsystem is reachable from script (world subsystems have no Python binding)",
+          hs is not None)
+    half_y = house.get_editor_property("FootprintSize").y * 0.5
+    placed = hs.place_marker_along_ray(
+        unreal.CSWindowMarker,
+        unreal.Vector(loc.x - 150.0, loc.y - half_y - 120.0, loc.z + 150.0),
+        unreal.Vector(0.0, 1.0, 0.0), 400.0) if hs else None
+    check("one brush click on a wall cuts exactly one window",
+          placed is not None and house.get_window_count() == 1
+          and house.get_feature_marker_count() == 1 and placed.causes_cut(),
+          "windows=%d markers=%d host=%s cut=%s"
+          % (house.get_window_count(), house.get_feature_marker_count(),
+             placed.get_host().get_actor_label() if (placed and placed.get_host()) else "None",
+             placed.causes_cut() if placed else "n/a"))
+    # ⚠️ **打空必须什么都不生成**。拖放那条路是"先落一个 actor、再问我贴在谁身上"，于是要有
+    # 一整套"找不到宿主要不要自毁"；这条路根本不生成，没有游离标记这种状态 —— 只判返回值为空
+    # 是不够的，必须连计数一起判，否则"生成了但没登记"会静静地漏过去。
+    before_miss = (house.get_window_count(), house.get_feature_marker_count())
+    miss = hs.place_marker_along_ray(
+        unreal.CSWindowMarker, unreal.Vector(loc.x, loc.y - 5000.0, loc.z + 5000.0),
+        unreal.Vector(0.0, 0.0, 1.0), 400.0) if hs else None
+    check("a click that misses every wall creates nothing at all",
+          miss is None and before_miss == (house.get_window_count(), house.get_feature_marker_count()),
+          "returned=%s counts %s -> (%d, %d)"
+          % ("None" if miss is None else "an actor", before_miss,
+             house.get_window_count(), house.get_feature_marker_count()))
+    # 换一档窗 ⇒ 洞跟着那一档的 `OpeningMesh` 走，C++ 一行不用改。
+    gothic_bp = unreal.load_asset("/PCGPlugins/HouseTest/BP_Window_Gothic_1x1")
+    if gothic_bp and hs:
+        g = hs.place_marker_along_ray(
+            gothic_bp.generated_class(),
+            unreal.Vector(loc.x + 150.0, loc.y - half_y - 120.0, loc.z + 150.0),
+            unreal.Vector(0.0, 1.0, 0.0), 400.0)
+        gw, gh = (g.get_demand_size() if g else (0.0, 0.0))
+        cw, ch = placed.get_demand_size() if placed else (0.0, 0.0)
+        check("swapping the brush class swaps the hole it cuts (gothic vs cottage)",
+              g is not None and abs(gw - cw) > 1.0 and abs(gh - ch) > 1.0,
+              "gothic=(%.1f x %.1f) cottage=(%.1f x %.1f)" % (gw, gh, cw, ch))
+        if g:
+            sub.destroy_actor(g)
+    if placed is not None:
+        sub.destroy_actor(placed)
+    house.reevaluate_site()
+    check("deleting a brush-placed marker closes its hole again",
+          house.get_window_count() == 0 and house.get_feature_marker_count() == 0,
+          "windows=%d markers=%d" % (house.get_window_count(), house.get_feature_marker_count()))
+
+    # ⚠️ **基线必须在 spawn 之前取**：`AddActor` 之后基类会补一次降级裁决（纪律 ③），标记
+    # 当场就解析并登记了。spawn 之后再读 `get_window_count()` 拿到的已经是"含标记"的数，
+    # 那条并存断言就变成 n == n+1。
+    house.set_editor_property("Windows", [make_window(3, 176.0, 78.0, 90.0, 110.0)])
+    house.rebuild_house()
+    list_only = house.get_window_count()
+
+    # 也走笔刷那条路生成 —— `ACSHouseFeatureMarker` 自 2026-09-06 起是 `NotPlaceable`
+    # （拖放入口已退役），`spawn_actor_from_class` 那条不再是它的生成方式。
+    marker = hs.place_marker_along_ray(
+        unreal.CSWindowMarker,
+        unreal.Vector(loc.x + half_x + 120.0, loc.y, loc.z + 150.0),
+        unreal.Vector(-1.0, 0.0, 0.0), 400.0) if hs else None
+    check("window marker: placed by a brush click", marker is not None)
+    if marker is not None:
+        marker.set_actor_label("WindowMarker_Regress")
+        # ⚠️ 先关自毁再解析：spawn 与摆位之间标记短暂地找不到宿主，开着它会当场自删 ——
+        # 而"标记没了"与"标记判它放不下"在断言里长得一模一样。
+        marker.set_editor_property("bDestroyWhenHostless", False)
+
+        check("the marker finds the demo house", marker.resolve_host_and_register(True),
+              "host=%s" % (marker.get_host().get_actor_label() if marker.get_host() else "None"))
+        check("the marker's demand is registered", house.get_feature_marker_count() == 1,
+              "markers=%d" % house.get_feature_marker_count())
+        check("the house really cut a hole for the marker", marker.causes_cut(),
+              "reject=%s" % str(marker.get_last_reject()))
+        # ① 并存：属性面板那份没被标记挤掉。
+        check("the marker's window coexists with the ones from the Windows list",
+              house.get_window_count() == list_only + 1,
+              "windows=%d (list alone: %d)" % (house.get_window_count(), list_only))
+
+        # ---- 拖动期：带标记拉尺寸 12 帧（`NotifyMarkersRebuilt` 那条路）----
+        #
+        # ⚠️ 上面那条 12 帧断言拖的是**属性面板那份窗**，它没有 actor、没有 transform 要写。
+        # 标记这条完全不同：footprint 一变，墙面就挪了，而标记 attach 在房子**根**上 ——
+        # 根没动，所以它不会自己跟过去。每帧把它拉回去的是 `NotifyMarkersRebuilt` 里那句
+        # `SnapToAnchor()`，也就是"锚点是权威、变换是派生量"的字面执行。
+        #
+        # 这一段同时钉三件在单测里够不着的事（单测只推一次边）：
+        #   ① 每帧写 transform **不产生阻塞刷新** —— 写 actor 变换很容易顺手带出一次重建；
+        #   ② 标记**逐帧**都贴在锚点派生位上，而不是"拖完了才对得上"（中途分家在画面上
+        #      就是洞与窗框错开，松手瞬间又跳回去）；
+        #   ③ 拖动不会把窗甩到别的边上（`EdgeIndex` 恒定）。
+        drag_edge = marker.get_anchor().get_editor_property("EdgeIndex")
+        house.set_editor_property("FootprintSize", unreal.Vector2D(600.0, 400.0))
+        house.rebuild_house()
+        before_drag = unreal.CSMesh.get_blocking_flush_count()
+        worst_drift = 0.0
+        edge_hops = 0
+        for i in range(1, 13):
+            house.set_editor_property("FootprintSize", unreal.Vector2D(600.0 + i * 5.0, 400.0))
+            house.reevaluate_site()
+            want = house.anchor_to_world(marker.get_anchor(),
+                                         marker.get_demand_half_height(),
+                                         marker.get_editor_property("WallStandoff")).translation
+            worst_drift = max(worst_drift, (marker.get_actor_location() - want).length())
+            if marker.get_anchor().get_editor_property("EdgeIndex") != drag_edge:
+                edge_hops += 1
+        drag_flushes = unreal.CSMesh.get_blocking_flush_count() - before_drag
+        check("dragging the house with a marker attached blocks the game thread zero times",
+              drag_flushes == 0, "flushes=%d" % drag_flushes)
+        check("the marker sits on its anchor every single frame of the drag, not just at the end",
+              worst_drift <= 0.5, "worst drift=%.3f cm over 12 frames" % worst_drift)
+        check("and the drag never flings it onto another wall",
+              edge_hops == 0, "hops=%d edge=%d" % (edge_hops, drag_edge))
+        check("the marker still cuts its hole after the drag", marker.causes_cut(),
+              "reject=%s" % str(marker.get_last_reject()))
+
+        house.set_editor_property("FootprintSize", unreal.Vector2D(600.0, 400.0))
+        house.reevaluate_site()
+
+        with_marker = house.get_window_count()
+        # ② 编辑器 world 里删掉 ⇒ 洞合拢、登记表清空。
+        sub.destroy_actor(marker)
+        house.reevaluate_site()
+        check("deleting the marker in the editor world closes its hole",
+              house.get_feature_marker_count() == 0 and house.get_window_count() == with_marker - 1,
+              "markers=%d windows=%d (was %d)"
+              % (house.get_feature_marker_count(), house.get_window_count(), with_marker))
+
+    # ---- 砖层（P1）扛洞缘：窗退掉框砖之后，**真正盖住断口的是这一层** ----
+    #
+    # ⚠️ `bBrickWallEnabled` 默认关着，在此之前**全仓没有任何一条断言把它打开过** ——
+    # `CSHouseBrickWall.h` 的纯函数有单测，但 actor 那条路（`BuildBrickWallBricks`：
+    # 容量、逐层哈希、`CurrentOpenings` 喂进去裁砖）一次都没被端到端跑过。窗刚退掉框砖，
+    # 洞缘从此归砖层，这条路不能再是盲区。
+    house.set_editor_property("Windows", [])
+    house.set_editor_property("bBrickWallEnabled", True)
+    house.rebuild_house()
+
+    wall_bricks = house.get_brick_wall_brick_count()
+    courses = house.get_brick_wall_course_count()
+    budget = house.get_brick_wall_brick_budget()
+    check("switching the brick layer on really lays courses of bricks",
+          courses > 0 and wall_bricks > 0,
+          "courses=%d bricks=%d budget=%d" % (courses, wall_bricks, budget))
+    # 预算是**不减洞**的上界（`EstimateBricks`）。没洞时实际数不许超过它 —— 超了说明
+    # 容量估算漏项，交互期就会撞上限**静默截断**（砖层铺一半，且一条断言都不会红）。
+    check("the no-holes estimate really bounds the brick count",
+          0 < wall_bricks <= budget, "bricks=%d budget=%d" % (wall_bricks, budget))
+    # 砖层与门框/接缝/角石/包边共用一个组件，总数必须还在硬上限（65536）之内。
+    total_with_wall = house.get_frame_brick_count()
+    check("the whole frame component stays under the 65536 cap",
+          total_with_wall < 65536, "total=%d (wall %d of it)" % (total_with_wall, wall_bricks))
+
+    # ---- 洞真的把砖裁掉了（洞缘四级的①：CPU 删 instance）----
+    house.set_editor_property("Windows", windows)
+    house.rebuild_house()
+    holed_bricks = house.get_brick_wall_brick_count()
+    removed = wall_bricks - holed_bricks
+    check("三扇窗把砖层裁掉了一批砖（洞缘①）", removed > 0,
+          "bricks=%d (was %d, removed %d)" % (holed_bricks, wall_bricks, removed))
+
+    # 上界：删得**过多**说明 clip 判据漏到洞外去了 —— 那在画面上是墙被啃掉一大块，
+    # 而"砖变少了"这个方向的断言只判下界的话照样全绿。按洞的面积算一个宽松上界：
+    # 每扇窗最多吃掉 (宽 / 砖距) x (高 / 层高) 块，再乘 3 放行余量（间隙、层对不齐、清空量）。
+    pitch = house.get_editor_property("FrameBrickLength") + house.get_editor_property("FrameBrickGap")
+    course_h = house.get_editor_property("BrickWallCourseHeight")
+    per_window = (78.0 / max(pitch, 1.0)) * (110.0 / max(course_h, 1.0))
+    ceiling = int(3 * per_window * 3.0) + 12
+    check("而且没有多啃：删掉的砖数不超过三个洞的面积当量",
+          removed <= ceiling,
+          "removed=%d ceiling=%d (pitch=%.1f course=%.1f)" % (removed, ceiling, pitch, course_h))
+
+    # ---- 幂等：砖层开着再复评一次，逐位不变（逐层哈希若漏项，这里会飘）----
+    house.reevaluate_site()
+    check("the brick layer rebuilds bit-identically",
+          house.get_brick_wall_brick_count() == holed_bricks
+          and house.get_brick_wall_course_count() == courses,
+          "bricks=%d courses=%d" % (house.get_brick_wall_brick_count(),
+                                    house.get_brick_wall_course_count()))
+
+    # ⚠️ **必须关回去**：默认值就是关的，留着开会把后面每一节的砖数基线全推翻。
+    house.set_editor_property("bBrickWallEnabled", False)
+    house.set_editor_property("Windows", [])
+    ground.reset_paint()
+    house.rebuild_house()
+    check("turning the brick layer back off returns the count to zero",
+          house.get_brick_wall_brick_count() == 0,
+          "bricks=%d" % house.get_brick_wall_brick_count())
 
 
 def spawn_house(label, x, y, z, size_x, size_y):
@@ -1660,7 +2159,9 @@ def demo_house_seam():
 
 
 def demo_house_resize():
-    """D5 拉尺寸：禁带 + 单边推拉 + 连续拖动期派生物跟得住。
+    """D5 拉尺寸：单边推拉 + 连续拖动期派生物跟得住。
+
+    （"禁带"已随四坡屋顶于 2026-08-31 删除，本节第 ② 段有留档；剩下的是推拉自己的记账。）
 
     ⚠️ 这一节测的是**机制**，不是交互控件：抓手 / gizmo / EdMode 不在 D5 这一轮范围内，
     尺寸一律从 `push_edge`（机制入口）与属性改。将来的 handle actor 只是往 push_edge 喂 Offset，
@@ -1711,50 +2212,28 @@ def demo_house_resize():
     near("the east wall moves exactly the offset",
          math.hypot(east_after[0] - east_before[0], east_after[1] - east_before[1]), 120.0, 0.05, " cm")
 
-    # ---- ② 禁带：连续推拉扫过翻轴点，脊向在**平滑步**里一次都不翻 ----
+    # ---- ② 连续推拉：每一步都恰好走 5 cm，净位移守恒 ----
     #
-    # ⚠️ 断言的口径（2026-08-30 裁决四，收缩过，理由写在 CSHouseLogicTests 那条同名用例里）：
-    # 从 X 长拖到 Y 长必然要改一次脊向 —— 那是拓扑必然，禁带管不了。禁带保证的是
-    # **改的那一步同时是尺寸跳变的那一步**：用户读到"房子换了个形状"，而不是"屋顶自己转了 90°"。
-    # 平滑步里一次都不翻 + 尺寸从不停在带内，这两条合起来才是"挡住翻轴现象"的可验证形态。
+    # 禁带与脊向滞回已随四坡屋顶删除（2026-08-31）：脊向由长轴连续导出、正方形处脊长为 0，
+    # **翻轴这个事件不存在了**，也就没有要挡的东西。剩下的是推拉自己的记账 ——
+    # 「拖 300 cm 墙就走 300 cm」，一步都不许吞、也不许多给。
     house.set_editor_property("FootprintSize", unreal.Vector2D(400.0, 320.0))
-    house.set_editor_property("RidgeAxis", unreal.CSRidgeAxis.X)
     house.rebuild_house()
-    band = house.get_footprint_band_range(2)          # edge 2 = 北墙，推的是 Y
-    check("the ridge-flip threshold sits inside the band",
-          band.x < 400.0 * 1.15 < band.y, "band=[%.1f, %.1f] threshold=%.1f" % (band.x, band.y, 400.0 * 1.15))
-
-    axis = house.get_editor_property("RidgeAxis")
-    smooth_flips, jump_flips, inside_band, prev_y = 0, 0, 0, house.get_editor_property("FootprintSize").y
+    jumps, prev_y = 0, house.get_editor_property("FootprintSize").y
     for _ in range(60):
-        house.push_edge(2, 5.0)
-        size = house.get_editor_property("FootprintSize")
-        jumped = abs(size.y - prev_y) > 5.0 + 1e-3
-        # 带随 X 走，X 在这段里不动，所以每帧重问一次也是同一条 —— 但别写死，X 会被别的用例改。
-        rng = house.get_footprint_band_range(2)
-        if rng.x < size.y < rng.y:
-            inside_band += 1
-        now = house.get_editor_property("RidgeAxis")
-        if now != axis:
-            if jumped:
-                jump_flips += 1
-            else:
-                smooth_flips += 1
-        axis, prev_y = now, size.y
-    check("a continuous drag never flips the ridge on a smooth step", smooth_flips == 0,
-          "smooth=%d jump=%d" % (smooth_flips, jump_flips))
-    check("no dragged size ever rests inside the band", inside_band == 0, "inside=%d" % inside_band)
-    check("the one ridge flip rides the band jump", jump_flips == 1, "jump=%d" % jump_flips)
-    check("the drag still ends with the ridge along the long axis",
-          axis == unreal.CSRidgeAxis.Y, "axis=%s" % axis)
-    # 净位移守恒：卡口只重排位移的分布，不吞长度。拖 300 cm 墙就走 300 cm。
+        house.push_edge(2, 5.0)                       # edge 2 = 北墙，推的是 Y
+        size_y = house.get_editor_property("FootprintSize").y
+        if abs(size_y - prev_y - 5.0) > 1e-3:
+            jumps += 1
+        prev_y = size_y
+    check("every drag step applies exactly the offset", jumps == 0, "jumps=%d" % jumps)
     near("total wall travel equals total drag travel",
          house.get_editor_property("FootprintSize").y, 320.0 + 300.0, 0.05, " cm")
 
     # ---- ③ 拖动期零阻塞（第十一条 flushes=0），且派生物跟得住 ----
     #
     # 与上面那些 set_editor_property 拖动的区别：push_edge 是**机制入口**，它会多做两件事
-    # （标脏 subsystem、按禁带修正尺寸）。这条断言保证那两件事没有把容量/包围盒的稳态破掉。
+    # （标脏 subsystem、按 MinFootprint 修正尺寸）。这条断言保证那两件事没有把容量/包围盒的稳态破掉。
     house.set_editor_property("FootprintSize", unreal.Vector2D(600.0, 400.0))
     house.rebuild_house()
     check("the push-edge flush test starts with frame bricks", house.get_frame_brick_count() > 0,

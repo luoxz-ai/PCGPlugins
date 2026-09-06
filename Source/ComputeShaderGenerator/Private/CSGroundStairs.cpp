@@ -46,6 +46,8 @@ class FCSGroundStairsScanCS : public FGlobalShader
 		SHADER_PARAMETER(float, StairGroundBaseZ)
 		SHADER_PARAMETER(float, StairStepHeight)
 		SHADER_PARAMETER(float, StairRoadThreshold)
+		SHADER_PARAMETER(float, StairMinMoundHeight)
+		SHADER_PARAMETER(uint32, StairDropTopStep)
 		SHADER_PARAMETER(float, StairEmbed)
 		SHADER_PARAMETER(float, StairRise)
 		SHADER_PARAMETER(float, StairZOffset)
@@ -202,6 +204,8 @@ bool Scan(
 					PassParams->StairGroundBaseZ = Params.GroundBaseZ;
 					PassParams->StairStepHeight = Params.StepHeight;
 					PassParams->StairRoadThreshold = Params.RoadThreshold;
+					PassParams->StairMinMoundHeight = FMath::Max(Params.MinMoundHeight, 0.0f);
+					PassParams->StairDropTopStep = Params.bDropTopStep ? 1u : 0u;
 					PassParams->StairEmbed = Params.Embed;
 					PassParams->StairRise = Params.Rise;
 					PassParams->StairZOffset = Params.ZOffset;

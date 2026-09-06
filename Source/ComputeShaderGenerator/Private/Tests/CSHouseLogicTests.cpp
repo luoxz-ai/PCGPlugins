@@ -5,17 +5,29 @@
 #include "CSGpuMeshTypes.h"
 #include "CSGroundShaperSteps.h"
 #include "CSHouseActor.h"
+#include "CSHouseDoorRuns.h"
 #include "CSHouseProfile.h"
+#include "CSHouseQuoin.h"
+#include "CSHouseTrim.h"
+#include "CSHouseBrickWall.h"
 #include "CSHouseResize.h"
 #include "CSHouseRoof.h"
 #include "CSHouseSeam.h"
+#include "CSHouseFeatureMarker.h"
+#include "CSHouseHeightHandleActor.h"
+#include "CSHouseResizeHandleActor.h"
+#include "CSHouseSubsystem.h"
 #include "CSSplineBlockActor.h"
+#include "Engine/StaticMesh.h"   // House.WindowMarker 里 LoadObject<UStaticMesh> 要完整类型
+#include "Engine/World.h"
+#include "Tests/AutomationEditorCommon.h"
 #include "Math/NumericLimits.h"
 #include "Math/RandomStream.h"
+#include "UObject/Class.h"   // HasAnyClassFlags / GetBoolMetaDataHierarchical（unity 构建会替你藏起来）
 
 // -----------------------------------------------------------------------------
 // TinyGladeHouse 的判定纯函数用例：不碰 RHI / world，只钉数学 ——
-// 屋面求值器（唯一真源，瓦/梁/落窗谓词将来都调它）、脊向滞回、边缘分割、离地收窄。
+// 屋面求值器（四坡，唯一真源，瓦/梁/落窗谓词都调它）、边缘分割、离地收窄。
 //
 // 计划纪律（TinyGladeHouse_Plan.md 阶段计划）：门洞区间、接触段、柱布点、openings 排布
 // 这类判定全部做成无 GPU 依赖的纯函数 + automation 测试。
@@ -26,21 +38,19 @@ namespace
 // Unity/jumbo builds share a TU, so file-local names carry a CSHouseTest_ prefix
 // （与 CSHouseActor.cpp 内的 CSHouse_ 前缀必须不同，否则 unity blob 里同名符号打架）。
 
-FCSRoofDesc CSHouseTest_MakeRoof(ECSRidgeAxis Axis, double SizeX, double SizeY)
+FCSRoofDesc CSHouseTest_MakeRoof(double SizeX, double SizeY)
 {
 	FCSRoofDesc Desc;
-	Desc.RidgeAxis = Axis;
 	Desc.Footprint = FVector2D(SizeX, SizeY);
 	Desc.EaveZ = 300.0f;
 	Desc.Pitch = 35.0f;
 	Desc.Overhang = 25.0f;
-	Desc.Thickness = 12.0f;
 	return Desc;
 }
 }
 
 // -----------------------------------------------------------------------------
-// 屋面求值器：三处关键高度自洽，且与脊向无关（换轴只是换了哪根轴当跨度）
+// 屋面求值器（四坡）：高度场 = 内距 × 坡度，脊长与角斜脊都是它的推论
 // -----------------------------------------------------------------------------
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
@@ -50,19 +60,24 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 
 bool FCSHouseRoofEvalTest::RunTest(const FString& Parameters)
 {
-	// 600 × 400，脊沿 X ⇒ 跨度是 Y（半跨 200）。
-	const FCSRoofDesc Roof = CSHouseTest_MakeRoof(ECSRidgeAxis::X, 600.0, 400.0);
+	// 600 × 400 ⇒ 脊沿长轴 X，跨度是 Y（半跨 200）。
+	const FCSRoofDesc Roof = CSHouseTest_MakeRoof(600.0, 400.0);
 	const float TanP = Roof.TanPitch();
 
-	TestTrue(TEXT("Ridge runs along the 600 side"), FMath::IsNearlyEqual(Roof.RidgeLength(), 600.0f));
+	TestTrue(TEXT("The ridge follows the long axis"), Roof.bRidgeAlongX());
 	TestTrue(TEXT("Span is the 400 side"), FMath::IsNearlyEqual(Roof.SpanLength(), 400.0f));
+	// 等坡度四坡的推论：两端的坡面各吃掉半跨，脊线只剩 |X − Y|。**不是**长边的长度。
+	TestTrue(TEXT("The ridge segment is the aspect difference"), FMath::IsNearlyEqual(Roof.RidgeLength(), 200.0f));
 
-	// 屋脊（跨度 0）= 墙顶 + tan(pitch) × 半跨。
+	// 屋脊高只由**短边**决定：脊线上的内距恰好是半跨。
 	TestTrue(TEXT("Ridge height"), FMath::IsNearlyEqual(CSHouseRoof_RidgeZ(Roof), 300.0f + TanP * 200.0f, 1.0e-3f));
 
-	// footprint 边界（|跨度| = 半跨）上屋面恰好落在墙顶 —— 这条自洽是"墙顶不漏缝"的保证。
-	TestTrue(TEXT("Roof meets the wall top at the footprint edge"),
-		FMath::IsNearlyEqual(CSHouseRoof_EvalZ(Roof, FVector2D(0.0, 200.0)), 300.0f, 1.0e-3f));
+	// **四条** footprint 边上屋面都恰好落在墙顶 —— 双坡时只有两条成立（另两条是山墙）。
+	TestTrue(TEXT("Roof meets the wall top on +Y"), FMath::IsNearlyEqual(CSHouseRoof_EvalZ(Roof, FVector2D(0.0, 200.0)), 300.0f, 1.0e-3f));
+	TestTrue(TEXT("Roof meets the wall top on -Y"), FMath::IsNearlyEqual(CSHouseRoof_EvalZ(Roof, FVector2D(0.0, -200.0)), 300.0f, 1.0e-3f));
+	TestTrue(TEXT("Roof meets the wall top on +X"), FMath::IsNearlyEqual(CSHouseRoof_EvalZ(Roof, FVector2D(300.0, 0.0)), 300.0f, 1.0e-3f));
+	TestTrue(TEXT("Roof meets the wall top on -X"), FMath::IsNearlyEqual(CSHouseRoof_EvalZ(Roof, FVector2D(-300.0, 0.0)), 300.0f, 1.0e-3f));
+
 	TestTrue(TEXT("Symmetric across the ridge"),
 		FMath::IsNearlyEqual(CSHouseRoof_EvalZ(Roof, FVector2D(0.0, -137.0)), CSHouseRoof_EvalZ(Roof, FVector2D(0.0, 137.0)), 1.0e-3f));
 
@@ -70,21 +85,36 @@ bool FCSHouseRoofEvalTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("Eave outer height"),
 		FMath::IsNearlyEqual(CSHouseRoof_EaveOuterZ(Roof), 300.0f - TanP * 25.0f, 1.0e-3f));
 
-	// 沿脊方向平移不改高度（双坡屋面在脊向是平的）。
-	TestTrue(TEXT("Height is invariant along the ridge"),
-		FMath::IsNearlyEqual(CSHouseRoof_EvalZ(Roof, FVector2D(-280.0, 90.0)), CSHouseRoof_EvalZ(Roof, FVector2D(275.0, 90.0)), 1.0e-3f));
+	// 脊线**段内**是平的；出了脊端点（|沿脊| > 100）就跟着两端的坡面往下走 ——
+	// 这一条正是四坡与双坡的分界，双坡在整条长轴上都是平的。
+	TestTrue(TEXT("Flat along the ridge segment"),
+		FMath::IsNearlyEqual(CSHouseRoof_EvalZ(Roof, FVector2D(60.0, 0.0)), CSHouseRoof_RidgeZ(Roof), 1.0e-3f));
+	TestTrue(TEXT("Past the ridge end the roof falls away"),
+		CSHouseRoof_EvalZ(Roof, FVector2D(250.0, 0.0)) < CSHouseRoof_RidgeZ(Roof) - 1.0f);
 
-	// 换脊向后同一座房子的屋脊高应当改变（跨度换成了 600 那条边），且仍与 EvalZ 自洽。
-	const FCSRoofDesc RoofY = CSHouseTest_MakeRoof(ECSRidgeAxis::Y, 600.0, 400.0);
-	TestTrue(TEXT("Ridge along Y spans the 600 side"), FMath::IsNearlyEqual(RoofY.SpanLength(), 600.0f));
-	TestTrue(TEXT("Ridge along Y meets the wall top at x = half span"),
-		FMath::IsNearlyEqual(CSHouseRoof_EvalZ(RoofY, FVector2D(300.0, 0.0)), 300.0f, 1.0e-3f));
+	// 角斜脊落在 45° 对角线上：300 − |x| = 200 − |y| ⇒ (200, 100) 的内距是 100。
+	TestTrue(TEXT("The corner hip line is the 45 degree diagonal"),
+		FMath::IsNearlyEqual(CSHouseRoof_EvalZ(Roof, FVector2D(200.0, 100.0)), 300.0f + TanP * 100.0f, 1.0e-3f));
+
+	// 正方形连续退化成金字塔：脊长 0，尖点在中心。
+	const FCSRoofDesc Square = CSHouseTest_MakeRoof(400.0, 400.0);
+	TestTrue(TEXT("A square roof degenerates to a pyramid"), FMath::IsNearlyEqual(Square.RidgeLength(), 0.0f));
+	TestTrue(TEXT("The pyramid apex is at the centre"),
+		FMath::IsNearlyEqual(CSHouseRoof_EvalZ(Square, FVector2D(0.0, 0.0)), 300.0f + Square.TanPitch() * 200.0f, 1.0e-3f));
+
+	// 转 90°：脊向跟着长轴走，短边没变 ⇒ 脊高不变，且高度场整体就是转置。
+	const FCSRoofDesc RoofY = CSHouseTest_MakeRoof(400.0, 600.0);
+	TestFalse(TEXT("The ridge follows the long axis after the swap"), RoofY.bRidgeAlongX());
+	TestTrue(TEXT("Ridge height is unchanged by the swap"),
+		FMath::IsNearlyEqual(CSHouseRoof_RidgeZ(RoofY), CSHouseRoof_RidgeZ(Roof), 1.0e-3f));
+	TestTrue(TEXT("The height field is the transpose"),
+		FMath::IsNearlyEqual(CSHouseRoof_EvalZ(RoofY, FVector2D(90.0, -280.0)), CSHouseRoof_EvalZ(Roof, FVector2D(-280.0, 90.0)), 1.0e-3f));
 
 	return true;
 }
 
 // -----------------------------------------------------------------------------
-// 屋面法线与覆盖谓词
+// 屋面法线与覆盖谓词：四个坡面 + 四条角斜脊 + 脊线 + 金字塔尖
 // -----------------------------------------------------------------------------
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
@@ -94,8 +124,9 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 
 bool FCSHouseRoofNormalTest::RunTest(const FString& Parameters)
 {
-	const FCSRoofDesc Roof = CSHouseTest_MakeRoof(ECSRidgeAxis::X, 600.0, 400.0);
+	const FCSRoofDesc Roof = CSHouseTest_MakeRoof(600.0, 400.0);
 
+	// 跨脊那两个坡面（长边侧）。
 	const FVector NPos = CSHouseRoof_EvalNormal(Roof, FVector2D(0.0, 120.0));
 	const FVector NNeg = CSHouseRoof_EvalNormal(Roof, FVector2D(0.0, -120.0));
 
@@ -109,119 +140,37 @@ bool FCSHouseRoofNormalTest::RunTest(const FString& Parameters)
 	const FVector Tangent = FVector(0.0, 1.0, -Roof.TanPitch()).GetSafeNormal();
 	TestTrue(TEXT("Normal is perpendicular to the slope"), FMath::IsNearlyZero(FVector::DotProduct(Tangent, NPos), 1.0e-4));
 
-	// 脊线上退化为上方向（两坡在此不连续，取上是唯一无偏的选择）。
-	TestTrue(TEXT("Ridge line normal is up"), CSHouseRoof_EvalNormal(Roof, FVector2D(10.0, 0.0)).Equals(FVector::UpVector, 1.0e-4));
+	// **两端那两个坡面是四坡独有的**（双坡时那儿是山墙，法线是水平的）。
+	const FVector NEnd = CSHouseRoof_EvalNormal(Roof, FVector2D(280.0, 0.0));
+	TestTrue(TEXT("The end slope leans along the ridge axis"), NEnd.X > 0.0 && NEnd.Z > 0.0);
+	TestTrue(TEXT("The end slope has no cross-ridge lean"), FMath::IsNearlyZero(NEnd.Y, 1.0e-4));
 
-	// 覆盖谓词含两个方向的外挑：半跨 200 + 25，沿脊半长 300 + 25。
+	// 脊线上两坡对冲 ⇒ 正上。
+	TestTrue(TEXT("On the ridge the two slopes cancel to straight up"),
+		CSHouseRoof_EvalNormal(Roof, FVector2D(50.0, 0.0)).Equals(FVector::UpVector, 1.0e-4));
+
+	// 角斜脊上一个 X 面与一个 Y 面并列 ⇒ 两个水平分量相等（法线落在对角竖直面里）。
+	const FVector NHip = CSHouseRoof_EvalNormal(Roof, FVector2D(200.0, 100.0));
+	TestTrue(TEXT("The corner hip normal splits the two faces evenly"),
+		NHip.X > 0.0 && FMath::IsNearlyEqual(NHip.X, NHip.Y, 1.0e-4));
+
+	// 金字塔尖：四面对冲 ⇒ 正上。
+	const FCSRoofDesc Square = CSHouseTest_MakeRoof(400.0, 400.0);
+	TestTrue(TEXT("The pyramid apex normal is straight up"),
+		CSHouseRoof_EvalNormal(Square, FVector2D(0.0, 0.0)).Equals(FVector::UpVector, 1.0e-4));
+
+	// 覆盖谓词：四面外挑都算（半跨 200 + 25，长轴半长 300 + 25）。
 	TestTrue(TEXT("Inside the footprint is under the roof"), CSHouseRoof_IsUnderRoof(Roof, FVector2D(0.0, 0.0)));
 	TestTrue(TEXT("The overhang counts as under the roof"), CSHouseRoof_IsUnderRoof(Roof, FVector2D(0.0, 220.0)));
 	TestFalse(TEXT("Past the overhang is not under the roof"), CSHouseRoof_IsUnderRoof(Roof, FVector2D(0.0, 240.0)));
-	TestTrue(TEXT("Under the gable overhang"), CSHouseRoof_IsUnderRoof(Roof, FVector2D(320.0, 0.0)));
-	TestFalse(TEXT("Past the gable overhang"), CSHouseRoof_IsUnderRoof(Roof, FVector2D(340.0, 0.0)));
+	TestTrue(TEXT("Under the end overhang"), CSHouseRoof_IsUnderRoof(Roof, FVector2D(320.0, 0.0)));
+	TestFalse(TEXT("Past the end overhang"), CSHouseRoof_IsUnderRoof(Roof, FVector2D(340.0, 0.0)));
 
 	return true;
 }
 
 // -----------------------------------------------------------------------------
-// 脊向滞回：长短轴穿越时屋顶不原地翻面
-// -----------------------------------------------------------------------------
-
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-	FCSHouseRidgeHysteresisTest,
-	"PCGPlugins.ComputeShaderGenerator.House.RidgeHysteresis",
-	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
-
-bool FCSHouseRidgeHysteresisTest::RunTest(const FString& Parameters)
-{
-	constexpr float Ratio = 1.15f;
-
-	// 明确的长轴：无论从哪一侧进来都收敛到同一根轴。
-	TestTrue(TEXT("Clearly long X stays X"),
-		CSHouseRoof_ChooseRidgeAxis(FVector2D(600, 300), ECSRidgeAxis::X, Ratio) == ECSRidgeAxis::X);
-	TestTrue(TEXT("Clearly long X flips from Y"),
-		CSHouseRoof_ChooseRidgeAxis(FVector2D(600, 300), ECSRidgeAxis::Y, Ratio) == ECSRidgeAxis::X);
-	TestTrue(TEXT("Clearly long Y flips from X"),
-		CSHouseRoof_ChooseRidgeAxis(FVector2D(300, 600), ECSRidgeAxis::X, Ratio) == ECSRidgeAxis::Y);
-
-	// 滞回带内（Y 只比 X 长一点，未达 1.15 倍）：保持现状，两个方向都不翻。
-	// 这一条正是"单边推拉让 X 穿过 Y 时屋顶啪地翻过去"的防线。
-	TestTrue(TEXT("Inside the band X keeps X"),
-		CSHouseRoof_ChooseRidgeAxis(FVector2D(400, 420), ECSRidgeAxis::X, Ratio) == ECSRidgeAxis::X);
-	TestTrue(TEXT("Inside the band Y keeps Y"),
-		CSHouseRoof_ChooseRidgeAxis(FVector2D(420, 400), ECSRidgeAxis::Y, Ratio) == ECSRidgeAxis::Y);
-
-	// 正方形是滞回带的正中心：谁进来谁留下，绝不抖动。
-	TestTrue(TEXT("Square keeps X"), CSHouseRoof_ChooseRidgeAxis(FVector2D(400, 400), ECSRidgeAxis::X, Ratio) == ECSRidgeAxis::X);
-	TestTrue(TEXT("Square keeps Y"), CSHouseRoof_ChooseRidgeAxis(FVector2D(400, 400), ECSRidgeAxis::Y, Ratio) == ECSRidgeAxis::Y);
-
-	// ⚠️ **这条断言在 2026-08-30 裁决四之后收缩过，收缩是有意的**（原文："连续单边推拉扫过
-	// 穿越点全程恰好翻一次" ⇒ 禁带口径下"一次都不翻"）。
-	//
-	// 收缩的理由与边界（写在这里，免得后人当成丢覆盖给"修"回去）：
-	//  · 裸滞回下，**只**改尺寸的一次单边推拉必然在某个连续步里翻一次 —— 那一步的画面就是
-	//    "屋顶原地 90° 跳过去"，正是裁决四要消掉的现象。
-	//  · 禁带把整段滞回模糊区 [A/R, A·R] 吞掉之后，尺寸**根本停不到阈值上**，所以在
-	//    "扫过翻轴阈"这件事上答案变成 0 次。这条 sweep 现在走的是禁带修正后的尺寸序列，
-	//    因此它测的是**同一个现象的消失**，不是把覆盖删掉。
-	//  · 全程完整推拉（从 X 长到 Y 长）仍然必须恰好翻一次 —— 那是拓扑必然（起点脊在 X、
-	//    终点脊在 Y），禁带管不了也不该管。它被下面 ResizeBand 用例的
-	//    "翻轴只发生在跳带那一步" 接手，那才是可断言的形态。
-	{
-		constexpr double Anchor = 400.0;             // X 恒定，只推 Y 那一边
-		constexpr double StepCm = 5.0;               // 一帧拖 5 cm，真实拖拽的量级
-		const double Threshold = Anchor * Ratio;     // 翻轴阈 = 460
-
-		FCSHouseResizeBand Band;
-		Band.Fraction = 0.20f;
-		Band.RidgeSwitchRatio = Ratio;
-
-		ECSRidgeAxis Axis = ECSRidgeAxis::X;
-		int32 ContinuousFlips = 0, JumpFlips = 0, NearThreshold = 0;
-		double Previous = CSHouseResize_ApplyBand(300.0, Anchor, Band);
-		for (int32 Step = 1; Step <= 60; ++Step)
-		{
-			const double SizeY = CSHouseResize_ApplyBand(300.0 + Step * StepCm, Anchor, Band);
-			// "跳带" = 这一步的尺寸位移明显超过一帧的拖动量。用户看到的是房子换档。
-			const bool bJumped = FMath::Abs(SizeY - Previous) > StepCm + 1.0e-6;
-			if (FMath::Abs(SizeY - Threshold) < 10.0) ++NearThreshold;
-
-			const ECSRidgeAxis Next = CSHouseRoof_ChooseRidgeAxis(FVector2D(Anchor, SizeY), Axis, Ratio);
-			if (Next != Axis) { if (bJumped) ++JumpFlips; else ++ContinuousFlips; }
-			Axis = Next;
-			Previous = SizeY;
-		}
-		// 这就是"一次都不翻"的可断言形态：**平滑拖动的每一步都不翻**。
-		TestEqual(TEXT("A continuous drag never flips the ridge on a smooth step"), ContinuousFlips, 0);
-		// 尺寸压根停不到翻轴阈附近 —— 阈值 460 整个落在禁带 (320, 480) 里。
-		TestEqual(TEXT("No dragged size ever rests near the ridge-flip threshold"), NearThreshold, 0);
-		// 拓扑必然：从 X 长拖到 Y 长，脊向总得改一次。禁带只保证它与尺寸跳变同步。
-		TestEqual(TEXT("The one ridge flip happens on the band jump"), JumpFlips, 1);
-		TestTrue(TEXT("The sweep still ends on Y"), Axis == ECSRidgeAxis::Y);
-	}
-
-	// 对照组（**故意关掉禁带**）：同一段推拉，翻轴就落回某个平滑步里 ——
-	// 证明上面那 0 是禁带挣来的，不是这段 sweep 本来就翻不动。
-	{
-		ECSRidgeAxis Axis = ECSRidgeAxis::X;
-		int32 ContinuousFlips = 0;
-		for (int32 Step = 1; Step <= 60; ++Step)
-		{
-			const ECSRidgeAxis Next = CSHouseRoof_ChooseRidgeAxis(FVector2D(400.0, 300.0 + Step * 5.0), Axis, Ratio);
-			if (Next != Axis) ++ContinuousFlips;
-			Axis = Next;
-		}
-		TestEqual(TEXT("Without the band the same drag flips the ridge mid-motion"), ContinuousFlips, 1);
-	}
-
-	// SwitchRatio <= 1 退化为无滞回：等价于旧的 X >= Y 隐式规则。
-	TestTrue(TEXT("Ratio 1 degenerates to the implicit long-axis rule"),
-		CSHouseRoof_ChooseRidgeAxis(FVector2D(400, 401), ECSRidgeAxis::X, 1.0f) == ECSRidgeAxis::Y);
-
-	return true;
-}
-
-// -----------------------------------------------------------------------------
-// 拉尺寸（D5）：单边推拉的记账 + 尺寸禁带
+// 拉尺寸（D5）：单边推拉的记账
 // -----------------------------------------------------------------------------
 
 namespace
@@ -232,6 +181,18 @@ FVector CSHouseTest_WallCentre(const FVector2D& Size, const FVector& Centre, int
 	const double Dim = CSHouseResize_EdgeDrivesX(EdgeIndex) ? Size.X : Size.Y;
 	return Centre + CSHouseResize_EdgeOuterWorld(EdgeIndex, Yaw) * (Dim * 0.5);
 }
+
+/**
+ * 第 EdgeIndex 面墙推的是 footprint 的哪一维（的当前值）。
+ *
+ * 存在的理由：边号到轴的映射是 `EdgeIndex & 1`，**边 1 / 边 3 推 X，边 0 / 边 2 推 Y** ——
+ * 直觉上"东墙"该配 Y，写断言时极易反手写成 `.Y`，而那条轴恒不动 ⇒ 断言读到 0，
+ * 与"推拉整个没生效"逐字相同。
+ */
+double CSHouseTest_PushedDim(const ACSHouseActor* House, int32 EdgeIndex)
+{
+	return CSHouseResize_EdgeDrivesX(EdgeIndex) ? House->FootprintSize.X : House->FootprintSize.Y;
+}
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
@@ -241,9 +202,6 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 
 bool FCSHouseEdgePushTest::RunTest(const FString& Parameters)
 {
-	// 禁带默认关掉：这一组用例钉的是推拉的记账，掺进禁带就分不清位移是被谁改的。
-	const FCSHouseResizeBand NoBand;
-
 	// ① 幂等：连续 10 次 Offset=0 不许改动任何量。
 	// 计划 D5 的第一条配套单测。它抓的是"每次事件都白走一遍状态机"这类漂移 ——
 	// gizmo 在没动的那些帧照样发 PostEditMove，漂一点点就是拖动期的持续抖动。
@@ -252,7 +210,7 @@ bool FCSHouseEdgePushTest::RunTest(const FString& Parameters)
 		FVector Centre(1000.0, 2000.0, 50.0);
 		for (int32 i = 0; i < 10; ++i)
 		{
-			const float Applied = CSHouse_ApplyEdgePush(Size, Centre, 1, 30.0f, 0.0f, 200.0f, NoBand);
+			const float Applied = CSHouse_ApplyEdgePush(Size, Centre, 1, 30.0f, 0.0f, 200.0f);
 			TestEqual(TEXT("A zero push applies zero"), Applied, 0.0f);
 		}
 		TestTrue(TEXT("Ten zero pushes leave the size untouched"), Size == FVector2D(600.0, 400.0));
@@ -270,7 +228,7 @@ bool FCSHouseEdgePushTest::RunTest(const FString& Parameters)
 		const FVector PushedBefore = CSHouseTest_WallCentre(Size, Centre, Edge, Yaw);
 		const FVector OppositeBefore = CSHouseTest_WallCentre(Size, Centre, Edge + 2, Yaw);
 
-		const float Applied = CSHouse_ApplyEdgePush(Size, Centre, Edge, Yaw, float(Delta), 200.0f, NoBand);
+		const float Applied = CSHouse_ApplyEdgePush(Size, Centre, Edge, Yaw, float(Delta), 200.0f);
 		TestEqual(FString::Printf(TEXT("Edge %d applies the whole offset"), Edge), double(Applied), Delta, 1.0e-3);
 
 		const FVector PushedAfter = CSHouseTest_WallCentre(Size, Centre, Edge, Yaw);
@@ -287,127 +245,9 @@ bool FCSHouseEdgePushTest::RunTest(const FString& Parameters)
 	{
 		FVector2D Size(600.0, 400.0);
 		FVector Centre = FVector::ZeroVector;
-		const float Applied = CSHouse_ApplyEdgePush(Size, Centre, 0, 0.0f, -1000.0f, 200.0f, NoBand);
+		const float Applied = CSHouse_ApplyEdgePush(Size, Centre, 0, 0.0f, -1000.0f, 200.0f);
 		TestEqual(TEXT("Shrinking past the floor applies only what was possible"), double(Applied), -200.0, 1.0e-3);
 		TestEqual(TEXT("The floor holds"), Size.Y, 200.0, 1.0e-3);
-	}
-
-	return true;
-}
-
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-	FCSHouseResizeBandTest,
-	"PCGPlugins.ComputeShaderGenerator.House.ResizeBand",
-	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
-
-bool FCSHouseResizeBandTest::RunTest(const FString& Parameters)
-{
-	FCSHouseResizeBand Band;
-	Band.Fraction = 0.20f;
-	Band.RidgeSwitchRatio = 1.15f;
-
-	// ① 带宽下界由滞回比反解，不是独立调参量：外沿必须**严格**在翻轴阈之外。
-	// 等号会让跳带那一步的落点恰好是 Y == R·X，而 ChooseRidgeAxis 用严格 > ⇒ 那一步不翻、
-	// 下一个平滑步才翻，翻轴就这么漏回连续拖动里。
-	{
-		FCSHouseResizeBand Narrow;
-		Narrow.Fraction = 0.01f;             // 用户把带调得比滞回还窄
-		Narrow.RidgeSwitchRatio = 1.15f;
-		const float F = CSHouseResize_EffectiveBandFraction(Narrow);
-		TestTrue(TEXT("The band is widened to cover the hysteresis zone"), 1.0f + F > 1.15f);
-		TestTrue(TEXT("The lower edge also clears the hysteresis zone"), 1.0f - F < 1.0f / 1.15f);
-
-		FCSHouseResizeBand Off;
-		Off.Fraction = 0.0f;
-		TestEqual(TEXT("Fraction 0 really turns the band off"), CSHouseResize_EffectiveBandFraction(Off), 0.0f);
-		TestEqual(TEXT("With the band off nothing is snapped"), CSHouseResize_ApplyBand(401.0, 400.0, Off), 401.0);
-	}
-
-	// ② 跳哪一侧只看落在带心（X == Y）的哪一边 ⇒ 幂等、来回拖不产生迟滞环。
-	// 若改成"按拖动方向跳"，来回拖会在两条外沿之间来回蹦 2f·A，那才是真的抖。
-	{
-		// 容差 1e-3 cm（10 微米）而不是 1e-6：外沿是 `Anchor × float(0.20f)`，
-		// 0.2 在 float 里存不下，边界天然差 1.2e-6 cm。拿它当"精确等于"是自找的假红。
-		const double Low = CSHouseResize_ApplyBand(399.0, 400.0, Band);
-		const double High = CSHouseResize_ApplyBand(401.0, 400.0, Band);
-		TestEqual(TEXT("Just below the centre snaps down"), Low, 320.0, 1.0e-3);
-		TestEqual(TEXT("Just above the centre snaps up"), High, 480.0, 1.0e-3);
-		// 幂等按"再来一次给同一个答案"验，不按"等于理论边界值"验 —— 后者会被上面那 1.2e-6 咬到。
-		TestEqual(TEXT("Snapping is idempotent (low edge)"), CSHouseResize_ApplyBand(Low, 400.0, Band), Low, 1.0e-9);
-		TestEqual(TEXT("Snapping is idempotent (high edge)"), CSHouseResize_ApplyBand(High, 400.0, Band), High, 1.0e-9);
-		TestEqual(TEXT("Outside the band nothing moves"), CSHouseResize_ApplyBand(700.0, 400.0, Band), 700.0, 1.0e-6);
-	}
-
-	// ③ 连续推拉全程：尺寸一次都没停在带内，跨带**只发生一次且是一次跳变**，
-	//    而南墙（对侧）在整段拖动里**逐位不动** —— 包括跳的那一帧。
-	// 最后半句才是这条用例的分量所在：跳带是尺寸的不连续跳变，中心随动的记账一旦漏了那半格，
-	// 对侧墙就会在跳的那一帧被甩出去，画面上看着像"房子整个平移了一下"。
-	{
-		constexpr float Yaw = 21.0f;
-		FVector2D Size(400.0, 320.0);        // 起手就在带外（低侧外沿）
-		FVector2D Raw = Size;                // 原始诉求累加器，没有它墙会卡死在外沿上
-		FVector Centre(500.0, -700.0, 0.0);
-		const FVector SouthBefore = CSHouseTest_WallCentre(Size, Centre, 0, Yaw);
-
-		int32 InsideBand = 0, Jumps = 0, SouthMoved = 0, Stuck = 0;
-		for (int32 Step = 0; Step < 60; ++Step)
-		{
-			// 推北墙（edge 2，外法线 +Y），每帧 5 cm，把 Y 从 320 一路推过 400。
-			const double Before = Size.Y;
-			CSHouse_ApplyEdgePush(Size, Centre, 2, Yaw, 5.0f, 200.0f, Band, &Raw);
-			if (FMath::Abs(Size.Y - Before) > 5.0 + 1.0e-6) ++Jumps;
-			if (FMath::IsNearlyEqual(Size.Y, Before)) ++Stuck;
-			if (CSHouseResize_IsInsideBand(Size.Y, Size.X, Band)) ++InsideBand;
-			if (!CSHouseTest_WallCentre(Size, Centre, 0, Yaw).Equals(SouthBefore, 1.0e-3)) ++SouthMoved;
-		}
-		TestEqual(TEXT("No dragged size ever rests inside the band"), InsideBand, 0);
-		TestEqual(TEXT("The drag crosses the band exactly once, as one jump"), Jumps, 1);
-		TestEqual(TEXT("The opposite wall never moves, not even on the jump frame"), SouthMoved, 0);
-		// 卡口是有代价的：跨带前后墙都会吸在外沿上不动若干帧。有 stuck 帧才说明卡口真的在工作
-		// （把累加器删掉的话这里会变成 60 —— 墙一步都跨不过去）。
-		TestTrue(TEXT("The detent really holds the wall for a while"), Stuck > 0 && Stuck < 60);
-		TestTrue(TEXT("The drag really got out the far side"), Size.Y > 480.0);
-		// **净位移守恒**：卡口只重排了位移的分布，没有凭空造出或吞掉长度 ——
-		// 拖 3 m 墙就走 3 m，跳带那 160 cm 是从后面的卡顿里借的，不是白送的。
-		// 「拖 1 m 走 2 m」那个父子回路缺陷在这条上会立刻现形。
-		TestEqual(TEXT("Total wall travel equals total drag travel"), Size.Y - 320.0, 60 * 5.0, 1.0e-6);
-		TestEqual(TEXT("The applied size has caught up with the raw request"), Size.Y, Raw.Y, 1.0e-6);
-	}
-
-	// ④ 跳带那一步：对侧墙逐位不动、被推墙恰好走返回值那么远。
-	{
-		constexpr float Yaw = 21.0f;
-		FVector2D Size(400.0, 320.0);
-		FVector Centre(500.0, -700.0, 0.0);
-		const FVector SouthBefore = CSHouseTest_WallCentre(Size, Centre, 0, Yaw);
-		const FVector NorthBefore = CSHouseTest_WallCentre(Size, Centre, 2, Yaw);
-
-		// 请求只推 100 cm（320 → 420，落在带内），禁带把它顶到 480 ⇒ 实际走 160。
-		const float Applied = CSHouse_ApplyEdgePush(Size, Centre, 2, Yaw, 100.0f, 200.0f, Band);
-		TestEqual(TEXT("The band turns the request into a jump to the far edge"), double(Applied), 160.0, 1.0e-3);
-		TestEqual(TEXT("The size lands on the far edge"), Size.Y, 480.0, 1.0e-3);
-		TestTrue(TEXT("The opposite wall stays put across the jump"),
-			CSHouseTest_WallCentre(Size, Centre, 0, Yaw).Equals(SouthBefore, 1.0e-3));
-		TestTrue(TEXT("The pushed wall moves exactly the applied amount"),
-			CSHouseTest_WallCentre(Size, Centre, 2, Yaw).Equals(
-				NorthBefore + CSHouseResize_EdgeOuterWorld(2, Yaw) * double(Applied), 1.0e-3));
-	}
-
-	// ⑤ MinFootprint 赢过禁带：小房子的低侧外沿掉到下限以下时，硬顶回去只会让墙拖不动。
-	{
-		FVector2D Size(220.0, 220.0);
-		FVector Centre = FVector::ZeroVector;
-		const float Applied = CSHouse_ApplyEdgePush(Size, Centre, 0, 0.0f, -30.0f, 200.0f, Band);
-		TestEqual(TEXT("The floor beats the band"), Size.Y, 200.0, 1.0e-3);
-		TestEqual(TEXT("And the applied offset reports the truth"), double(Applied), -20.0, 1.0e-3);
-	}
-
-	// ⑥ 翻轴预判：禁带口径下，翻轴只可能与跳带同步。
-	{
-		TestFalse(TEXT("A smooth step outside the band never flips"),
-			CSHouseResize_WouldFlipRidge(FVector2D(400.0, 320.0), FVector2D(400.0, 315.0), ECSRidgeAxis::X, 1.15f));
-		TestTrue(TEXT("The band jump is where the flip lives"),
-			CSHouseResize_WouldFlipRidge(FVector2D(400.0, 320.0), FVector2D(400.0, 480.0), ECSRidgeAxis::X, 1.15f));
 	}
 
 	return true;
@@ -416,50 +256,344 @@ bool FCSHouseResizeBandTest::RunTest(const FString& Parameters)
 // -----------------------------------------------------------------------------
 // 边缘线段分割：等分、护角、最小宽度早退
 // -----------------------------------------------------------------------------
+// ⓘ `FCSHouseEdgeSplitTest`（等分槽）已随 `SplitEdgeIntoSlots` 于 2026-09-04 一并删除：
+//    门不再按等分槽开，改成"路在墙上截出的区间"。接替它的是下面的 `DoorRuns`。
+// -----------------------------------------------------------------------------
+
+// -----------------------------------------------------------------------------
+// 门洞区间求解（2026-09-04 重做）：门宽 = 路在墙上截出的弦长
+//
+// 这一族用例钉的正是旧口径做不到的四件事：亚采样端点、连续性、区间滞回、过宽切分。
+// -----------------------------------------------------------------------------
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-	FCSHouseEdgeSplitTest,
-	"PCGPlugins.ComputeShaderGenerator.House.EdgeSplit",
+	FCSHouseDoorRunsTest,
+	"PCGPlugins.ComputeShaderGenerator.House.DoorRuns",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 
-bool FCSHouseEdgeSplitTest::RunTest(const FString& Parameters)
+namespace
 {
-	float FirstS = 0, Pitch = 0;
-
-	// 600 长墙，护角 60 ⇒ 可用 480；目标段距 150 ⇒ round(3.2) = 3 段，段长 160。
+/** 造一条沿边剖面：[Lo, Hi] 等距 Steps+1 点，路是中心 Center、半宽 HalfW 的梯形（边沿线性过渡）。 */
+void CSHouseTest_MakeRoadProfile(float Lo, float Hi, int32 Steps, float Center, float HalfW,
+	float Feather, TArray<float>& Out, float& OutStep)
+{
+	OutStep = (Hi - Lo) / Steps;
+	Out.Reset();
+	for (int32 K = 0; K <= Steps; ++K)
 	{
-		const int32 N = ACSHouseActor::SplitEdgeIntoSlots(600.0f, 60.0f, 150.0f, 40.0f, FirstS, Pitch);
-		TestEqual(TEXT("600 wall splits into three slots"), N, 3);
-		TestTrue(TEXT("First slot starts at the corner margin"), FMath::IsNearlyEqual(FirstS, 60.0f));
-		TestTrue(TEXT("Slots are an exact equal split"), FMath::IsNearlyEqual(Pitch, 160.0f, 1.0e-3f));
-		// 等分的定义：最后一段的末端恰好落在另一侧护角上，没有余量。
-		TestTrue(TEXT("The last slot ends exactly on the far corner margin"),
-			FMath::IsNearlyEqual(FirstS + N * Pitch, 600.0f - 60.0f, 1.0e-3f));
+		const float S = Lo + OutStep * K;
+		const float D = FMath::Abs(S - Center);
+		// 梯形：|D| ≤ HalfW 处为 1，HalfW..HalfW+Feather 线性降到 0。
+		const float W = (D <= HalfW) ? 1.0f : FMath::Max(0.0f, 1.0f - (D - HalfW) / FMath::Max(Feather, 1.0e-3f));
+		Out.Add(W);
+	}
+}
+
+FCSDoorRunParams CSHouseTest_MakeRunParams(float Hi)
+{
+	FCSDoorRunParams P;
+	P.OnWeight = 0.5f;
+	P.MinWidth = 40.0f;
+	P.KeepWidth = 32.0f;
+	P.MaxWidth = 260.0f;
+	P.PierWidth = 20.0f;
+	P.Hi = Hi;
+	return P;
+}
+}   // namespace
+
+bool FCSHouseDoorRunsTest::RunTest(const FString& Parameters)
+{
+	constexpr float Lo = 60.0f, Hi = 540.0f;   // 600 长墙、护角 60
+	const FCSDoorRunParams P = CSHouseTest_MakeRunParams(Hi);
+	TArray<float> Weights;
+	TArray<FCSDoorRun> Runs;
+	float Step = 0;
+
+	// ---- ① 没有路 ⇒ 一个洞都不开 ----
+	{
+		Weights.Init(0.0f, 21);
+		CSHouse_SolveRoadRuns(Weights, Lo, (Hi - Lo) / 20.0f, P, TArrayView<const FCSDoorRun>(), Runs);
+		TestEqual(TEXT("No road yields no runs"), Runs.Num(), 0);
 	}
 
-	// 短墙：可用长装不下一个最小拱 ⇒ 这条边不开门。
+	// ---- ② 一条居中的路 ⇒ 一个洞，宽度 = 路在阈值 0.5 处的弦长 ----
+	// 梯形半宽 60、过渡 20 ⇒ 权重降到 0.5 的位置在 60 + 10 = 70 ⇒ 弦长 140。
 	{
-		const int32 N = ACSHouseActor::SplitEdgeIntoSlots(150.0f, 60.0f, 150.0f, 40.0f, FirstS, Pitch);
-		TestEqual(TEXT("A wall with no usable run yields no slots"), N, 0);
-	}
-
-	// 可用长比目标段距短但仍装得下一个拱 ⇒ 至少一段（clamp 下界）。
-	{
-		const int32 N = ACSHouseActor::SplitEdgeIntoSlots(220.0f, 60.0f, 150.0f, 40.0f, FirstS, Pitch);
-		TestEqual(TEXT("A short usable run still yields one slot"), N, 1);
-		TestTrue(TEXT("The single slot spans the whole usable run"), FMath::IsNearlyEqual(Pitch, 100.0f, 1.0e-3f));
-	}
-
-	// 段数随墙长单调不减 —— 拉尺寸时拱只会增删，不会莫名其妙重排。
-	{
-		int32 Previous = 0;
-		for (int32 Step = 0; Step <= 40; ++Step)
+		CSHouseTest_MakeRoadProfile(Lo, Hi, 24, 300.0f, 60.0f, 20.0f, Weights, Step);
+		CSHouse_SolveRoadRuns(Weights, Lo, Step, P, TArrayView<const FCSDoorRun>(), Runs);
+		TestEqual(TEXT("One road yields one run"), Runs.Num(), 1);
+		if (Runs.Num() == 1)
 		{
-			const float Length = 150.0f + Step * 25.0f;
-			const int32 N = ACSHouseActor::SplitEdgeIntoSlots(Length, 60.0f, 150.0f, 40.0f, FirstS, Pitch);
-			TestTrue(TEXT("Slot count is monotonic in wall length"), N >= Previous);
-			Previous = N;
+			TestTrue(TEXT("Run is centred on the road"), FMath::IsNearlyEqual(Runs[0].Center(), 300.0f, 1.0f));
+			TestTrue(TEXT("Run width is the road's chord at the threshold"),
+				FMath::IsNearlyEqual(Runs[0].Width(), 140.0f, 2.0f));
 		}
+	}
+
+	// ---- ③ **亚采样端点**：宽度不是采样步长的整数倍 ----
+	// 这一条是重做的全部意义。旧口径按"几个采样点过阈"定宽，宽度只能是 Step 的整数倍，
+	// 画路时门一格一格地跳；这里端点在跨阈的两点之间线性求根，宽度是路宽的连续函数。
+	{
+		CSHouseTest_MakeRoadProfile(Lo, Hi, 24, 300.0f, 53.0f, 17.0f, Weights, Step);
+		CSHouse_SolveRoadRuns(Weights, Lo, Step, P, TArrayView<const FCSDoorRun>(), Runs);
+		TestEqual(TEXT("Sub-sample profile still yields one run"), Runs.Num(), 1);
+		if (Runs.Num() == 1)
+		{
+			const float Ratio = Runs[0].Width() / Step;
+			TestTrue(TEXT("Run width is NOT quantised to the sample step"),
+				FMath::Abs(Ratio - FMath::RoundToFloat(Ratio)) > 0.05f);
+		}
+	}
+
+	// ---- ④ **连续性**：路一点点变宽，洞就一点点变宽（没有台阶）----
+	{
+		float Previous = 0.0f;
+		float MaxJump = 0.0f;
+		for (int32 K = 0; K <= 60; ++K)
+		{
+			const float HalfW = 30.0f + K * 1.0f;   // 每步只宽 1 cm
+			CSHouseTest_MakeRoadProfile(Lo, Hi, 24, 300.0f, HalfW, 20.0f, Weights, Step);
+			CSHouse_SolveRoadRuns(Weights, Lo, Step, P, TArrayView<const FCSDoorRun>(), Runs);
+			if (Runs.Num() != 1) continue;
+			const float Width = Runs[0].Width();
+			TestTrue(TEXT("Run width never shrinks as the road widens"), Width >= Previous - 1.0e-3f);
+			if (Previous > 0.0f) MaxJump = FMath::Max(MaxJump, Width - Previous);
+			Previous = Width;
+		}
+		// 每步路宽 +2（两侧各 +1）⇒ 洞宽的单步增量必须同量级，绝不能出现"一跳一个采样格"。
+		TestTrue(TEXT("Width grows smoothly, never by a whole sample step"), MaxJump < Step * 0.6f);
+	}
+
+	// ---- ⑤ 滞回：窄到 MinWidth 以下但仍 ≥ KeepWidth 的洞，**只有上一帧开着**才留 ----
+	{
+		CSHouseTest_MakeRoadProfile(Lo, Hi, 24, 300.0f, 8.0f, 20.0f, Weights, Step);   // 弦长 ≈ 36
+		CSHouse_SolveRoadRuns(Weights, Lo, Step, P, TArrayView<const FCSDoorRun>(), Runs);
+		TestEqual(TEXT("A sub-minimum road does not open a new door"), Runs.Num(), 0);
+
+		const FCSDoorRun Prev[] = { FCSDoorRun{ 280.0f, 320.0f } };
+		CSHouse_SolveRoadRuns(Weights, Lo, Step, P, Prev, Runs);
+		TestEqual(TEXT("The same road keeps an already-open door alive"), Runs.Num(), 1);
+
+		// 上一帧的区间在别处 ⇒ 不交叠 ⇒ 不继承（滞回不能跨洞传染）。
+		const FCSDoorRun Elsewhere[] = { FCSDoorRun{ 80.0f, 140.0f } };
+		CSHouse_SolveRoadRuns(Weights, Lo, Step, P, Elsewhere, Runs);
+		TestEqual(TEXT("Hysteresis does not leak across non-overlapping runs"), Runs.Num(), 0);
+	}
+
+	// ---- ⑥ 过宽的路切成一排拱，相邻之间留墩 ----
+	{
+		CSHouseTest_MakeRoadProfile(Lo, Hi, 48, 300.0f, 220.0f, 10.0f, Weights, Step);   // 弦长 ≈ 450 > MaxWidth
+		CSHouse_SolveRoadRuns(Weights, Lo, Step, P, TArrayView<const FCSDoorRun>(), Runs);
+		TestTrue(TEXT("An over-wide road splits into several arches"), Runs.Num() >= 2);
+		for (int32 Index = 0; Index + 1 < Runs.Num(); ++Index)
+		{
+			TestTrue(TEXT("Adjacent arches keep a pier between them"),
+				FMath::IsNearlyEqual(Runs[Index + 1].S0 - Runs[Index].S1, P.PierWidth, 0.5f));
+			TestTrue(TEXT("Split arches respect the max width"), Runs[Index].Width() <= P.MaxWidth + 0.5f);
+		}
+	}
+
+	// ---- ⑦ 路跑出可用区间 ⇒ 端点夹在护角上，不越界 ----
+	{
+		CSHouseTest_MakeRoadProfile(Lo, Hi, 24, Lo - 30.0f, 90.0f, 10.0f, Weights, Step);
+		CSHouse_SolveRoadRuns(Weights, Lo, Step, P, TArrayView<const FCSDoorRun>(), Runs);
+		for (const FCSDoorRun& Run : Runs)
+		{
+			TestTrue(TEXT("Run stays inside the usable span"), Run.S0 >= Lo - 1.0e-3f && Run.S1 <= Hi + 1.0e-3f);
+		}
+	}
+
+	// ---- ⑧ 两条分开的路 ⇒ 两个洞（旧口径下这依赖两条路恰好落在不同的槽里）----
+	{
+		Weights.Reset();
+		Step = (Hi - Lo) / 48.0f;
+		for (int32 K = 0; K <= 48; ++K)
+		{
+			const float S = Lo + Step * K;
+			const bool bRoadA = FMath::Abs(S - 180.0f) <= 45.0f;
+			const bool bRoadB = FMath::Abs(S - 420.0f) <= 45.0f;
+			Weights.Add((bRoadA || bRoadB) ? 1.0f : 0.0f);
+		}
+		CSHouse_SolveRoadRuns(Weights, Lo, Step, P, TArrayView<const FCSDoorRun>(), Runs);
+		TestEqual(TEXT("Two separate roads yield two doors"), Runs.Num(), 2);
+	}
+
+	// -------------------------------------------------------------------------
+	// 以下四条走**闭环**（`bClosed`）—— 四条边接成周界之后门洞真正跑的就是这一支，
+	// 而 2026-09-05 之前它一条断言都没有（转角的洞全靠它）。
+	// -------------------------------------------------------------------------
+
+	constexpr float Period = 800.0f;
+	constexpr int32 RingN = 80;
+	const float RingStep = Period / RingN;   // 10 cm
+	// `Weights` 覆盖 [0, Period)，末点**不重复**首点，这是闭环模式的口径。
+	auto MakeRing = [&](auto&& IsRoad)
+	{
+		Weights.Reset();
+		for (int32 K = 0; K < RingN; ++K) Weights.Add(IsRoad(RingStep * K) ? 1.0f : 0.0f);
+	};
+	FCSDoorRunParams Ring = CSHouseTest_MakeRunParams(Period);
+	Ring.bClosed = true;
+
+	// ---- ⑨ 压在环原点上的路得到**一条**跨原点的段，不是被数组首尾切成两条 ----
+	{
+		MakeRing([](float S) { return S <= 60.0f || S >= 740.0f; });
+		CSHouse_SolveRoadRuns(Weights, 0.0f, RingStep, Ring, TArrayView<const FCSDoorRun>(), Runs);
+		TestEqual(TEXT("A road across the ring origin yields one run, not two"), Runs.Num(), 1);
+		if (Runs.Num() == 1)
+		{
+			// 绕回的段用**不取模**的 S 表示（调用方按边切时靠这一点拆成两片）。
+			TestTrue(TEXT("The wrapping run keeps un-modded S"), Runs[0].S1 > Period);
+		}
+	}
+
+	// ---- ⑩ 碎环段并掉：两个洞之间只剩一小段墙 ⇒ 并成一条（要点 ④）----
+	{
+		MakeRing([](float S) { return (S >= 200.0f && S <= 260.0f) || (S >= 280.0f && S <= 340.0f); });
+
+		Ring.MinWallSegment = 0.0f;
+		CSHouse_SolveRoadRuns(Weights, 0.0f, RingStep, Ring, TArrayView<const FCSDoorRun>(), Runs);
+		TestEqual(TEXT("Without the filter a wall sliver keeps the two runs apart"), Runs.Num(), 2);
+
+		Ring.MinWallSegment = 30.0f;
+		CSHouse_SolveRoadRuns(Weights, 0.0f, RingStep, Ring, TArrayView<const FCSDoorRun>(), Runs);
+		TestEqual(TEXT("A sub-minimum wall sliver merges the two runs"), Runs.Num(), 1);
+		if (Runs.Num() == 1)
+		{
+			TestTrue(TEXT("The merged run spans both roads"),
+				Runs[0].S0 < 200.0f && Runs[0].S1 > 340.0f);
+		}
+	}
+
+	// ---- ⑪ 绕回那一段也要能并（首段与末段之间跨过 Hi 的空隙）----
+	{
+		MakeRing([](float S) { return (S >= 10.0f && S <= 90.0f) || (S >= 700.0f && S <= 780.0f); });
+
+		Ring.MinWallSegment = 0.0f;
+		CSHouse_SolveRoadRuns(Weights, 0.0f, RingStep, Ring, TArrayView<const FCSDoorRun>(), Runs);
+		TestEqual(TEXT("Without the filter the two runs straddle the origin separately"), Runs.Num(), 2);
+
+		Ring.MinWallSegment = 40.0f;
+		CSHouse_SolveRoadRuns(Weights, 0.0f, RingStep, Ring, TArrayView<const FCSDoorRun>(), Runs);
+		TestEqual(TEXT("The gap across the ring origin merges too"), Runs.Num(), 1);
+		if (Runs.Num() == 1)
+		{
+			TestTrue(TEXT("The merged wrapping run is expressed with S0 < Lo"), Runs[0].S0 < 0.0f);
+			TestTrue(TEXT("The merged wrapping run never exceeds one period"),
+				Runs[0].Width() <= Period + 1.0e-3f);
+		}
+	}
+
+	// ---- ⑫ 拱廊的墩不受它影响：环上根本看不到那些空隙（`MaxWidth = 0` 时才是产线口径）----
+	{
+		MakeRing([](float S) { return S >= 150.0f && S <= 600.0f; });
+		Ring.MinWallSegment = 60.0f;   // 远大于 PierWidth = 20
+		Ring.MaxWidth = 0.0f;          // 产线在环上不切，切分放到按边切完之后
+		CSHouse_SolveRoadRuns(Weights, 0.0f, RingStep, Ring, TArrayView<const FCSDoorRun>(), Runs);
+		TestEqual(TEXT("One wide road stays one ring run"), Runs.Num(), 1);
+		if (Runs.Num() == 1)
+		{
+			// 切分由调用方按边切完之后再做，墩宽因此永远不会被 MinWallSegment 并掉。
+			TArray<FCSDoorRun> Split;
+			CSHouse_SplitRun(Runs[0], 160.0f, 20.0f, 32.0f, Split);
+			TestTrue(TEXT("The downstream split still leaves piers between the arches"), Split.Num() >= 3);
+			for (int32 Index = 0; Index + 1 < Split.Num(); ++Index)
+			{
+				TestTrue(TEXT("Split arches keep the pier gap"),
+					FMath::IsNearlyEqual(Split[Index + 1].S0 - Split[Index].S1, 20.0f, 0.5f));
+			}
+		}
+	}
+
+	return true;
+}
+
+// -----------------------------------------------------------------------------
+// 扁拱（`ArchRise` ≠ 半宽）：剖面与裁剪场必须描述**同一条**曲线
+//
+// 这一条是整个 D6 里最容易静默错的地方：门框砖沿 `CSHouse_SampleOpeningProfile` 摆，
+// 墙面的洞由 `CSHouse_ClipKeeps`（以及材质里它的逐字翻译）切。两者一旦不同式，
+// 症状是"砖沿着一条弧走、洞却是另一条弧"，**没有任何断言或报错**会响。
+// -----------------------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseArchRiseTest,
+	"PCGPlugins.ComputeShaderGenerator.House.ArchRise",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseArchRiseTest::RunTest(const FString& Parameters)
+{
+	auto MakeArch = [](float Width, float Rise)
+	{
+		FCSWallOpening O;
+		O.Type = ECSOpeningType::Door;
+		O.Shape = ECSOpeningShape::Arch;
+		O.CenterS = 300.0f;
+		O.Width = Width;
+		O.Z0 = 0.0f;
+		O.Z1 = 220.0f;
+		O.ArchRise = Rise;
+		return O;
+	};
+
+	// ---- ① ArchRise = 0 ⇒ 逐位退回正半圆（旧行为不许被这次改动动到）----
+	{
+		const FCSWallOpening O = MakeArch(200.0f, 0.0f);
+		TestTrue(TEXT("Rise defaults to the half width"), FMath::IsNearlyEqual(O.Rise(), 100.0f, 1.0e-3f));
+		const FCSOpeningClipField F = CSHouse_ComputeClipField(O);
+		TestTrue(TEXT("A default arch is still a true semicircle"),
+			FMath::IsNearlyEqual(F.InvScaleZ, 1.0f / 100.0f, 1.0e-5f));
+	}
+
+	// ---- ② 扁拱：剖面的每个顶点都落在裁剪场的边界上 ----
+	for (const float Rise : { 40.0f, 70.0f, 100.0f, 160.0f })
+	{
+		const FCSWallOpening O = MakeArch(240.0f, Rise);
+		const FCSOpeningClipField F = CSHouse_ComputeClipField(O);
+		TArray<FCSOpeningProfileSample> Samples;
+		CSHouse_SampleOpeningProfile(O, 1.0f, Samples);
+		TestTrue(TEXT("A flattened arch still yields a profile"), Samples.Num() >= 6);
+
+		float WorstOutside = 0.0f;
+		for (const FCSOpeningProfileSample& Sample : Samples)
+		{
+			// 剖面顶点是**外接**多边形（弦高补偿），所以它恒在解析曲线之外或之上；
+			// 判据是"不许落到曲线里面"，而不是"恰好在曲线上"。
+			const FVector2f Q = F.Eval(Sample.S, Sample.ZHigh);
+			const float Radial = FMath::Sqrt(Q.X * Q.X + Q.Y * Q.Y);
+			if (Q.Y > 0.0f) WorstOutside = FMath::Max(WorstOutside, 1.0f - Radial);
+		}
+		TestTrue(FString::Printf(TEXT("Rise %.0f: no profile vertex falls inside the clip curve"), Rise),
+			WorstOutside < 1.0e-3f);
+	}
+
+	// ---- ③ 扁拱的洞**确实更矮**：拱脚以上正中那一列，半圆保留不了的高度扁拱要保留 ----
+	{
+		const FCSWallOpening Flat = MakeArch(240.0f, 50.0f);
+		const FCSWallOpening Round = MakeArch(240.0f, 0.0f);       // Rise = 120
+		const FCSOpeningClipField FF = CSHouse_ComputeClipField(Flat);
+		const FCSOpeningClipField RF = CSHouse_ComputeClipField(Round);
+
+		// 洞心正上方 Z = 200：半圆（拱脚 100、顶 220）还在洞里；扁拱（拱脚 170、顶 220）也在洞里。
+		TestFalse(TEXT("Round arch keeps the crown open at Z=200"), CSHouse_ClipKeeps(RF, RF.Eval(300.0f, 200.0f)));
+		TestFalse(TEXT("Flat arch keeps the crown open at Z=200"), CSHouse_ClipKeeps(FF, FF.Eval(300.0f, 200.0f)));
+
+		// 洞**边缘**附近 S = 300 + 110（离中心 110，半宽 120）、Z = 200：
+		// 半圆在这个高度还没收拢（弧很陡）⇒ 仍是洞；扁拱早就收到 Z=220 附近了 ⇒ 已是墙。
+		TestTrue(TEXT("Flat arch has already closed near the springing edge"),
+			CSHouse_ClipKeeps(FF, FF.Eval(410.0f, 200.0f)));
+
+		// 两者的拱脚高不同 —— 这正是"扁"的定义。
+		TestTrue(TEXT("Flat arch springs higher than the round one"), FF.RefZ > RF.RefZ + 50.0f);
+	}
+
+	// ---- ④ Rise 被夹在洞高之内：给一个荒谬的大值也不许把拱脚推到洞底以下 ----
+	{
+		const FCSWallOpening O = MakeArch(200.0f, 5000.0f);
+		TestTrue(TEXT("Rise is clamped to the opening height"), O.Rise() <= 220.0f + 1.0e-3f);
+		const FCSOpeningClipField F = CSHouse_ComputeClipField(O);
+		TestTrue(TEXT("Clamped rise keeps the springing at or above the sill"), F.RefZ >= -1.0e-3f);
 	}
 
 	return true;
@@ -1289,6 +1423,124 @@ bool FCSHouseFrameAnalyticMatchesLegacyTest::RunTest(const FString& Parameters)
 }
 
 // -----------------------------------------------------------------------------
+// 拱间墩的小石柱：柱础 + 柱身 + 柱头（2026-09-04）
+//
+// 实拍 `img/tiny-glade-ref-twin-arch-pier.jpg`：两道拱之间那根墩不是一摞同样的砖，而是
+// 柱础 + 柱身 + **更宽的柱头**，两道拱圈收在柱头上。这里把它钉成几何断言：
+//   ① 开了柱头之后墩变成三条砖路（础 / 身 / 头），与两侧的拱合计五条；
+//   ② 础与头各**一块**砖、横截面放大（`CrossScale`），柱身与两拱的 `CrossScale` 恒 1；
+//   ③ 三段首尾相接、同一个 S —— 跨度里仍然只有**一列**（`FramePierSingleColumn` 的不变量不许破）；
+//   ④ 柱头高度被夹在墩高的 40% 内：给一个荒谬的大值也不许把柱身挤成负长；
+//   ⑤ 关掉（`CapitalHeight = 0`）逐位退回旧拓扑（三条砖路）。
+// -----------------------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseFramePierCapitalTest,
+	"PCGPlugins.ComputeShaderGenerator.House.FramePierCapital",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseFramePierCapitalTest::RunTest(const FString& Parameters)
+{
+	const ACSHouseActor* CDO = GetDefault<ACSHouseActor>();
+
+	FCSWallOpening A = CSHouseTest_DemoArch(140.0f);
+	FCSWallOpening B = CSHouseTest_DemoArch(300.0f);
+	A.StyleFlags |= CSHouse_StylePierAfter;
+	B.StyleFlags |= CSHouse_StylePierBefore;
+	const FCSWallOpening Pair[2] = { A, B };
+	const float PierCentre = (A.S1() + B.S0()) * 0.5f;
+	float Span = 0.0f, PierTop = 0.0f;
+	TestTrue(TEXT("The demo pair leaves a pier span"), CSHouse_PierSpanBetween(A, B, Span, PierTop));
+
+	auto Build = [&](float CapHeight, TArray<CSHouseFrame::FElement>& Out)
+	{
+		CSHouseFrame::FBrickParams Params;
+		Params.Length = CDO->FrameBrickLength;
+		Params.Gap = CDO->FrameBrickGap;
+		Params.MaxBricks = 4096;
+		Params.CapitalScale = 1.5f;
+		Params.CapitalHeight = CapHeight;
+		CSHouseFrame::FWallFrame Frame;   // 墙空间 = 世界空间
+		Out.Reset();
+		CSHouseFrame::BuildEdgeElements(Frame, MakeArrayView(Pair, 2), Params, Out);
+	};
+
+	// ---- ①②③ 开柱头 ----
+	{
+		TArray<CSHouseFrame::FElement> Elements;
+		Build(14.0f, Elements);
+		TestEqual(TEXT("Arch + base + shaft + capital + arch = five brick paths"), Elements.Num(), 5);
+		if (Elements.Num() == 5)
+		{
+			const CSHouseFrame::FElement& Base = Elements[1];
+			const CSHouseFrame::FElement& Shaft = Elements[2];
+			const CSHouseFrame::FElement& Capital = Elements[3];
+
+			TestTrue(TEXT("Base is a single widened brick on the floor"),
+				Base.BrickCount == 1 && FMath::IsNearlyEqual(Base.CrossScale, 1.5f)
+				&& FMath::IsNearlyEqual(Base.Path.BaseZ, 0.0f) && FMath::IsNearlyEqual(Base.Path.TopZ, 14.0f)
+				&& FMath::IsNearlyEqual(Base.Path.LeftS, PierCentre, 0.01f));
+			TestTrue(TEXT("Capital is a single widened brick under the springing"),
+				Capital.BrickCount == 1 && FMath::IsNearlyEqual(Capital.CrossScale, 1.5f)
+				&& FMath::IsNearlyEqual(Capital.Path.TopZ, PierTop, 0.01f)
+				&& FMath::IsNearlyEqual(Capital.Path.BaseZ, PierTop - 14.0f, 0.01f)
+				&& FMath::IsNearlyEqual(Capital.Path.LeftS, PierCentre, 0.01f));
+			TestTrue(TEXT("Shaft keeps the plain cross-section and fills exactly the gap between them"),
+				FMath::IsNearlyEqual(Shaft.CrossScale, 1.0f)
+				&& FMath::IsNearlyEqual(Shaft.Path.BaseZ, 14.0f, 0.01f)
+				&& FMath::IsNearlyEqual(Shaft.Path.TopZ, PierTop - 14.0f, 0.01f)
+				&& FMath::IsNearlyEqual(Shaft.Path.LeftS, PierCentre, 0.01f));
+			TestTrue(TEXT("The arches themselves are not widened"),
+				FMath::IsNearlyEqual(Elements[0].CrossScale, 1.0f) && FMath::IsNearlyEqual(Elements[4].CrossScale, 1.0f));
+
+			// 单砖的位置 = 它那一小段的中点（HalfLen 就是半段高）。
+			FVector2f SZ, Tangent;
+			CSHouseFrame::EvalPath(Base.Path, Base.HalfLen, SZ, Tangent);
+			TestTrue(TEXT("Base brick sits mid-slab"), FMath::IsNearlyEqual(SZ.Y, 7.0f, 0.01f) && FMath::IsNearlyEqual(SZ.X, PierCentre, 0.01f));
+			CSHouseFrame::EvalPath(Capital.Path, Capital.HalfLen, SZ, Tangent);
+			TestTrue(TEXT("Capital brick sits mid-slab"), FMath::IsNearlyEqual(SZ.Y, PierTop - 7.0f, 0.01f));
+
+			// ③ 跨度里仍然只有一列：三段砖心的 S 全部相同。
+			TArray<double> Columns;
+			for (const CSHouseFrame::FElement& E : Elements)
+			{
+				for (int32 K = 0; K < E.BrickCount; ++K)
+				{
+					CSHouseFrame::EvalPath(E.Path, E.HalfLen + K * E.Pitch, SZ, Tangent);
+					if (SZ.Y > PierTop - 1.0f || SZ.X < A.S1() - 0.5f || SZ.X > B.S0() + 0.5f) continue;
+					bool bKnown = false;
+					for (const double S : Columns) bKnown |= FMath::Abs(S - SZ.X) < 0.5;
+					if (!bKnown) Columns.Add(SZ.X);
+				}
+			}
+			TestEqual(TEXT("Base, shaft and capital still form exactly one column"), Columns.Num(), 1);
+		}
+	}
+
+	// ---- ④ 夹住：柱头高度荒谬地大，柱身也不许是负长 ----
+	{
+		TArray<CSHouseFrame::FElement> Elements;
+		Build(1000.0f, Elements);
+		TestEqual(TEXT("An absurd capital height still yields five paths"), Elements.Num(), 5);
+		if (Elements.Num() == 5)
+		{
+			TestTrue(TEXT("Capital height is clamped so the shaft keeps positive length"),
+				Elements[2].Path.TopZ > Elements[2].Path.BaseZ + 1.0f
+				&& Elements[1].Path.TopZ <= PierTop * 0.4f + 0.01f);
+		}
+	}
+
+	// ---- ⑤ 关掉 = 旧拓扑 ----
+	{
+		TArray<CSHouseFrame::FElement> Elements;
+		Build(0.0f, Elements);
+		TestEqual(TEXT("With the capital off the pier is one plain path again (three total)"), Elements.Num(), 3);
+	}
+
+	return true;
+}
+
+// -----------------------------------------------------------------------------
 // 拱间墩上只砌**一列**砖
 //
 // 旧路让相邻两拱各出一条门樘砖脚、各伸进跨度一半 ⇒ 两列砖在墩正中**共面对接**，从地面
@@ -1487,33 +1739,17 @@ bool FCSHouseFrameBrickOverlapTest::RunTest(const FString& Parameters)
 }
 
 // -----------------------------------------------------------------------------
-// 墙-顶收口：檐口楔形缝里到底有没有实体 / 山墙与屋面底是不是共面 / 屋脊是收口还是互穿
+// 房体夹具：竖直射线数实体层数 + 一组参数化的房体 desc
 //
-// 为什么不是"从室内往天上打一条射线"：檐口那道楔形空腔在**数学上**是封住的 ——
-// CSHouseRoof_EvalZAcross 在 footprint 边界处按构造等于墙顶（EaveZ），墙顶面与屋面底沿墙外棱
-// 相切，任何直线射线都跨不过那条切线，所以射线判据在**修之前也全绿**，什么都测不出来。
-// 真正的破绽是这条"封口"宽度为零：屋面底那张大四边形从墙顶外棱的**内部**横切过去（T 型接缝），
-// 而顶点是 float32 世界坐标 —— 缝里没有任何实体，封口靠的是两张面在一条线上恰好相等。
-// 所以断言落在**体积**上：楔形缝里每一点都必须被实体包住，且封口与屋面板是**互穿**（深度 ≥ 2）
-// 而不是相切。这条判据与 FootprintSize / RoofPitch / RoofOverhang / 脊向 / 墙厚全都无关地成立。
+// 深度判据的用法：房体是**凸块的并集**（面板盒、窗台盒、柱子全是凸的，且每块闭合、法线朝外）。
+// 对一个凸块：起点在块内的竖直射线只穿出一次（N·up > 0，记 +1）；起点在块外则一进一出净 0。
+// 于是**所有交点上 sign(N·up) 的和 = 包住 P 的块数** —— 不要求 mesh 是流形，也不受"埋在实心里
+// 的背靠背重复面"影响（那种一对正好抵消）。竖直射线穿不过竖直面，所以 XY 投影退化的三角直接跳过。
 // -----------------------------------------------------------------------------
-
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-	FCSHouseEaveSealedTest,
-	"PCGPlugins.ComputeShaderGenerator.House.EaveSealed",
-	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 
 namespace
 {
-/**
- * 从 P 朝正上方数"套着几层实体"。
- *
- * 房体是**凸块的并集**（面板盒、窗台盒、屋面板、山墙棱柱、檐口封口楔形全是凸的，且每块闭合、
- * 法线朝外）。对一个凸块：起点在块内的竖直射线只穿出一次（N·up > 0，记 +1）；起点在块外则
- * 一进一出净 0。于是**所有交点上 sign(N·up) 的和 = 包住 P 的块数** —— 不要求 mesh 是流形，
- * 也不受"埋在实心里的背靠背重复面"影响（那种一对正好抵消）。
- * 竖直射线穿不过竖直面，所以 XY 投影退化的三角直接跳过。
- */
+/** 从 P 朝正上方数"套着几层实体"（判据见本节抬头）。 */
 int32 CSHouseTest_SolidDepth(const FCSGpuMeshCPUData& S, const FVector& P)
 {
 	int32 Depth = 0;
@@ -1544,184 +1780,22 @@ int32 CSHouseTest_SolidDepth(const FCSGpuMeshCPUData& S, const FVector& P)
 	return Depth;
 }
 
-/** 一组房体参数（脊向 / 底面 / 坡度 / 外挑 / 板厚 / 墙高 / 墙厚）。 */
+/** 一组房体参数（底面 / 墙高 / 墙厚）。屋面不进房体三角汤，所以坡度与外挑在这里无处可用。 */
 struct FCSHouseTestBodyCase
 {
-	ECSRidgeAxis Axis;
 	double SizeX, SizeY;
-	float Pitch, Overhang, RoofThickness, WallHeight, WallThickness;
+	float WallHeight, WallThickness;
 	const TCHAR* What;
 };
 
 FCSHouseBodyDesc CSHouseTest_MakeBody(const FCSHouseTestBodyCase& Case)
 {
 	FCSHouseBodyDesc Body;
-	Body.Roof.RidgeAxis = Case.Axis;
-	Body.Roof.Footprint = FVector2D(Case.SizeX, Case.SizeY);
-	Body.Roof.EaveZ = Case.WallHeight;
-	Body.Roof.Pitch = Case.Pitch;
-	Body.Roof.Overhang = Case.Overhang;
-	Body.Roof.Thickness = Case.RoofThickness;
-	Body.Footprint = Body.Roof.Footprint;
+	Body.Footprint = FVector2D(Case.SizeX, Case.SizeY);
 	Body.WallHeight = Case.WallHeight;
 	Body.WallThickness = Case.WallThickness;
 	return Body;   // World = Identity ⇒ 三角汤就是局部坐标
 }
-}
-
-bool FCSHouseEaveSealedTest::RunTest(const FString& Parameters)
-{
-	// 覆盖面就是这条断言的价值：只把演示那一个尺寸调对等于什么都没证。每一行都换掉至少两个
-	// 会改变收口形状的量 —— 脊向决定哪两面是檐墙（两组边的长度口径还不一样）、外挑 0 是
-	// 屋面端面与墙外表面共面的退化位、板厚下限是咬入量最小的最坏情况、坡度上下限决定缝有多深。
-	const FCSHouseTestBodyCase Cases[] = {
-		{ ECSRidgeAxis::X,  600, 400, 35.0f, 25.0f, 12.0f, 300.0f, 24.0f, TEXT("demo size") },
-		{ ECSRidgeAxis::Y,  600, 400, 35.0f, 25.0f, 12.0f, 300.0f, 24.0f, TEXT("demo size, ridge along Y") },
-		{ ECSRidgeAxis::X,  400, 600, 20.0f,  0.0f, 12.0f, 300.0f, 24.0f, TEXT("zero overhang") },
-		{ ECSRidgeAxis::Y,  400, 600, 60.0f, 90.0f,  6.0f, 240.0f, 40.0f, TEXT("steep, deep overhang, thick wall") },
-		{ ECSRidgeAxis::X, 1000, 320, 15.0f, 60.0f, 20.0f, 420.0f, 12.0f, TEXT("shallow, thick slab, thin wall") },
-		{ ECSRidgeAxis::Y,  260, 250, 45.0f, 25.0f,  2.0f, 300.0f, 24.0f, TEXT("near square, thinnest slab") },
-		{ ECSRidgeAxis::X,  250, 250, 70.0f, 25.0f, 12.0f, 300.0f, 24.0f, TEXT("pitch clamp") },
-	};
-
-	// 采样比例一律取"看着不像整数"的值：正好落在面板 / 棱柱边界上的竖直射线判定是模糊的。
-	// 0.008 与 0.993 是**故意**贴到山墙棱柱盖着的那两小段上 —— 檐口封口件在那里是缺席的，
-	// 转角靠山墙盖，漏了这两个比例就测不到"四条边处理不一样"的那两个角。
-	const double AlongFrac[] = { 0.008, 0.037, 0.213, 0.409, 0.5, 0.661, 0.837, 0.971, 0.993 };
-	const double DepthFrac[] = { 0.13, 0.47, 0.86 };
-	const double HeightFrac[] = { 0.06, 0.31, 0.62, 0.93 };
-	// 屋脊那组探针尤其不能取整比例：竖直射线落在**四边形的对角线**上时两个三角会同时判中，
-	// 深度凭空 +1。踩过一次 —— 外挑 0 时 (沿脊 0, 跨度 半跨/2) 恰好压在屋面板上下表面的对角线上，
-	// 报出"深度 2 = 两板互穿"，其实两板是好的。深度判据只会**多**数不会少数，所以只有
-	// 「恰好等于 1」这一条会被它咬到。
-	const double RidgeAbsCm[] = { 0.37, -0.37, 2.13, -2.13, 5.31, -5.31 };
-	const double RidgeFrac[] = { 0.023, -0.023, 0.517, -0.517, 0.971, -0.971 };
-
-	for (const FCSHouseTestBodyCase& Case : Cases)
-	{
-		const FCSHouseBodyDesc Body = CSHouseTest_MakeBody(Case);
-		const FCSRoofDesc& Roof = Body.Roof;
-		FCSGpuMeshCPUData S;
-		CSHouse_BuildBodySoup(Body, S);
-
-		const float T = Body.WallThickness;
-		const float H = Body.WallHeight;
-		const float LA = Roof.RidgeLength();
-		const float HalfSpan = Roof.HalfSpan();
-		const float RampW = FMath::Min(T, HalfSpan);
-		const float SlabVert = CSHouseRoof_SlabVerticalThickness(Roof);
-		const double HX = Body.Footprint.X * 0.5, HY = Body.Footprint.Y * 0.5;
-
-		int32 OpenSamples = 0, TangentSamples = 0;
-		double WorstOpenGap = 0.0;
-		FVector WorstOpenAt = FVector::ZeroVector;
-
-		// ---- ① 墙顶到屋面底之间那条楔形缝：**周界带**上每一点都必须被实体包住 ----
-		// 周界带按 footprint 反推（离某条边不超过一个墙厚），不照抄生成器的四段分法 ——
-		// 照抄的话生成器漏了哪条边，断言也会跟着漏。
-		for (int32 Side = 0; Side < 4; ++Side)
-		{
-			for (double FA : AlongFrac)
-			{
-				for (double FD : DepthFrac)
-				{
-					// Side 0/2 = ±Y 那两面（带沿 X 走），1/3 = ±X 那两面。
-					const double Inset = FD * T;
-					double X = 0, Y = 0;
-					if ((Side & 1) == 0)
-					{
-						X = -HX + FA * Body.Footprint.X;
-						Y = (Side == 0) ? (-HY + Inset) : (HY - Inset);
-					}
-					else
-					{
-						Y = -HY + FA * Body.Footprint.Y;
-						X = (Side == 1) ? (HX - Inset) : (-HX + Inset);
-					}
-
-					const FVector2D XY(X, Y);
-					const double Across = Roof.LocalToAcross(XY);
-					const double SoffitZ = CSHouseRoof_EvalZAcross(Roof, Across);
-					if (SoffitZ - H < 0.05) continue;   // 墙外棱附近缝高本就是 0，没有"缝里"可言
-
-					for (double FZ : HeightFrac)
-					{
-						const FVector P(X, Y, H + FZ * (SoffitZ - H));
-						if (CSHouseTest_SolidDepth(S, P) < 1)
-						{
-							++OpenSamples;
-							if (SoffitZ - H > WorstOpenGap) { WorstOpenGap = SoffitZ - H; WorstOpenAt = P; }
-						}
-					}
-
-					// ---- ② 封口不是"刚好贴住"而是**咬进**屋面板：同一处 XY 在屋面底之上半个
-					//      咬入量的地方，必须同时属于封口件和屋面板（深度 ≥ 2）。零余量共面正是
-					//      山墙那条发丝亮线的成因，这一条把两处一起钉住。
-					const float Bite = CSHouseRoof_SoffitBite(Roof, Across, RampW);
-					if (Bite > 0.2f && CSHouseTest_SolidDepth(S, FVector(X, Y, SoffitZ + 0.5 * Bite)) < 2)
-					{
-						++TangentSamples;
-					}
-				}
-			}
-		}
-
-		TestTrue(FString::Printf(TEXT("[%s] no sky through the eave wedge (%d open samples, worst gap %.2f cm at %s)"),
-			Case.What, OpenSamples, WorstOpenGap, *WorstOpenAt.ToString()), OpenSamples == 0);
-		TestTrue(FString::Printf(TEXT("[%s] wall tops bite into the slab instead of touching it (%d tangent samples)"),
-			Case.What, TangentSamples), TangentSamples == 0);
-
-		// ---- ② 补一刀：山墙**整条跨度**（不只周界带）都要咬进屋面板 ----
-		int32 GableTangent = 0;
-		for (int32 End = 0; End < 2; ++End)
-		{
-			const double Along = (End == 0 ? 1.0 : -1.0) * (LA * 0.5 - T * 0.5);
-			for (double AF : { 0.041, 0.313, -0.313, 0.687, -0.687 })
-			{
-				const double Across = AF * HalfSpan;
-				const float Bite = CSHouseRoof_SoffitBite(Roof, Across, RampW);
-				if (Bite <= 0.2f) continue;
-				const FVector L = Roof.RidgeToLocal(Along, Across, CSHouseRoof_EvalZAcross(Roof, Across) + 0.5 * Bite);
-				if (CSHouseTest_SolidDepth(S, L) < 2) ++GableTangent;
-			}
-		}
-		TestTrue(FString::Printf(TEXT("[%s] the gable slope is not coplanar with the roof underside (%d tangent samples)"),
-			Case.What, GableTangent), GableTangent == 0);
-
-		// ---- ③ 屋脊：两块坡板对切收口，不互穿 ----
-		// 判据一：沿脊中点（山墙够不着的地方）实体深度恒为 1。互穿的话过冲那一段是 2。
-		int32 RidgeOverlap = 0;
-		FString RidgeWorst;
-		const double ProbeAlong = 0.211 * LA * 0.5;   // 远离两端山墙，又不落在任何对称位上
-		auto ProbeSlab = [&](double Across)
-		{
-			const FVector L = Roof.RidgeToLocal(ProbeAlong, Across, CSHouseRoof_EvalZAcross(Roof, Across) + 0.5 * SlabVert);
-			const int32 D = CSHouseTest_SolidDepth(S, L);
-			if (D != 1)
-			{
-				++RidgeOverlap;
-				if (RidgeWorst.IsEmpty()) RidgeWorst = FString::Printf(TEXT("across=%.2f depth=%d"), Across, D);
-			}
-		};
-		for (double AC : RidgeAbsCm) if (FMath::Abs(AC) < HalfSpan) ProbeSlab(AC);
-		for (double AF : RidgeFrac) ProbeSlab(AF * HalfSpan);
-		TestTrue(FString::Printf(TEXT("[%s] the two slabs miter at the ridge instead of crossing (%d doubled samples, first %s)"),
-			Case.What, RidgeOverlap, *RidgeWorst), RidgeOverlap == 0);
-
-		// 判据二：屋面覆盖范围内不许有任何顶点戳出屋面板的上表面 —— 互穿时露出来的那个交叉小尖
-		// （旧做法 ≈ Thickness·sin(pitch)）就是这条抓的东西，山墙 / 封口咬得太深也一样抓。
-		float WorstPoke = 0.0f;
-		for (const FVector3f& Pf : S.Positions)
-		{
-			const FVector2D XY(Pf.X, Pf.Y);
-			if (!CSHouseRoof_IsUnderRoof(Roof, XY)) continue;
-			const float TopZ = CSHouseRoof_EvalZAcross(Roof, Roof.LocalToAcross(XY)) + SlabVert;
-			WorstPoke = FMath::Max(WorstPoke, float(Pf.Z) - TopZ);
-		}
-		TestTrue(FString::Printf(TEXT("[%s] nothing pokes through the roof top surface (%.3f cm)"), Case.What, WorstPoke),
-			WorstPoke < 0.05f);
-	}
-	return true;
 }
 
 // -----------------------------------------------------------------------------
@@ -1894,7 +1968,7 @@ bool CSHouseTest_VertexKept(const FCSGpuMeshCPUData& S, int32 Index)
 
 bool FCSHousePierPlasterTest::RunTest(const FString& Parameters)
 {
-	const FCSHouseTestBodyCase Case = { ECSRidgeAxis::X, 600, 400, 35.0f, 25.0f, 12.0f, 300.0f, 24.0f, TEXT("piers") };
+	const FCSHouseTestBodyCase Case = { 600, 400, 300.0f, 24.0f, TEXT("piers") };
 	const float PierWidth = 40.0f;
 
 	// 边 0 = 南墙：Start = (−HX, −HY)、U = +X、In = +Y、Len = FootprintSize.X（见 CSHouse_GetEdge）。
@@ -2085,10 +2159,9 @@ namespace
 /**
  * 带裁剪场的**墙**面板顶点数。/36 = 洞板数（一块洞板恰好一次 `AddBox`）。
  *
- * ⚠️ **必须先按 R 通道筛出墙**：两块屋面板是直接写 `Writer.Semantic = CSHouse_Semantic(Roof)`
- * 的（没走 `SetPanel`），那一句不碰 `.Z` ⇒ 屋面顶点的 B 恒为 0，按通道字典读出来正好是
- * "形状 id = Arch"。屋面材质是 Opaque、不消费这两条通道，所以线上无害；但只按 B 数的话，
- * 一栋空房子也会数出两块"洞板"来（实测 72 个顶点），断言当场变成描述屋面。
+ * ⚠️ **必须先按 R 通道筛出墙**：只按 B 数会把别的构件也算进来（历史上两块实体屋面板就撞过
+ * 这一条 —— 它们的 B 恒为 0，按字典读正好是"形状 id = Arch"，一栋空房子能数出两块"洞板"）。
+ * 屋面现在改成瓦片实例、根本不进这份三角汤，但这条筛选照留：柱子、包边砖同样不是墙。
  */
 int32 CSHouseTest_ClipVertCount(const FCSGpuMeshCPUData& S)
 {
@@ -2122,7 +2195,7 @@ bool FCSHouseWindowPredicateMatchesGeometryTest::RunTest(const FString& Paramete
 	// 出厂参数（CDO），断言才真的钉住线上那一份口径。
 	const ACSHouseActor* CDO = GetDefault<ACSHouseActor>();
 	const float Pier = CDO->PierWidth;
-	const FCSHouseTestBodyCase Case = { ECSRidgeAxis::X, 600, 400, 35.0f, 25.0f, 12.0f, 300.0f, 24.0f, TEXT("windows") };
+	const FCSHouseTestBodyCase Case = { 600, 400, 300.0f, 24.0f, TEXT("windows") };
 	const FVector2D Foot(Case.SizeX, Case.SizeY);
 
 	// 两扇门：一扇占住南墙（边 0）的右端 —— 窗挤到它跟前就该被判 `OverlapsOpening`（门拱优先）；
@@ -2178,7 +2251,8 @@ bool FCSHouseWindowPredicateMatchesGeometryTest::RunTest(const FString& Paramete
 	// `CSHouse_GetEdge` 对短边的缩短口径也带进这条断言。
 	const int32 Edges[2] = { 0, 1 };
 
-	int32 Accepted = 0, Rejected = 0, DroppedByGeometry = 0, BadPanel = 0, MissingSill = 0, NoBricks = 0;
+	int32 Accepted = 0, Rejected = 0, DroppedByGeometry = 0, BadPanel = 0, MissingSill = 0;
+	int32 WindowBricks = 0, DoorPaths = 0;
 	int32 RejectHistogram[8] = { 0 };
 	FString FirstFailure;
 
@@ -2286,7 +2360,12 @@ bool FCSHouseWindowPredicateMatchesGeometryTest::RunTest(const FString& Paramete
 						continue;
 					}
 
-					// ④ 砖那一侧：窗必须拿到一条自己的砖路，且**带第四段**（窗台底边）。
+					// ④ 砖那一侧：**窗一条框砖路都不许有**（2026-09-06 裁决「附属物持有 mesh」的
+					// 直接后果：洞缘由窗自带的预制框盖住，房子再砌一圈就是双份几何）。
+					//
+					// ⚠️ 同一次调用里门/拱**照旧**出它那一圈 —— 门是房子自己生成的（`CSHouseActor.cpp`
+					// 里由道路推导），没有任何附属物替它盖洞缘，那一圈砖**就是**门框。所以这里一次验
+					// 两头：窗为零、门非零。只验前一半的话，把整条产线掐死也能全绿。
 					CSHouseFrame::FBrickParams Params;
 					Params.Length = CDO->FrameBrickLength;
 					Params.Gap = CDO->FrameBrickGap;
@@ -2296,19 +2375,23 @@ bool FCSHouseWindowPredicateMatchesGeometryTest::RunTest(const FString& Paramete
 					TArray<FCSWallOpening> EdgeOnly;
 					for (const FCSWallOpening& O : All) if (O.EdgeIndex == Edge) EdgeOnly.Add(O);
 					CSHouseFrame::BuildEdgeElements(Frame, EdgeOnly, Params, Elements);
-					bool bWindowPath = false;
 					for (const CSHouseFrame::FElement& E : Elements)
 					{
-						bWindowPath |= FMath::IsNearlyEqual(E.Path.CenterS, Window.CenterS, 0.01f)
-							&& E.BrickCount > 0 && E.Path.bSill && E.Path.SillLen() > 0.0f;
-					}
-					if (!bWindowPath)
-					{
-						++NoBricks;
-						if (FirstFailure.IsEmpty())
+						if (E.BrickCount <= 0) continue;
+						// 窗那条路的指纹：同一个 S **且带第四段**。门落地没有第四段，墩也没有 ——
+						// 少了 `bSill` 这一半，一根正好骑在窗中线上的墩会被误判成"窗又长砖了"。
+						if (FMath::IsNearlyEqual(E.Path.CenterS, Window.CenterS, 0.01f) && E.Path.bSill)
 						{
-							FirstFailure = FString::Printf(TEXT("edge=%d shape=%d S=%.0f 没拿到带窗台段的砖路"),
-								Edge, int32(Shape), Window.CenterS);
+							++WindowBricks;
+							if (FirstFailure.IsEmpty())
+							{
+								FirstFailure = FString::Printf(TEXT("edge=%d shape=%d S=%.0f 的窗还在长框砖（%d 块）"),
+									Edge, int32(Shape), Window.CenterS, E.BrickCount);
+							}
+						}
+						else
+						{
+							++DoorPaths;
 						}
 					}
 				}
@@ -2337,7 +2420,9 @@ bool FCSHouseWindowPredicateMatchesGeometryTest::RunTest(const FString& Paramete
 		FirstFailure.IsEmpty() ? TEXT("nothing dropped") : *FirstFailure), DroppedByGeometry, 0);
 	TestEqual(TEXT("...and that panel spans the whole opening with its end caps outside the clip"), BadPanel, 0);
 	TestEqual(TEXT("...and the wall under the sill stays solid (裁决三：几何永远实心)"), MissingSill, 0);
-	TestEqual(TEXT("...and the frame lays it a brick path carrying the sill course"), NoBricks, 0);
+	TestEqual(TEXT("...and grows no frame bricks of its own (its prefab frame covers the edge)"), WindowBricks, 0);
+	TestTrue(FString::Printf(TEXT("...while the doors sharing those edges still get their brick ring (%d paths)"),
+		DoorPaths), DoorPaths > 0);
 
 	// ---- 墩跨度不接受窗（计划 D6）：默认参数下不可达，必须把跨度撑开才测得到 ----
 	{
@@ -2498,10 +2583,27 @@ bool FCSHouseFrameWindowSillTest::RunTest(const FString& Parameters)
 		TestEqual(FString::Printf(TEXT("%s: and solid wall on its outward side"), C.What), OutsideBad, 0);
 
 		// ---- ③ 底边被砖盖满 ----
+		//
+		// ⚠️ 这里**故意按门那一档送进去**：窗自 2026-09-06 起不出框砖，但 `MakeOpeningPath` 的
+		// 第四段仍然为门服务，本段验的是那一段到底有没有被 `SolveRun` 铺满 —— 与洞的类型无关。
+		// 第四段由 `Z0 > 0` 决定而不是类型（见上面门那一档：落地 ⇒ 无第四段），所以只换 `Type`
+		// 就能拿到同一条四段路。
+		FCSWallOpening AsDoor = Window;
+		AsDoor.Type = ECSOpeningType::Door;
 		TArray<CSHouseFrame::FElement> Elements;
-		const int32 Bricks = CSHouseFrame::BuildEdgeElements(Frame, MakeArrayView(&Window, 1), Params, Elements);
-		TestTrue(FString::Printf(TEXT("%s lays bricks (%d in %d paths)"), C.What, Bricks, Elements.Num()),
+		const int32 Bricks = CSHouseFrame::BuildEdgeElements(Frame, MakeArrayView(&AsDoor, 1), Params, Elements);
+		TestTrue(FString::Printf(TEXT("%s lays bricks when it is a door (%d in %d paths)"), C.What, Bricks, Elements.Num()),
 			Bricks > 8 && Elements.Num() == 1);
+
+		// **退役本身的判据**：几何一模一样、只是类型是窗 ⇒ 一块砖都不出。用"恰好为零"而不是
+		// "少一些"，是为了让"把窗重新接回框砖"的改动没法悄悄通过。
+		{
+			TArray<CSHouseFrame::FElement> AsWindow;
+			const int32 WindowBricks = CSHouseFrame::BuildEdgeElements(Frame, MakeArrayView(&Window, 1), Params, AsWindow);
+			TestEqual(FString::Printf(TEXT("%s lays no frame bricks as a window"), C.What), WindowBricks, 0);
+			TestEqual(FString::Printf(TEXT("%s: not even an empty path"), C.What), AsWindow.Num(), 0);
+		}
+
 		if (Elements.Num() != 1) continue;
 
 		const CSHouseFrame::FElement& E = Elements[0];
@@ -2779,7 +2881,6 @@ bool FCSHouseSeamGeometryTest::RunTest(const FString& Parameters)
 	// 拿房体三角汤直接验：接缝那一段的三角形数**不许减少**（不生成面板就是一个真几何洞），
 	// 而裁剪判据必须在那一段上说"丢掉"。两条一起才说得清"洞在渲染层、不在几何里"。
 	FCSHouseBodyDesc Desc;
-	Desc.Roof = CSHouseTest_MakeRoof(ECSRidgeAxis::X, A.Footprint.X, A.Footprint.Y);
 	Desc.Footprint = A.Footprint;
 	Desc.WallThickness = A.WallThickness;
 	Desc.WallHeight = A.WallHeight;
@@ -2820,115 +2921,1637 @@ bool FCSHouseSeamGeometryTest::RunTest(const FString& Parameters)
 	return true;
 }
 
-// -----------------------------------------------------------------------------
-// 屋面必须**符合**那本冻结的顶点色通道字典（P2 冻结，仲裁点在 `ACSHouseActor` 类注释）
-//
-// 两块坡板过去是 `Writer.Semantic = CSHouse_Semantic(Roof)` 直接砌的、**没走 `SetPanel`**，
-// 而那一句既不碰 `.Z`、也不换裁剪场，于是屋面的两条通道同时在撒谎：
-//   · B 恒为 0 —— 字典说 B 是洞形状 id，而 0 是**合法**的 id（`Arch`）⇒ "这块屋面上有个拱洞"；
-//   · UV1 原样留着**上一块墙面板**的 clip 场 q。
-// 屋面材质是 Opaque 常数色、不消费这两条通道，所以线上无害、也没有任何东西会报错；但裁决六
-// 要求通道**随网格烘进 StaticMesh**，将来任何消费 B/UV1 的东西（铺瓦、雪线、屋顶天窗）
-// 都会把整片屋面读成"有洞"。修法是让屋面去符合字典，**不动字典**。
-//
-// ⚠️ 断言必须**两条一起立**，只立一条都会退化：
-//   · 只判 B：把那一句换成"只改语义色但把 B 写对"照样绿，UV1 还是残值；
-//   · 只判 UV1：在"最后一块墙面板本来就没有裁剪场"的房子上残值与哨兵逐位相同 ⇒ 恒真。
-// ⚠️ 因此夹具**必须自带对照组**：得有一栋房子的最后一块墙面板真的带着裁剪场。默认参数下
-//    第 3 面墙末尾总会补一块无 clip 的实心段，残值恰好就是哨兵 —— 那种夹具证明不了 UV1
-//    这一条。下面 `Stale` 那一组把洞的面板格顶到墙末端（`AddPanel` 的零宽守卫吃掉尾段），
-//    最后一次 `SetPanel` 因此带着一个真的 Arch 场；`bStaleFixtureIsReal` 那条就是在证这件事。
-// -----------------------------------------------------------------------------
+// =============================================================================
+// 角石（D7 墙自身转角，合卷卷一 A7 / 卷五 A11）
+// =============================================================================
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-	FCSHouseRoofChannelDictionaryTest,
-	"PCGPlugins.ComputeShaderGenerator.House.RoofChannelDictionary",
+	FCSHouseQuoinCoversOuterEdgeTest,
+	"PCGPlugins.ComputeShaderGenerator.House.QuoinCoversOuterEdge",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 
-bool FCSHouseRoofChannelDictionaryTest::RunTest(const FString& Parameters)
+bool FCSHouseQuoinCoversOuterEdgeTest::RunTest(const FString& Parameters)
 {
-	// 无洞面板的哨兵：`FCSOpeningClipField::Eval` 在 bValid = false 时返回的那一对。
-	// 从**真源**取而不是抄一个 8.0f 进来，改哨兵时这条断言才会跟着走。
-	const FVector2f Sentinel = FCSOpeningClipField().Eval(0.0f, 0.0f);
-
-	const FCSHouseTestBodyCase Cases[] = {
-		{ ECSRidgeAxis::X,  600, 400, 35.0f, 25.0f, 12.0f, 300.0f, 24.0f, TEXT("demo size") },
-		{ ECSRidgeAxis::Y,  600, 400, 35.0f, 25.0f, 12.0f, 300.0f, 24.0f, TEXT("ridge along Y") },
-		{ ECSRidgeAxis::X,  400, 600, 20.0f,  0.0f, 12.0f, 300.0f, 24.0f, TEXT("zero overhang") },
+	// ⚠️ **判据不是"不穿模"** —— 四面墙是精确 butt joint，那条恒真、测了也永远绿。
+	// 角石要盖的是外角那条竖直棱上的 UV 岛断裂，所以判据是：砖的横截面必须在**两个相邻墙面**
+	// 的外法线方向上都伸出墙外表面。只伸出一个方向 = 只遮住半条棱，另一半照旧断纹。
+	struct FCase { const TCHAR* What; FVector2D Footprint; float Yaw; FVector2D Center; float Inset; };
+	const FCase Cases[] = {
+		{ TEXT("axis-aligned"),     FVector2D(600.0, 400.0),    0.0f, FVector2D(0.0, 0.0),       0.0f },
+		{ TEXT("yawed 37 deg"),     FVector2D(600.0, 400.0),   37.0f, FVector2D(1200.0, -800.0), 0.0f },
+		{ TEXT("square + offset"),  FVector2D(500.0, 500.0), -113.0f, FVector2D(-300.0, 450.0),  0.0f },
+		{ TEXT("slightly inset"),   FVector2D(800.0, 300.0),   90.0f, FVector2D(0.0, 0.0),       4.0f },
 	};
 
-	// 第 3 面墙（西墙）长 = Footprint.Y − 2T = 352。面板格 = 半宽 + 半个墩 ⇒ 300 + 50 + 10 = 360
-	// 被夹到 352，游标因此正好停在墙末端，尾段那次 `AddPanel` 被 `SB − SA < 0.5f` 吃掉 ——
-	// 于是**最后一次 `SetPanel` 带的是这个洞的 Arch 场**，屋面若不换场就会原样继承它。
-	FCSWallOpening Stale;
-	Stale.Shape = ECSOpeningShape::Arch;
-	Stale.EdgeIndex = 3;
-	Stale.CenterS = 300.0f;
-	Stale.Width = 100.0f;
-	Stale.Z0 = 0.0f;
-	Stale.Z1 = 200.0f;
-	Stale.Tag = 7;
+	const float T = 24.0f;          // WallThickness
+	const float Depth = 20.0f;      // FrameBrickDepth —— 砖的 +X（面内朝外）
+	const float Thick = T;          // FrameBrickThickness <= 0.5 时退化成墙厚（见 EnsureFrameComponent）
+	const double Diag = 0.70710678118654752440;
 
-	bool bStaleFixtureIsReal = false;
-
-	for (int32 Variant = 0; Variant < 2; ++Variant)
+	for (const FCase& C : Cases)
 	{
-		for (const FCSHouseTestBodyCase& Case : Cases)
+		const FTransform World(FRotator(0.0f, C.Yaw, 0.0f), FVector(C.Center.X, C.Center.Y, 0.0));
+		TArray<CSHouseQuoin::FQuoin> Quoins;
+		const int32 Made = CSHouseQuoin::BuildQuoins(World, C.Footprint, T, 0.0f, 300.0f, C.Inset, Quoins);
+
+		TestEqual(FString::Printf(TEXT("[%s] a rectangle yields exactly four quoins"), C.What), Made, 4);
+		if (Made != 4) continue;
+
+		const double HX = 0.5 * C.Footprint.X;
+		const double HY = 0.5 * C.Footprint.Y;
+
+		for (int32 Index = 0; Index < 4; ++Index)
 		{
-			FCSHouseBodyDesc Body = CSHouseTest_MakeBody(Case);
-			Body.PierWidth = 20.0f;
-			if (Variant == 1) Body.Openings = { Stale };
+			const CSHouseQuoin::FQuoin& Q = Quoins[Index];
+			const FVector2D Sign = CSHouseQuoin::CornerSign(Index);
 
-			FCSGpuMeshCPUData S;
-			CSHouse_BuildBodySoup(Body, S);
+			// ---- 柱心：Inset = 0 时正落在外角点上 ----
+			const FVector Expect = World.TransformPosition(FVector(
+				Sign.X * HX - Sign.X * Diag * C.Inset,
+				Sign.Y * HY - Sign.Y * Diag * C.Inset, 0.0));
+			TestTrue(FString::Printf(TEXT("[%s] quoin %d sits on its footprint corner"), C.What, Index),
+				FVector2D(Expect.X, Expect.Y).Equals(Q.Point, 0.01));
 
-			const FString What = FString::Printf(TEXT("%s%s"), Case.What,
-				Variant == 1 ? TEXT(" + opening running to the end of the last wall") : TEXT(""));
+			// ---- 朝外方向 = 角平分线（世界空间） ----
+			const FVector Bisector = World.TransformVectorNoScale(FVector(Sign.X * Diag, Sign.Y * Diag, 0.0));
+			TestTrue(FString::Printf(TEXT("[%s] quoin %d points along the corner bisector"), C.What, Index),
+				FVector2D::DotProduct(Q.Outward, FVector2D(Bisector.X, Bisector.Y)) > 0.999);
 
-			// ---- 对照组：探针真的打在屋面上（两块坡板 = 两次 AddBox = 2 × 36 顶点）----
-			int32 FirstRoof = INDEX_NONE, RoofVerts = 0, BadShapeId = 0, BadUV1 = 0, Discarded = 0;
-			FVector2f WorstUV1 = Sentinel;
-			for (int32 Index = 0; Index < S.Colors.Num(); ++Index)
+			// ---- 核心判据：两个相邻墙面各自的外法线上都伸出墙外 ----
+			// 砖的横截面 = 沿 Outward 的 Depth × 沿其法向的 Thick，中心在 Q.Point。
+			const FVector2D U = Q.Outward;
+			const FVector2D V(-U.Y, U.X);
+			for (int32 Which = 0; Which < 2; ++Which)
 			{
-				if (FMath::RoundToInt(S.Colors[Index].X * 255.0f) != int32(ECSHousePart::Roof)) continue;
-				if (FirstRoof == INDEX_NONE) FirstRoof = Index;
-				++RoofVerts;
-				// ① B = 255：字典说"这块面板没有洞"。0 会被读成 Arch。
-				if (FMath::RoundToInt(S.Colors[Index].Z * 255.0f) != 255) ++BadShapeId;
-				// ② UV1 = 无洞哨兵，一位不差 —— 残值是上一块面板的 q，与哨兵没有任何关系。
-				const FVector2f Q = S.TexCoordChannels[1][Index];
-				if (Q != Sentinel) { ++BadUV1; WorstUV1 = Q; }
-				// ③ 顺着材质那一侧再判一次：屋面一个像素都不许被 clip 掉。
-				//    ⚠️ **这一条不是门**（故意破坏实验实测：把屋面改回旧写法时它照绿）——
-				//    残值 q =(2.02, 2.94) 落在 Arch 判据的洞外，恰好活得下来。留着只因为它是唯一
-				//    "按消费者口径"说话的一条；真正报红的是 ①②，别把它当成 ①② 的替代品。
-				if (!CSHouseTest_VertexKept(S, Index)) ++Discarded;
-			}
+				const FVector LocalN = (Which == 0) ? FVector(Sign.X, 0.0, 0.0) : FVector(0.0, Sign.Y, 0.0);
+				const FVector WorldN3 = World.TransformVectorNoScale(LocalN);
+				const FVector2D N = FVector2D(WorldN3.X, WorldN3.Y).GetSafeNormal();
 
-			TestEqual(FString::Printf(TEXT("[%s] the two roof slabs are 72 vertices"), *What), RoofVerts, 72);
-			TestEqual(FString::Printf(TEXT("[%s] every roof vertex says 'this panel has no opening' (B = 255)"), *What),
-				BadShapeId, 0);
-			TestEqual(FString::Printf(TEXT("[%s] no roof vertex carries the previous wall panel's clip field (worst UV1 = %s, sentinel = %s)"),
-				*What, *WorstUV1.ToString(), *Sentinel.ToString()), BadUV1, 0);
-			TestEqual(FString::Printf(TEXT("[%s] the material criterion discards no roof vertex"), *What), Discarded, 0);
+				const FVector FacePoint = World.TransformPosition(
+					(Which == 0) ? FVector(Sign.X * HX, 0.0, 0.0) : FVector(0.0, Sign.Y * HY, 0.0));
+				const double FaceD = FVector2D::DotProduct(FVector2D(FacePoint.X, FacePoint.Y), N);
 
-			// ---- 夹具自证：`Stale` 那一组里，紧挨屋面之前写的确实是一块**带裁剪场**的墙面板 ----
-			// 不证这一条的话，UV1 那条断言可能只是在"残值本来就等于哨兵"的房子上恒真。
-			if (Variant == 1 && FirstRoof > 0)
-			{
-				const int32 Prev = FirstRoof - 1;
-				if (FMath::RoundToInt(S.Colors[Prev].X * 255.0f) == int32(ECSHousePart::Wall)
-					&& FMath::RoundToInt(S.Colors[Prev].Z * 255.0f) != 255
-					&& S.TexCoordChannels[1][Prev] != Sentinel)
-				{
-					bStaleFixtureIsReal = true;
-				}
+				const double BoxD = FVector2D::DotProduct(Q.Point, N)
+					+ 0.5 * Depth * FMath::Abs(FVector2D::DotProduct(U, N))
+					+ 0.5 * Thick * FMath::Abs(FVector2D::DotProduct(V, N));
+
+				TestTrue(FString::Printf(TEXT("[%s] quoin %d stands proud of wall face %d (by %.2f cm)"),
+					C.What, Index, Which, BoxD - FaceD), BoxD - FaceD > 0.5);
 			}
 		}
 	}
 
-	TestTrue(TEXT("the fixture really does leave a live clip field behind (otherwise the UV1 assertion is vacuous)"),
-		bStaleFixtureIsReal);
+	// ---- 退化 footprint 不出柱：任一边窄于两个墙厚时四角互相吃掉 ----
+	{
+		TArray<CSHouseQuoin::FQuoin> None;
+		TestEqual(TEXT("a footprint thinner than two wall thicknesses yields no quoin"),
+			CSHouseQuoin::BuildQuoins(FTransform::Identity, FVector2D(600.0, 40.0), 24.0f, 0.0f, 300.0f, 0.0f, None), 0);
+		TestEqual(TEXT("a zero-height wall yields no quoin"),
+			CSHouseQuoin::BuildQuoins(FTransform::Identity, FVector2D(600.0, 400.0), 24.0f, 0.0f, 0.0f, 0.0f, None), 0);
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseQuoinSharesColumnEmitterTest,
+	"PCGPlugins.ComputeShaderGenerator.House.QuoinSharesTheColumnEmitter",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseQuoinSharesColumnEmitterTest::RunTest(const FString& Parameters)
+{
+	// 合卷卷五 A11 的可执行版本：角石与接缝柱**必须**走同一个 `CSHouseFrame::AppendColumn`。
+	// 谁将来复制一份出去（哪怕只差一个 0.5 的下限），这条就会红。
+	CSHouseFrame::FBrickParams Params;
+	Params.Length = 26.0f;
+	Params.Gap = 0.0f;
+	Params.MaxBricks = 512;
+
+	const FVector2D Point(1234.5, -678.25);
+	const FVector2D Outward = FVector2D(0.6, -0.8);   // 已归一
+	const float BottomZ = 137.0f;
+	const float TopZ = 137.0f + 293.5f;
+
+	TArray<CSHouseSeam::FCorner> Corners;
+	CSHouseSeam::FCorner Corner;
+	Corner.Point = Point; Corner.Outward = Outward; Corner.BottomZ = BottomZ; Corner.TopZ = TopZ;
+	Corners.Add(Corner);
+
+	TArray<CSHouseQuoin::FQuoin> Quoins;
+	CSHouseQuoin::FQuoin Quoin;
+	Quoin.Point = Point; Quoin.Outward = Outward; Quoin.BottomZ = BottomZ; Quoin.TopZ = TopZ;
+	Quoins.Add(Quoin);
+
+	TArray<CSHouseFrame::FElement> FromSeam, FromQuoin;
+	const int32 SeamBricks = CSHouseSeam::BuildCornerElements(Corners, 0x1234u, Params, FromSeam);
+	const int32 QuoinBricks = CSHouseQuoin::BuildQuoinElements(Quoins, 0x1234u, Params, FromQuoin);
+
+	TestEqual(TEXT("both emit the same brick count"), QuoinBricks, SeamBricks);
+	TestTrue(TEXT("both emit exactly one path"), FromSeam.Num() == 1 && FromQuoin.Num() == 1);
+	if (FromSeam.Num() != 1 || FromQuoin.Num() != 1) return false;
+
+	const CSHouseFrame::FElement& A = FromSeam[0];
+	const CSHouseFrame::FElement& B = FromQuoin[0];
+	TestEqual(TEXT("same brick count"), B.BrickCount, A.BrickCount);
+	TestEqual(TEXT("same slot start"), B.BrickBegin, A.BrickBegin);
+	TestEqual(TEXT("same pitch"), B.Pitch, A.Pitch);
+	TestEqual(TEXT("same half length"), B.HalfLen, A.HalfLen);
+	TestEqual(TEXT("same layout scale"), B.LayoutScale, A.LayoutScale);
+	TestEqual(TEXT("same path top"), B.Path.TopZ, A.Path.TopZ);
+	TestTrue(TEXT("same origin"), B.Frame.Origin.Equals(A.Frame.Origin, 1e-4f));
+	TestTrue(TEXT("same U axis"), B.Frame.AxisU.Equals(A.Frame.AxisU, 1e-6f));
+	TestTrue(TEXT("same V axis"), B.Frame.AxisV.Equals(A.Frame.AxisV, 1e-6f));
+
+	// ---- 进深轴朝外，不朝里 ----
+	// kernel：路径竖直 ⇒ 切向 (0,1) ⇒ OutwardSZ = (−1,0) ⇒ AxisX = −AxisU = 砖的进深轴。
+	// 写成 `AxisU = Outward` 的症状是砖整根插进房间，而**位置断言一条都不会红** —— 所以必须单测。
+	const FVector2D DepthAxis(-B.Frame.AxisU.X, -B.Frame.AxisU.Y);
+	const double Dot = FVector2D::DotProduct(DepthAxis, Outward);
+	TestTrue(FString::Printf(TEXT("the depth axis points outward (dot = %.4f)"), Dot), Dot > 0.999);
+
+	// ---- 随机数基必须不同：两者是不同的东西，共用发射器不等于共用身份 ----
+	TestNotEqual(TEXT("seam and quoin derive different per-instance randoms from the same seed"),
+		B.RandomBase, A.RandomBase);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseQuoinRandomIgnoresSlotTest,
+	"PCGPlugins.ComputeShaderGenerator.House.QuoinRandomIgnoresSlot",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseQuoinRandomIgnoresSlotTest::RunTest(const FString& Parameters)
+{
+	// 角石排在门框砖与接缝砖之后 ⇒ 每开一扇门它的槽位就整体后移。逐实例随机数**不许**跟着变，
+	// 否则将来谁给砖材质接上 PerInstanceRandom 色差，开一扇门就会让四个角整体换色，
+	// 而砖数 / 位置 / 三角形数所有几何断言全绿。
+	CSHouseFrame::FBrickParams Params;
+	Params.Length = 26.0f;
+	Params.Gap = 0.0f;
+	Params.MaxBricks = 512;
+
+	TArray<CSHouseQuoin::FQuoin> Quoins;
+	CSHouseQuoin::BuildQuoins(FTransform::Identity, FVector2D(600.0, 400.0), 24.0f, 0.0f, 300.0f, 0.0f, Quoins);
+	TestEqual(TEXT("fixture yields four quoins"), Quoins.Num(), 4);
+
+	auto RandomsWithPrefix = [&](int32 PrefixBricks, TArray<uint32>& OutRandoms, TArray<int32>& OutSlots)
+	{
+		TArray<CSHouseFrame::FElement> Elements;
+		const int32 Skip = PrefixBricks > 0 ? 1 : 0;
+		if (PrefixBricks > 0)
+		{
+			CSHouseFrame::FElement Filler;      // 假装前面已经排了这么多门框砖
+			Filler.BrickBegin = 0;
+			Filler.BrickCount = PrefixBricks;
+			Elements.Add(Filler);
+		}
+		CSHouseQuoin::BuildQuoinElements(Quoins, 0xABCDu, Params, Elements);
+		for (int32 i = Skip; i < Elements.Num(); ++i)
+		{
+			OutRandoms.Add(Elements[i].RandomBase);
+			OutSlots.Add(Elements[i].BrickBegin);
+		}
+	};
+
+	TArray<uint32> R0, R1;
+	TArray<int32> S0, S1;
+	RandomsWithPrefix(0, R0, S0);
+	RandomsWithPrefix(37, R1, S1);
+
+	TestEqual(TEXT("the same four columns come out either way"), R1.Num(), R0.Num());
+	if (R1.Num() != R0.Num()) return false;
+
+	bool bSlotsMoved = false;
+	for (int32 i = 0; i < R0.Num(); ++i)
+	{
+		TestEqual(FString::Printf(TEXT("quoin %d keeps its per-instance random when the slots shift"), i), R1[i], R0[i]);
+		bSlotsMoved |= (S1[i] != S0[i]);
+	}
+	// 夹具自证：槽位**确实**动了，否则上面那条是空判据。
+	TestTrue(TEXT("the fixture really does shift the slots"), bSlotsMoved);
+
+	// 四个角互不相同 —— 否则一栋房四个角会长得一模一样。
+	TSet<uint32> Distinct(R0);
+	TestEqual(TEXT("the four corners get four different randoms"), Distinct.Num(), R0.Num());
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseQuoinTruncatesTest,
+	"PCGPlugins.ComputeShaderGenerator.House.QuoinTruncatesNeverGrows",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseQuoinTruncatesTest::RunTest(const FString& Parameters)
+{
+	// 容量是注册期一次付清的常量。撞上就截断、绝不扩容 —— 扩容是阻塞刷新，落在用户恰好
+	// 画到的那一笔上（零阻塞纪律）。
+	TArray<CSHouseQuoin::FQuoin> Quoins;
+	CSHouseQuoin::BuildQuoins(FTransform::Identity, FVector2D(600.0, 400.0), 24.0f, 0.0f, 300.0f, 0.0f, Quoins);
+
+	const int32 Caps[] = { 0, 1, 7, 12, 23, 512 };
+	for (int32 Cap : Caps)
+	{
+		CSHouseFrame::FBrickParams Params;
+		Params.Length = 26.0f;
+		Params.Gap = 0.0f;
+		Params.MaxBricks = Cap;
+
+		TArray<CSHouseFrame::FElement> Elements;
+		const int32 Added = CSHouseQuoin::BuildQuoinElements(Quoins, 1u, Params, Elements);
+
+		TestTrue(FString::Printf(TEXT("cap %d is never exceeded (added %d)"), Cap, Added), Added <= Cap);
+		TestTrue(FString::Printf(TEXT("cap %d never yields a negative count"), Cap), Added >= 0);
+
+		int32 Sum = 0;
+		for (const CSHouseFrame::FElement& E : Elements)
+		{
+			TestTrue(FString::Printf(TEXT("cap %d: every path has a positive brick count"), Cap), E.BrickCount > 0);
+			TestEqual(FString::Printf(TEXT("cap %d: slots stay contiguous"), Cap), E.BrickBegin, Sum);
+			Sum += E.BrickCount;
+		}
+		TestEqual(FString::Printf(TEXT("cap %d: the returned count matches the slots"), Cap), Sum, Added);
+	}
+	return true;
+}
+
+// =============================================================================
+// 包边石（D7 第三样，合卷卷一 A8 / 卷五 A11）
+// =============================================================================
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseTrimTilesPerimeterTest,
+	"PCGPlugins.ComputeShaderGenerator.House.TrimTilesThePerimeter",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseTrimTilesPerimeterTest::RunTest(const FString& Parameters)
+{
+	// 无洞时四条边各出一段，合起来正好铺满周界（四段之和 = 2X + 2Y，因为 1/3 号墙
+	// 两端各内缩一个墙厚、而 0/2 号墙跑满 —— 与房体面板同一套 `CSHouse_GetEdge` 分法）。
+	const FVector2D Footprint(600.0, 400.0);
+	const float T = 24.0f;
+
+	CSHouseTrim::FBand Band;
+	Band.CenterZ = 300.0f;
+	Band.HalfHeight = 10.0f;
+
+	TArray<CSHouseTrim::FRun> Runs;
+	CSHouseFrame::FBrickParams Params;
+	Params.Length = 26.0f;
+	Params.Gap = 0.0f;
+	Params.MaxBricks = 512;
+
+	TArray<CSHouseFrame::FElement> Elements;
+	const int32 Bricks = CSHouseTrim::BuildBand(FTransform::Identity, Footprint, T, Band, 6.0f,
+		TArrayView<const FCSWallOpening>(), 0x99u, CSHouseFrame::EPathFamily::TrimTop, Params, Runs, Elements);
+
+	TestEqual(TEXT("a hole-free rectangle yields one run per edge"), Runs.Num(), 4);
+	TestTrue(TEXT("the band actually produces bricks"), Bricks > 0);
+
+	double Total = 0.0;
+	TSet<int32> Edges;
+	for (const CSHouseTrim::FRun& R : Runs)
+	{
+		Total += R.Span();
+		Edges.Add(R.EdgeIndex);
+		TestTrue(FString::Printf(TEXT("run on edge %d starts at the edge start"), R.EdgeIndex),
+			FMath::IsNearlyZero(R.S0, 0.01f));
+	}
+	TestEqual(TEXT("all four edges are covered"), Edges.Num(), 4);
+	// 0/2 号墙跑满 X，1/3 号墙是 Y − 2T。
+	const double Expect = 2.0 * Footprint.X + 2.0 * (Footprint.Y - 2.0 * T);
+	TestTrue(FString::Printf(TEXT("the runs tile the perimeter (%.1f vs %.1f)"), Total, Expect),
+		FMath::IsNearlyEqual(Total, Expect, 0.01));
+
+	// 每条路都是平顶段、且高度就是带高 —— 写错成竖直段的话砖会整排立起来，而砖数照样对。
+	for (const CSHouseFrame::FElement& E : Elements)
+	{
+		TestTrue(TEXT("every trim path is a flat run"), E.Path.MidKind == CSHouseFrame::EMidKind::Flat);
+		TestFalse(TEXT("a trim path has no jambs"), E.Path.bLeftJamb || E.Path.bRightJamb || E.Path.bSill);
+		TestEqual(TEXT("the path sits at the band height"), E.Path.TopZ, Band.CenterZ);
+		TestTrue(TEXT("the path length is the run span"), E.Path.TotalLen() > 0.0f);
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseTrimAvoidsOpeningsTest,
+	"PCGPlugins.ComputeShaderGenerator.House.TrimAvoidsOpenings",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseTrimAvoidsOpeningsTest::RunTest(const FString& Parameters)
+{
+	// ⚠️ 这条是本模块存在的唯一理由：不切洞的话勒脚石会从门口正中一路铺过去，
+	// 而砖数 / 零阻塞 / 三角形数**所有断言都不会红**，只有出图看得见。
+	const FVector2D Footprint(600.0, 400.0);
+	const float T = 24.0f;
+	const float WallHeight = 300.0f;
+
+	// 0 号墙上两扇落地门 + 一扇高窗。
+	TArray<FCSWallOpening> Openings;
+	{
+		FCSWallOpening Door;
+		Door.EdgeIndex = 0; Door.Z0 = 0.0f; Door.Z1 = 200.0f; Door.Width = 120.0f;
+		Door.CenterS = 150.0f; Openings.Add(Door);
+		Door.CenterS = 420.0f; Openings.Add(Door);
+
+		FCSWallOpening Window;
+		Window.EdgeIndex = 0; Window.Z0 = 160.0f; Window.Z1 = 240.0f; Window.Width = 90.0f;
+		Window.CenterS = 290.0f; Openings.Add(Window);
+	}
+	Openings.Sort([](const FCSWallOpening& A, const FCSWallOpening& B)
+	{
+		return A.EdgeIndex != B.EdgeIndex ? A.EdgeIndex < B.EdgeIndex : A.CenterS < B.CenterS;
+	});
+
+	CSHouseFrame::FBrickParams Params;
+	Params.Length = 26.0f;
+	Params.Gap = 0.0f;
+	Params.MaxBricks = 512;
+
+	auto BuildBandRuns = [&](float CenterZ, uint32 Salt, TArray<CSHouseTrim::FRun>& OutRuns)
+	{
+		CSHouseTrim::FBand Band;
+		Band.CenterZ = CenterZ;
+		Band.HalfHeight = 10.0f;
+		TArray<CSHouseFrame::FElement> Elements;
+		CSHouseTrim::BuildBand(FTransform::Identity, Footprint, T, Band, 6.0f,
+			MakeArrayView(Openings), 0x77u, Salt, Params, OutRuns, Elements);
+		return Band;
+	};
+
+	// ---- 墙脚带：门挡路（Z0 = 0），高窗不挡 ⇒ 0 号墙被切成 3 段，其余三边各 1 段 ----
+	TArray<CSHouseTrim::FRun> BaseRuns;
+	const CSHouseTrim::FBand BaseBand = BuildBandRuns(0.0f, CSHouseFrame::EPathFamily::TrimBase, BaseRuns);
+
+	int32 OnEdge0 = 0;
+	for (const CSHouseTrim::FRun& R : BaseRuns) if (R.EdgeIndex == 0) ++OnEdge0;
+	TestEqual(TEXT("two ground-level doors cut the base band on edge 0 into three runs"), OnEdge0, 3);
+	TestEqual(TEXT("the other three edges stay whole"), BaseRuns.Num() - OnEdge0, 3);
+
+	// 核心：没有任何一段与挡路的洞重叠。
+	for (const CSHouseTrim::FRun& R : BaseRuns)
+	{
+		for (const FCSWallOpening& O : Openings)
+		{
+			if (O.EdgeIndex != R.EdgeIndex) continue;
+			if (!CSHouseTrim::BlocksBand(O, BaseBand)) continue;
+			const bool bOverlap = R.S1 > O.S0() && R.S0 < O.S1();
+			TestFalse(FString::Printf(
+				TEXT("base run [%.1f, %.1f] does not cross the opening at %.1f"), R.S0, R.S1, O.CenterS), bOverlap);
+		}
+	}
+
+	// ---- 墙顶带：三个洞都够不着 ⇒ 四条边各 1 段，与无洞时一样 ----
+	TArray<CSHouseTrim::FRun> TopRuns;
+	BuildBandRuns(WallHeight, CSHouseFrame::EPathFamily::TrimTop, TopRuns);
+	TestEqual(TEXT("nothing reaches the wall top, so the top band stays whole"), TopRuns.Num(), 4);
+
+	// ---- 判据带 Z，不是只看 S：把窗抬到墙顶，顶带就该被切开 ----
+	{
+		TArray<FCSWallOpening> HighOnly;
+		FCSWallOpening Tall;
+		Tall.EdgeIndex = 0; Tall.Z0 = 280.0f; Tall.Z1 = 340.0f; Tall.Width = 90.0f; Tall.CenterS = 290.0f;
+		HighOnly.Add(Tall);
+
+		CSHouseTrim::FBand Band;
+		Band.CenterZ = WallHeight;
+		Band.HalfHeight = 10.0f;
+		TArray<CSHouseTrim::FRun> Runs;
+		TArray<CSHouseFrame::FElement> Elements;
+		CSHouseTrim::BuildBand(FTransform::Identity, Footprint, T, Band, 6.0f,
+			MakeArrayView(HighOnly), 0x77u, CSHouseFrame::EPathFamily::TrimTop, Params, Runs, Elements);
+
+		int32 Cut = 0;
+		for (const CSHouseTrim::FRun& R : Runs) if (R.EdgeIndex == 0) ++Cut;
+		TestEqual(TEXT("an opening that does reach the top cuts the top band"), Cut, 2);
+	}
+
+	// ---- 重叠的洞不该产生负长度或错序的段 ----
+	{
+		TArray<FCSWallOpening> Overlap;
+		FCSWallOpening A;
+		A.EdgeIndex = 0; A.Z0 = 0.0f; A.Z1 = 200.0f; A.Width = 200.0f; A.CenterS = 200.0f; Overlap.Add(A);
+		A.CenterS = 260.0f; Overlap.Add(A);   // 与上一个重叠
+
+		CSHouseTrim::FBand Band;
+		Band.CenterZ = 0.0f;
+		Band.HalfHeight = 10.0f;
+		TArray<CSHouseTrim::FRun> Runs;
+		TArray<CSHouseFrame::FElement> Elements;
+		CSHouseTrim::BuildBand(FTransform::Identity, Footprint, T, Band, 6.0f,
+			MakeArrayView(Overlap), 0x77u, CSHouseFrame::EPathFamily::TrimBase, Params, Runs, Elements);
+
+		for (const CSHouseTrim::FRun& R : Runs)
+		{
+			TestTrue(FString::Printf(TEXT("run [%.1f, %.1f] has a positive span"), R.S0, R.S1), R.Span() > 0.0f);
+		}
+		// 同一条边上的段必须严格递增且互不相交。
+		float Prev = -1.0f;
+		for (const CSHouseTrim::FRun& R : Runs)
+		{
+			if (R.EdgeIndex != 0) continue;
+			TestTrue(TEXT("runs on one edge are ordered and disjoint"), R.S0 >= Prev);
+			Prev = R.S1;
+		}
+	}
+	return true;
+}
+
+
+// -----------------------------------------------------------------------------
+// D8 特征标记：宿主解析（纯函数）+ 登记 / 裁决 / 换宿主 / 注销（要 world）
+// -----------------------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseWallPickTest,
+	"PCGPlugins.ComputeShaderGenerator.House.WallPick",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseWallPickTest::RunTest(const FString& Parameters)
+{
+	const FVector2D Footprint(600.0, 400.0);
+	const float T = 24.0f;
+	const float WallHeight = 300.0f;
+
+	// 边 0 的外表面是 y = -HY = -200，外法线 (0,-1)。从外面朝 +Y 打过去必须命中它。
+	{
+		const FCSWallHit Hit = CSHouse_RayHitWall(
+			FVector(0.0, -400.0, 150.0), FVector(0.0, 1.0, 0.0), Footprint, T, WallHeight, 1000.0f);
+		TestTrue(TEXT("ray from outside hits the south wall"), Hit.bHit);
+		TestEqual(TEXT("it is edge 0"), Hit.EdgeIndex, 0);
+		// 边 0 的 Start = (-HX, -HY)、U = (+1, 0) ⇒ x = 0 处的 S 就是半个 footprint.X。
+		TestTrue(FString::Printf(TEXT("S lands at mid-wall (%.1f)"), Hit.S),
+			FMath::IsNearlyEqual(Hit.S, float(Footprint.X * 0.5), 0.01f));
+		TestTrue(FString::Printf(TEXT("Z is the ray height (%.1f)"), Hit.Z),
+			FMath::IsNearlyEqual(Hit.Z, 150.0f, 0.01f));
+		TestTrue(FString::Printf(TEXT("distance is the gap to the face (%.1f)"), Hit.Distance),
+			FMath::IsNearlyEqual(Hit.Distance, 200.0f, 0.01f));
+	}
+
+	// **背面不算命中**：站在房子里往外打，一面墙都不该咬上 —— 否则在屋里挥一下鼠标就会把窗
+	// 贴到背面那堵墙上，而画面上看起来只是"窗跑到对面去了"。
+	{
+		const FCSWallHit Hit = CSHouse_RayHitWall(
+			FVector::ZeroVector, FVector(0.0, -1.0, 0.0), Footprint, T, WallHeight, 1000.0f);
+		TestFalse(TEXT("a ray leaving from inside hits nothing"), Hit.bHit);
+	}
+
+	// 打在墙顶以上 ⇒ 不命中（Z 越界）。这条守的是"窗贴到屋顶上"。
+	{
+		const FCSWallHit Hit = CSHouse_RayHitWall(
+			FVector(0.0, -400.0, WallHeight + 50.0), FVector(0.0, 1.0, 0.0), Footprint, T, WallHeight, 1000.0f);
+		TestFalse(TEXT("a ray above the eave hits nothing"), Hit.bHit);
+	}
+
+	// 够不着 ⇒ 不命中。MaxDistance 就是标记的探针长度，这条守的是"隔着半张地图也能咬上"。
+	{
+		const FCSWallHit Hit = CSHouse_RayHitWall(
+			FVector(0.0, -400.0, 150.0), FVector(0.0, 1.0, 0.0), Footprint, T, WallHeight, 100.0f);
+		TestFalse(TEXT("a ray that falls short hits nothing"), Hit.bHit);
+	}
+
+	// 就近版：贴在南墙外一点点、朝向随便，必须找到边 0 并把 S/Z 夹进墙面内。
+	{
+		const FCSWallHit Hit = CSHouse_NearestWall(
+			FVector(0.0, -230.0, 150.0), Footprint, T, WallHeight, 200.0f);
+		TestTrue(TEXT("a point just outside the wall snaps to it"), Hit.bHit);
+		TestEqual(TEXT("it is edge 0"), Hit.EdgeIndex, 0);
+		TestTrue(FString::Printf(TEXT("perpendicular distance (%.1f)"), Hit.Distance),
+			FMath::IsNearlyEqual(Hit.Distance, 30.0f, 0.01f));
+	}
+	// 太远 ⇒ 不吸附。两条都空才轮到标记自毁，所以这条界限是承重的。
+	{
+		const FCSWallHit Hit = CSHouse_NearestWall(
+			FVector(0.0, -1000.0, 150.0), Footprint, T, WallHeight, 200.0f);
+		TestFalse(TEXT("a far point snaps to nothing"), Hit.bHit);
+	}
+	return true;
+}
+
+// -----------------------------------------------------------------------------
+// D4 砖层（两层墙之 A，2026-09-06）：一摞包边带。纯函数，无 world
+// -----------------------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseBrickWallTest,
+	"PCGPlugins.ComputeShaderGenerator.House.BrickWall",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseBrickWallTest::RunTest(const FString& Parameters)
+{
+	const FVector2D Footprint(600.0, 400.0);
+	const float T = 24.0f;
+	const float WallHeight = 300.0f;
+
+	// ---- 分层：铺满 0..檐口，不重不漏 ----
+	{
+		const CSHouseBrickWall::FCourses C = CSHouseBrickWall::PlanCourses(WallHeight, 20.0f);
+		TestEqual(TEXT("300 / 20 gives 15 courses"), C.Count, 15);
+		TestTrue(TEXT("courses exactly fill the wall"),
+			FMath::IsNearlyEqual(C.Height * float(C.Count), WallHeight, 0.01f));
+		TestTrue(TEXT("the first course sits on the floor"),
+			FMath::IsNearlyEqual(C.CenterZ(0) - C.HalfHeight(), 0.0f, 0.01f));
+		TestTrue(TEXT("the last course tops out at the eave"),
+			FMath::IsNearlyEqual(C.CenterZ(C.Count - 1) + C.HalfHeight(), WallHeight, 0.01f));
+
+		// 请求值除不尽时**向上取整**：宁可层高略矮，也不在檐口下留半层。
+		const CSHouseBrickWall::FCourses Odd = CSHouseBrickWall::PlanCourses(300.0f, 40.0f);
+		TestEqual(TEXT("300 / 40 rounds up to 8 courses"), Odd.Count, 8);
+		TestTrue(TEXT("and the courses still fill the wall exactly"),
+			FMath::IsNearlyEqual(Odd.Height * 8.0f, 300.0f, 0.01f));
+
+		// 退化输入不许产出一个"看着合理"的方案。
+		TestEqual(TEXT("zero wall height gives no courses"),
+			CSHouseBrickWall::PlanCourses(0.0f, 20.0f).Count, 0);
+		TestEqual(TEXT("zero course height gives no courses"),
+			CSHouseBrickWall::PlanCourses(WallHeight, 0.0f).Count, 0);
+	}
+
+	CSHouseFrame::FBrickParams Params;
+	Params.Length = 26.0f;
+	Params.Gap = 0.0f;
+	Params.MaxBricks = 4096;
+
+	const CSHouseBrickWall::FCourses Courses = CSHouseBrickWall::PlanCourses(WallHeight, 20.0f);
+	auto Noop = [](int32, const CSHouseTrim::FBand&, int32, const TArray<CSHouseTrim::FRun>&) {};
+
+	// ---- 无洞：砖数不超上界，且四条边每层都各出一整段 ----
+	int32 NoHoleBricks = 0;
+	{
+		TArray<CSHouseTrim::FRun> Runs;
+		TArray<CSHouseFrame::FElement> Elements;
+		int32 CoursesSeen = 0;
+		NoHoleBricks = CSHouseBrickWall::BuildWall(FTransform::Identity, Footprint, T, Courses,
+			3.0f, TArrayView<const FCSWallOpening>(), 0x1234u, Params, Runs, Elements,
+			[&](int32, const CSHouseTrim::FBand&, int32, const TArray<CSHouseTrim::FRun>& R)
+			{
+				++CoursesSeen;
+				TestEqual(TEXT("a course with no holes is four whole runs"), R.Num(), 4);
+			});
+		TestEqual(TEXT("every course was emitted"), CoursesSeen, Courses.Count);
+		TestTrue(TEXT("bricks were emitted at all"), NoHoleBricks > 0);
+
+		const int32 Budget = CSHouseBrickWall::EstimateBricks(Footprint, T, Courses, Params.Length);
+		TestTrue(FString::Printf(TEXT("the estimate is an upper bound (%d <= %d)"), NoHoleBricks, Budget),
+			NoHoleBricks <= Budget);
+		// 上界就是"周长 / 砖长 × 层数"，别留魔数：这里现算一遍对答案。
+		float Perimeter = 0.0f;
+		for (int32 Edge = 0; Edge < 4; ++Edge) Perimeter += CSHouse_GetEdge(Edge, Footprint, T).Len;
+		TestEqual(TEXT("the budget is perimeter / brick length x courses"),
+			Budget, FMath::CeilToInt(Perimeter / Params.Length) * Courses.Count);
+
+		// **这条才是重点**：一栋 6×4 m、檐高 3 m 的房子要 1000+ 块砖，而砖的常驻容量默认只有
+		// 512（`FrameReserveCapacity`，与门框/接缝/角石/包边共用）—— 砖层一开就会被截断。
+		// 容量因此是 P1 必须先解决的事，不是收尾时再调的参数。
+		TestTrue(FString::Printf(TEXT("one house alone outgrows the default brick capacity (%d)"), Budget),
+			Budget > 1000);
+	}
+
+	// ---- 有洞：洞挡住的那些层要让开，没挡住的照旧整段 ----
+	{
+		// 一扇窗：边 0、S ∈ [200, 300]、Z ∈ [90, 200]。
+		FCSWallOpening Win;
+		Win.Type = ECSOpeningType::Window;
+		Win.Shape = ECSOpeningShape::Rect;
+		Win.EdgeIndex = 0;
+		Win.CenterS = 250.0f;
+		Win.Width = 100.0f;
+		Win.Z0 = 90.0f;
+		Win.Z1 = 200.0f;
+		Win.SourceId = FGuid(1, 2, 3, 4);
+		const TArray<FCSWallOpening> Openings = { Win };
+
+		const float Clearance = 3.0f;
+		TArray<CSHouseTrim::FRun> Runs;
+		TArray<CSHouseFrame::FElement> Elements;
+		int32 CutCourses = 0;
+
+		const int32 Total = CSHouseBrickWall::BuildWall(FTransform::Identity, Footprint, T, Courses,
+			Clearance, MakeArrayView(Openings), 0x1234u, Params, Runs, Elements,
+			[&](int32 Index, const CSHouseTrim::FBand& Band, int32, const TArray<CSHouseTrim::FRun>& R)
+			{
+				const bool bBlocked = CSHouseTrim::BlocksBand(Win, Band);
+				if (!bBlocked)
+				{
+					TestEqual(FString::Printf(TEXT("course %d clears the hole in Z, so it stays whole"), Index),
+						R.Num(), 4);
+					return;
+				}
+				++CutCourses;
+				// 边 0 被切成两段 ⇒ 这一层总共 5 段。
+				TestEqual(FString::Printf(TEXT("course %d is cut into an extra run"), Index), R.Num(), 5);
+
+				for (const CSHouseTrim::FRun& Run : R)
+				{
+					if (Run.EdgeIndex != 0) continue;
+					// ① 删实例：没有任何一段压在洞（含让开量）上。
+					const bool bOverlaps = Run.S1 > Win.S0() - Clearance && Run.S0 < Win.S1() + Clearance;
+					TestFalse(FString::Printf(TEXT("run [%.1f, %.1f] keeps off the hole"), Run.S0, Run.S1),
+						bOverlaps);
+				}
+				// ② 水平贴合：洞两侧那两段的端点正好落在洞缘 ± 让开量上。
+				const CSHouseTrim::FRun* Left = nullptr;
+				const CSHouseTrim::FRun* Right = nullptr;
+				for (const CSHouseTrim::FRun& Run : R)
+				{
+					if (Run.EdgeIndex != 0) continue;
+					if (Run.S1 <= Win.S0()) Left = &Run;
+					else Right = &Run;
+				}
+				if (TestNotNull(TEXT("there is a run left of the hole"), Left))
+				{
+					TestTrue(FString::Printf(TEXT("it butts against the hole (%.2f)"), Left->S1),
+						FMath::IsNearlyEqual(Left->S1, Win.S0() - Clearance, 0.01f));
+				}
+				if (TestNotNull(TEXT("there is a run right of the hole"), Right))
+				{
+					TestTrue(FString::Printf(TEXT("it butts against the hole (%.2f)"), Right->S0),
+						FMath::IsNearlyEqual(Right->S0, Win.S1() + Clearance, 0.01f));
+				}
+			});
+
+		TestTrue(TEXT("some courses really were cut (otherwise the checks above are vacuous)"), CutCourses > 0);
+		TestTrue(FString::Printf(TEXT("a hole only ever removes bricks (%d < %d)"), Total, NoHoleBricks),
+			Total < NoHoleBricks);
+	}
+
+	// ---- 上界对**有洞**也得成立：窄洞会让一段路裂成两段，两段各自向上取整 ----
+	//
+	// ⚠️ 这不是多余的谨慎。`EstimateBricks` 是 `ceil(周长 / 砖长) x 层数`，除的是**砖长**而不是
+	// 砖距（`Length + Gap`），所以 `Gap = 0` 的默认档下它**一点余量都没有**（实测 6x4 m 房
+	// budget 1332 = 实际 1332，逐块相等）。而洞把一条整路裂成两段之后，两段各走一次 `SolveRun`
+	// 的取整，合起来**可能比原来那一整段还多一块** —— 只要洞比半个砖距还窄，省下的长度补不回
+	// 那次取整。真超了的后果不是报错，是 `Params.MaxBricks` 当场**静默截断**：砖层铺一半，
+	// 而砖数、三角数、零阻塞每一条断言照绿。
+	//
+	// 所以这里从**比砖距还窄**（10 cm，砖距 26）一路扫到很宽，单洞与三洞各来一遍。
+	{
+		const int32 Budget = CSHouseBrickWall::EstimateBricks(Footprint, T, Courses, Params.Length);
+		const float Widths[8] = { 10.0f, 13.0f, 20.0f, 26.0f, 40.0f, 78.0f, 100.0f, 150.0f };
+		int32 Worst = 0;
+		float WorstWidth = 0.0f;
+		int32 WorstHoles = 0;
+
+		for (const float W : Widths)
+		{
+			for (int32 HoleCount = 1; HoleCount <= 3; HoleCount += 2)
+			{
+				TArray<FCSWallOpening> Many;
+				for (int32 I = 0; I < HoleCount; ++I)
+				{
+					FCSWallOpening O;
+					O.Type = ECSOpeningType::Window;
+					O.Shape = ECSOpeningShape::Rect;
+					// 铺到不同的边上，免得三个洞在同一条边上互相重叠成一个大洞（那就测不到裂段了）。
+					O.EdgeIndex = I;
+					O.CenterS = 150.0f + 60.0f * float(I);
+					O.Width = W;
+					O.Z0 = 90.0f;
+					O.Z1 = 200.0f;
+					O.SourceId = FGuid(7, 7, 7, I + 1);
+					Many.Add(O);
+				}
+
+				TArray<CSHouseTrim::FRun> SweepRuns;
+				TArray<CSHouseFrame::FElement> SweepElements;
+				const int32 Built = CSHouseBrickWall::BuildWall(FTransform::Identity, Footprint, T, Courses,
+					3.0f, MakeArrayView(Many), 0x1234u, Params, SweepRuns, SweepElements, Noop);
+				if (Built > Worst)
+				{
+					Worst = Built;
+					WorstWidth = W;
+					WorstHoles = HoleCount;
+				}
+			}
+		}
+
+		AddInfo(FString::Printf(TEXT("budget sweep: worst %d bricks (%d hole(s) of %.0f cm) vs budget %d, no-hole %d"),
+			Worst, WorstHoles, WorstWidth, Budget, NoHoleBricks));
+		TestTrue(FString::Printf(TEXT("no arrangement of holes ever outgrows the no-hole estimate (%d <= %d)"),
+			Worst, Budget), Worst <= Budget);
+	}
+
+	// ---- 拱洞：砖跟着**剪影**收，不是被切成一个矩形缺口 ----
+	//
+	// 这条是①从"包围盒"升级成"剪影"的全部理由（2026-09-06）。落地拱 Z ∈ [0, 220]、
+	// 拱脚在 220 − 100 = 120：120 以下满宽 200，120 以上按椭圆收窄，到 220 收成 0。
+	{
+		FCSWallOpening Arch;
+		Arch.Type = ECSOpeningType::Door;
+		Arch.Shape = ECSOpeningShape::Arch;
+		Arch.EdgeIndex = 0;
+		Arch.CenterS = 300.0f;
+		Arch.Width = 200.0f;
+		Arch.Z0 = 0.0f;
+		Arch.Z1 = 220.0f;
+		Arch.ArchRise = 100.0f;
+		Arch.SourceId = FGuid(9, 9, 9, 9);
+
+		// 半宽随高度的形状：拱脚以下满宽、拱脚以上单调收窄、洞顶归零、洞外归零。
+		TestTrue(TEXT("below the springing the arch is full width"),
+			FMath::IsNearlyEqual(CSHouse_OpeningHalfWidthAtZ(Arch, 50.0f), 100.0f, 0.01f));
+		TestTrue(TEXT("at the springing it is still full width"),
+			FMath::IsNearlyEqual(CSHouse_OpeningHalfWidthAtZ(Arch, 120.0f), 100.0f, 0.01f));
+		const float Mid = CSHouse_OpeningHalfWidthAtZ(Arch, 170.0f);
+		TestTrue(FString::Printf(TEXT("halfway up the arch it has narrowed (%.1f)"), Mid),
+			Mid > 0.0f && Mid < 100.0f);
+		TestTrue(TEXT("at the crown it closes"),
+			FMath::IsNearlyEqual(CSHouse_OpeningHalfWidthAtZ(Arch, 220.0f), 0.0f, 0.01f));
+		TestTrue(TEXT("above the hole there is nothing to cut"),
+			FMath::IsNearlyEqual(CSHouse_OpeningHalfWidthAtZ(Arch, 260.0f), 0.0f, 0.01f));
+
+		// ⚠️ 拱的 clip 场在拱脚以下**无下界**（那是有意的）。抬起来的拱窗必须靠洞自己的 Z0 兜住，
+		// 否则它会一路裁到地面 —— 而画面上只是"墙脚少了一片砖"，没有任何断言会红。
+		FCSWallOpening HighArch = Arch;
+		HighArch.Z0 = 90.0f;
+		HighArch.Z1 = 260.0f;
+		TestTrue(TEXT("a raised arch does not cut below its own sill"),
+			FMath::IsNearlyEqual(CSHouse_OpeningHalfWidthAtZ(HighArch, 50.0f), 0.0f, 0.01f));
+
+		// 逐层：被挡住的 S 跨度必须**随高度单调不增**（拱圈越往上越窄）。
+		const TArray<FCSWallOpening> Openings = { Arch };
+		TArray<CSHouseTrim::FRun> Runs;
+		TArray<CSHouseFrame::FElement> Elements;
+		float PrevSpan = TNumericLimits<float>::Max();
+		int32 Narrowing = 0;
+		CSHouseBrickWall::BuildWall(FTransform::Identity, Footprint, T, Courses, 0.0f,
+			MakeArrayView(Openings), 0x1234u, Params, Runs, Elements,
+			[&](int32, const CSHouseTrim::FBand& Band, int32, const TArray<CSHouseTrim::FRun>&)
+			{
+				float B0 = 0.0f, B1 = 0.0f;
+				const float Span = CSHouseTrim::BlockedSpan(Arch, Band, B0, B1) ? (B1 - B0) : 0.0f;
+				TestTrue(FString::Printf(TEXT("the blocked span never widens going up (%.1f -> %.1f)"),
+						PrevSpan, Span),
+					Span <= PrevSpan + 0.01f);
+				if (Span < PrevSpan - 0.01f) ++Narrowing;
+				PrevSpan = Span;
+			});
+		// 至少收窄过几次 —— 否则上面那条"不变宽"是句空话（矩形缺口也满足它）。
+		TestTrue(FString::Printf(TEXT("and it really does narrow (%d steps)"), Narrowing), Narrowing >= 3);
+	}
+
+	// ---- 容量是硬上限：撞上就截断，绝不扩容 ----
+	{
+		CSHouseFrame::FBrickParams Tight = Params;
+		Tight.MaxBricks = 100;
+		TArray<CSHouseTrim::FRun> Runs;
+		TArray<CSHouseFrame::FElement> Elements;
+		const int32 Total = CSHouseBrickWall::BuildWall(FTransform::Identity, Footprint, T, Courses,
+			3.0f, TArrayView<const FCSWallOpening>(), 0x1234u, Tight, Runs, Elements, Noop);
+		TestTrue(FString::Printf(TEXT("the wall is truncated at capacity (%d <= 100)"), Total),
+			Total <= 100);
+	}
+
+	return true;
+}
+
+
+// -----------------------------------------------------------------------------
+// D8 锚点（2026-09-06 用户裁决「位置的存储方式与 TG 一致」）：纯函数，无 world
+// -----------------------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseWallAnchorTest,
+	"PCGPlugins.ComputeShaderGenerator.House.WallAnchor",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseWallAnchorTest::RunTest(const FString& Parameters)
+{
+	const FVector2D Footprint(600.0, 400.0);
+	const float T = 24.0f;
+	const float WallHeight = 300.0f;
+	const float WinHeight = 110.0f;
+
+	auto MakeHit = [](int32 Edge, float S, float Z)
+	{
+		FCSWallHit H;
+		H.bHit = true; H.EdgeIndex = Edge; H.S = S; H.Z = Z;
+		return H;
+	};
+
+	// ---- 锚到**近**的那个角 ----
+	{
+		// 边 0 长 600。S = 100 靠起点角。
+		const FCSWallAnchor A = CSHouse_MakeWallAnchor(MakeHit(0, 100.0f, 150.0f), Footprint, T, 95.0f);
+		TestTrue(TEXT("anchor is valid"), A.IsValidAnchor());
+		TestFalse(TEXT("S=100 on a 600 wall anchors to the start corner"), A.bFromEndCorner);
+		TestTrue(TEXT("and records 100 from it"), FMath::IsNearlyEqual(A.DistFromCorner, 100.0f, 0.01f));
+
+		// S = 500 靠终点角。
+		const FCSWallAnchor B = CSHouse_MakeWallAnchor(MakeHit(0, 500.0f, 150.0f), Footprint, T, 95.0f);
+		TestTrue(TEXT("S=500 anchors to the end corner"), B.bFromEndCorner);
+		TestTrue(TEXT("and records 100 from it"), FMath::IsNearlyEqual(B.DistFromCorner, 100.0f, 0.01f));
+
+		// 正中间归**起点角** —— 判据要给出确定的一侧，否则同一个位置两次算出两个锚点，
+		// 而两者在墙不变时给出同一个 S ⇒ 差异要等到第一次拉尺寸才显形。
+		const FCSWallAnchor M = CSHouse_MakeWallAnchor(MakeHit(0, 300.0f, 150.0f), Footprint, T, 95.0f);
+		TestFalse(TEXT("dead centre is deterministic (start corner)"), M.bFromEndCorner);
+	}
+
+	// ---- 往返：墙不变时 锚点 → S 必须还原命中点 ----
+	{
+		for (int32 Edge = 0; Edge < 4; ++Edge)
+		{
+			const FCSHouseEdgeFrame F = CSHouse_GetEdge(Edge, Footprint, T);
+			const float S = F.Len * 0.3f;
+			const FCSWallAnchor A = CSHouse_MakeWallAnchor(MakeHit(Edge, S, 150.0f), Footprint, T, 95.0f);
+			TestTrue(FString::Printf(TEXT("edge %d round-trips S=%.1f"), Edge, S),
+				FMath::IsNearlyEqual(CSHouse_AnchorS(A, Footprint, T), S, 0.01f));
+		}
+	}
+
+	// ---- **这条是本次改动的理由**：拉尺寸之后，靠"没动的那个角"的窗在世界里纹丝不动 ----
+	//
+	// `PushEdge(1, +100)` 干两件事：Footprint.X += 100，且 actor 中心沿 +X 移 50
+	// （对侧墙在世界里不动）。于是 +X 那一侧的两个角各挪 +100、−X 那一侧的两个角不动。
+	//
+	// 拿边 2 来测（它从 (HX, HY) 往 −X 走，S 原点正是会动的那个角）：
+	// 绝对弧长的老写法下，边 2 上的窗会**整体滑 +100**，而那面墙根本没动 —— 2026-09-05
+	// 逐一推算出来的四条边里最难解释的一种。锚到远端角之后它必须不动。
+	{
+		const FVector2D Before(600.0, 400.0);
+		const FVector2D After(700.0, 400.0);
+		const double CentreShift = 50.0;   // PushEdge 同时把中心挪半个增量
+
+		auto WorldXOnEdge2 = [&](float S, const FVector2D& FP, double Shift)
+		{
+			const FCSHouseEdgeFrame F = CSHouse_GetEdge(2, FP, T);
+			return F.Start.X + F.U.X * double(S) + Shift;   // 边 2 的 U = (−1, 0)
+		};
+
+		// 窗在边 2 的 S = 500 处 ⇒ 靠终点角（= 世界里不动的那个角）。
+		const float SBefore = 500.0f;
+		const FCSWallAnchor A = CSHouse_MakeWallAnchor(MakeHit(2, SBefore, 150.0f), Before, T, 95.0f);
+		TestTrue(TEXT("it anchored to the corner that will not move"), A.bFromEndCorner);
+
+		const double XBefore = WorldXOnEdge2(SBefore, Before, 0.0);
+		const double XAfter = WorldXOnEdge2(CSHouse_AnchorS(A, After, T), After, CentreShift);
+		TestTrue(FString::Printf(TEXT("the window holds its world position across the resize (%.1f -> %.1f)"),
+				XBefore, XAfter),
+			FMath::IsNearlyEqual(XBefore, XAfter, 0.01));
+
+		// 反证：同一扇窗按**绝对弧长**记的话会滑整整 100 —— 这就是被修掉的那个 bug。
+		const double XAbsolute = WorldXOnEdge2(SBefore, After, CentreShift);
+		TestTrue(FString::Printf(TEXT("absolute arc length would have slid it by %.1f"), XAbsolute - XBefore),
+			FMath::IsNearlyEqual(XAbsolute - XBefore, 100.0, 0.01));
+
+		// 而靠**会动**的那个角的窗，本来就该随墙走：+X 面从 300 挪到 400。
+		const FCSWallAnchor Near = CSHouse_MakeWallAnchor(MakeHit(2, 100.0f, 150.0f), Before, T, 95.0f);
+		TestFalse(TEXT("a window near the pushed corner anchors to it"), Near.bFromEndCorner);
+		TestTrue(TEXT("and travels with that corner"),
+			FMath::IsNearlyEqual(
+				WorldXOnEdge2(CSHouse_AnchorS(Near, After, T), After, CentreShift)
+					- WorldXOnEdge2(100.0f, Before, 0.0),
+				100.0, 0.01));
+	}
+
+	// ---- 墙缩到锚点越界 ⇒ 夹回墙面内（谓词照旧会判 NearCorner，但位置不许飞出去） ----
+	{
+		const FCSWallAnchor A = CSHouse_MakeWallAnchor(MakeHit(0, 100.0f, 150.0f), Footprint, T, 95.0f);
+		const FVector2D Tiny(50.0, 400.0);
+		const float S = CSHouse_AnchorS(A, Tiny, T);
+		TestTrue(FString::Printf(TEXT("S clamps into the shortened wall (%.1f)"), S), S >= 0.0f && S <= 50.0f);
+	}
+
+	// ---- **不动点**：派生出来的变换再打一次探针，必须拿回同一个锚点 ----
+	//
+	// 这条钉的是 `WallStandoff` 那个坑：把原点推进墙里（或正好贴在外皮上而 Standoff = 0）
+	// 会让射线的 `Dist <= 0` 与就近版的"背面"判据一起失效 —— 症状是"窗吸附一次之后再也
+	// 解析不到宿主"，而无宿主会自毁，全程不报红。
+	{
+		const float Standoff = 5.0f;
+		for (int32 Edge = 0; Edge < 4; ++Edge)
+		{
+			const FCSHouseEdgeFrame F = CSHouse_GetEdge(Edge, Footprint, T);
+			const float S = F.Len * 0.4f;
+			const FCSWallAnchor A = CSHouse_MakeWallAnchor(MakeHit(Edge, S, 150.0f), Footprint, T, 150.0f - WinHeight * 0.5f);
+
+			const FTransform Local = CSHouse_AnchorToLocal(A, Footprint, T, WinHeight * 0.5f, Standoff);
+			const FCSWallHit Back = CSHouse_RayHitWall(
+				Local.GetLocation(), Local.GetRotation().GetForwardVector(), Footprint, T, WallHeight, 600.0f);
+
+			TestTrue(FString::Printf(TEXT("edge %d: the derived transform still sees its own wall"), Edge), Back.bHit);
+			TestEqual(FString::Printf(TEXT("edge %d: same edge"), Edge), Back.EdgeIndex, Edge);
+			TestTrue(FString::Printf(TEXT("edge %d: same S (%.2f vs %.2f)"), Edge, Back.S, S),
+				FMath::IsNearlyEqual(Back.S, S, 0.01f));
+
+			const FCSWallAnchor Round = CSHouse_MakeWallAnchor(Back, Footprint, T, Back.Z - WinHeight * 0.5f);
+			TestTrue(FString::Printf(TEXT("edge %d: the anchor is a fixed point of resolve"), Edge), Round == A);
+		}
+	}
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseWindowMarkerTest,
+	"PCGPlugins.ComputeShaderGenerator.House.WindowMarker",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseWindowMarkerTest::RunTest(const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Editor test world"), World)) return false;
+
+	ACSHouseActor* House = World->SpawnActor<ACSHouseActor>(FVector::ZeroVector, FRotator::ZeroRotator);
+	if (!TestNotNull(TEXT("House"), House)) return false;
+	// 道路驱动的门会占掉墙面，本条只测标记这一环 —— 把门那一路摘干净，否则断言会时红时绿
+	// 地取决于有没有地面。
+	House->Windows.Reset();
+
+	ACSWindowMarker* Marker = World->SpawnActor<ACSWindowMarker>(FVector::ZeroVector, FRotator::ZeroRotator);
+	if (!TestNotNull(TEXT("Window marker"), Marker)) return false;
+	// ⚠️ **必须关掉自毁**：脚本是"先 spawn 后摆位"，spawn 那一瞬间标记在原点、找不到宿主，
+	// 开着它会当场自删 —— 而"标记没了"与"标记判它放不下"在断言里长得一模一样。
+	Marker->bDestroyWhenHostless = false;
+
+	// 摆到南墙外 100 cm、朝 +Y（面向墙），高度取半个窗高以上免得一上来就 SillTooLow。
+	const double HalfY = House->FootprintSize.Y * 0.5;
+	Marker->SetActorLocation(FVector(0.0, -HalfY - 100.0, 150.0));
+	Marker->SetActorRotation(FRotator(0.0, 90.0, 0.0));   // +X 指向 +Y
+
+	TestTrue(TEXT("the marker resolves a host"), Marker->ResolveHostAndRegister(true));
+	TestEqual(TEXT("the host is that house"), Marker->GetHost(), House);
+	TestEqual(TEXT("the house holds exactly one marker demand"), House->GetFeatureMarkerCount(), 1);
+	TestEqual(TEXT("the demand was accepted"), Marker->GetLastReject(), ECSFeatureReject::None);
+	TestTrue(TEXT("the house really cut a hole for it"), Marker->CausesCut());
+	TestEqual(TEXT("and that hole shows up in the window count"), House->GetWindowCount(), 1);
+
+	// 吸附：接受之后标记被搬到墙面上（锚点 → 世界的派生变换），不再停在用户随手放的地方。
+	const FVector AcceptedAt = Marker->GetActorLocation();
+	TestTrue(TEXT("an accepted marker snaps onto the wall face"),
+		FMath::IsNearlyEqual(AcceptedAt.Y, -HalfY - Marker->WallStandoff, 0.5));
+	TestTrue(TEXT("and it is attached to the host (that is how it follows the house)"),
+		Marker->GetAttachParentActor() == House);
+
+	// ---- 松手时被拒 ⇒ **弹回最后一个被答应的位置**（计划 D8「回位规则」= TG DecoratorBackup）----
+	//
+	// ⚠️ 2026-09-06 起这条判据翻了个面：以前是"停在被拒处、窗洞掉到 0"，现在回退到
+	// `LastAcceptedAnchor` 并吸附回去 —— 所以窗洞**留着**。"被拒的诉求不撤登记"那一条没变，
+	// 它由下面那个从未被接受过的标记来钉。
+	Marker->SetActorLocation(FVector(-House->FootprintSize.X * 0.5, -HalfY - 100.0, 150.0));
+	Marker->ResolveHostAndRegister(true);
+	TestEqual(TEXT("the demand is still registered"), House->GetFeatureMarkerCount(), 1);
+	TestTrue(TEXT("a rejected release springs back to the last accepted spot"),
+		Marker->GetActorLocation().Equals(AcceptedAt, 0.5));
+	TestTrue(TEXT("so it still cuts a hole"), Marker->CausesCut());
+	TestEqual(TEXT("and the window is still there"), House->GetWindowCount(), 1);
+
+	// ---- 房子拉尺寸 ⇒ 标记按锚点跟着走 ----
+	//
+	// 2026-09-05 核出的缺陷：标记既不 attach、也没有任何人在房子变化时通知它 ⇒ 洞与标记
+	// 从此分家（推第 e 条边，第 e 与 e+1 条边上的窗错位 Δ）。判据取"锚点是权威"的字面含义：
+	// **标记的世界位置恒等于锚点派生出来的位置**。
+	{
+		const int32 EdgeBefore = Marker->GetAnchor().EdgeIndex;
+		House->PushEdge(1, 100.0f, true);   // 推 +X 那面墙：footprint → 700×400，中心挪 +50
+		TestEqual(TEXT("resizing does not fling the window onto another wall"),
+			Marker->GetAnchor().EdgeIndex, EdgeBefore);
+		TestTrue(TEXT("and the marker follows its anchor across the resize"),
+			Marker->GetActorLocation().Equals(
+				House->AnchorToWorld(Marker->GetAnchor(), Marker->GetDemandHalfHeight(),
+					Marker->WallStandoff).GetLocation(), 0.5));
+		TestTrue(TEXT("the window survives it"), Marker->CausesCut());
+	}
+
+	// ---- 盖顶件不许污染洞（三件里只有 OpeningMesh 定洞）----
+	//
+	// ⚠️ 这条钉的是本类**最容易搞错、而且搞错了一条断言都不会红**的纪律：把过梁/窗台并进定洞件，
+	// 洞会从 78×160 涨到框外那一圈，而过梁正好把它盖住 —— 画面上看不出来，只有从侧面或洞的
+	// 内壁才露馅。所以这里用一个**故意超大**的假过梁（引擎的 100³ Cube）去撞它。
+	{
+		float BeforeW = 0.0f, BeforeH = 0.0f;
+		Marker->GetDemandSize(BeforeW, BeforeH);
+		TestTrue(TEXT("the opening mesh gives a sane size to begin with"), BeforeW > 1.0f && BeforeH > 1.0f);
+		const int32 WindowsBefore = House->GetWindowCount();
+
+		UStaticMesh* Fat = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+		if (TestNotNull(TEXT("engine cube (stand-in for an oversized lintel)"), Fat))
+		{
+			Marker->LintelMesh->SetStaticMesh(Fat);
+			Marker->SillMesh->SetStaticMesh(Fat);
+			Marker->ResolveHostAndRegister(true);
+
+			float AfterW = 0.0f, AfterH = 0.0f;
+			Marker->GetDemandSize(AfterW, AfterH);
+			TestTrue(FString::Printf(TEXT("dressing meshes do not widen the hole (%.1f -> %.1f)"), BeforeW, AfterW),
+				FMath::IsNearlyEqual(AfterW, BeforeW, 0.01f));
+			TestTrue(FString::Printf(TEXT("nor heighten it (%.1f -> %.1f)"), BeforeH, AfterH),
+				FMath::IsNearlyEqual(AfterH, BeforeH, 0.01f));
+			TestEqual(TEXT("and the house still cuts exactly the same windows"),
+				House->GetWindowCount(), WindowsBefore);
+
+			Marker->LintelMesh->SetStaticMesh(nullptr);
+			Marker->SillMesh->SetStaticMesh(nullptr);
+		}
+
+		// **组件恒在、网格可空**：清掉定洞件 ⇒ 退回手填的 Width / Height，而不是产出零尺寸洞
+		// （谓词对零宽洞只会淡淡地说一句 Degenerate，画面上"窗没了"与"窗被门挤掉"长得一样）。
+		UStaticMesh* Opening = Marker->OpeningMesh->GetStaticMesh();
+		Marker->OpeningMesh->SetStaticMesh(nullptr);
+		float BareW = 0.0f, BareH = 0.0f;
+		Marker->GetDemandSize(BareW, BareH);
+		TestTrue(FString::Printf(TEXT("an empty opening slot falls back to the typed size (%.1f x %.1f)"),
+				BareW, BareH),
+			FMath::IsNearlyEqual(BareW, Marker->Width, 0.01f)
+				&& FMath::IsNearlyEqual(BareH, Marker->Height, 0.01f));
+		Marker->OpeningMesh->SetStaticMesh(Opening);
+		Marker->ResolveHostAndRegister(true);
+	}
+
+	// ---- 从未被接受过的标记：登记留着、不弹回、洞不出 ----
+	//
+	// 这条钉的是计划 D8 那句"被拒的诉求留在列表里、只是这一轮不出洞" —— 撤登记的话，
+	// "从被门拱占住的墙拖到隔壁墙"会先把它删掉再也回不来。
+	{
+		ACSWindowMarker* NeverOk = World->SpawnActor<ACSWindowMarker>(FVector::ZeroVector, FRotator::ZeroRotator);
+		if (!TestNotNull(TEXT("Corner marker"), NeverOk)) return false;
+		NeverOk->bDestroyWhenHostless = false;
+		NeverOk->SetActorLocation(FVector(-House->FootprintSize.X * 0.5, -HalfY - 100.0, 150.0));
+		NeverOk->SetActorRotation(FRotator(0.0, 90.0, 0.0));
+		NeverOk->ResolveHostAndRegister(true);
+
+		TestEqual(TEXT("a never-accepted rejection stays registered"), House->GetFeatureMarkerCount(), 2);
+		TestEqual(TEXT("and it reports why"), NeverOk->GetLastReject(), ECSFeatureReject::NearCorner);
+		TestFalse(TEXT("no hole was cut for it"), NeverOk->CausesCut());
+		TestEqual(TEXT("it is counted as a reject, not as a missing demand"), House->GetWindowRejectCount(), 1);
+		TestEqual(TEXT("the accepted one is untouched"), House->GetWindowCount(), 1);
+
+		World->DestroyActor(NeverOk);
+		TestEqual(TEXT("and removing it leaves the first one alone"), House->GetFeatureMarkerCount(), 1);
+	}
+
+	// ---- 换宿主：先向旧的注销，再挂新的 ----
+	ACSHouseActor* Other = World->SpawnActor<ACSHouseActor>(
+		FVector(0.0, 3000.0, 0.0), FRotator::ZeroRotator);
+	if (!TestNotNull(TEXT("Second house"), Other)) return false;
+	Other->Windows.Reset();
+
+	const double OtherHalfY = Other->FootprintSize.Y * 0.5;
+	Marker->SetActorLocation(FVector(0.0, 3000.0 - OtherHalfY - 100.0, 150.0));
+	Marker->ResolveHostAndRegister(true);
+	TestEqual(TEXT("the marker moved to the second house"), Marker->GetHost(), Other);
+	TestEqual(TEXT("the old host let go of it"), House->GetFeatureMarkerCount(), 0);
+	TestEqual(TEXT("the new host picked it up"), Other->GetFeatureMarkerCount(), 1);
+	TestTrue(TEXT("and it cuts a hole there"), Marker->CausesCut());
+
+	// ---- 删掉标记 ⇒ 宿主那一份跟着消失（"无主的窗"这一类状态被消灭）----
+	World->DestroyActor(Marker);
+	TestEqual(TEXT("destroying the marker unregisters its demand"), Other->GetFeatureMarkerCount(), 0);
+	TestEqual(TEXT("and the hole closes"), Other->GetWindowCount(), 0);
+
+	// ---- 找不到宿主时确实会自毁（这条单独造一个，免得污染上面的断言）----
+	ACSWindowMarker* Lonely = World->SpawnActor<ACSWindowMarker>(
+		FVector(0.0, -100000.0, 0.0), FRotator::ZeroRotator);
+	if (!TestNotNull(TEXT("Lonely marker"), Lonely)) return false;
+	TestFalse(TEXT("a marker far from any house resolves nothing"), Lonely->ResolveHostAndRegister(true));
+	TestFalse(TEXT("and it destroys itself (D8 ruling)"), IsValid(Lonely));
+
+	return true;
+}
+
+// -----------------------------------------------------------------------------
+// 点击加窗的**落地那一步**（D8 笔刷模式，2026-09-06）：`AdoptAnchor` 与 `PlaceMarkerAlongRay`
+//
+// `House.WindowMarker` 钉的是**拖 gizmo** 那条路（输入 = actor 自己的变换 →
+// `ResolveHostAndRegister`）。这一条钉的是**点击**那条路（输入 = 已经解出来的命中 →
+// `AdoptAnchor`），两者的分工写在 `ACSHouseFeatureMarker::AdoptAnchor` 的注释里。
+//
+// 判据是"锚点是权威"这句话的可执行形式 —— **三份坐标必须逐位互相印证**：
+//   ① 标记身上的 `Anchor`（(边号, 离角距离, 洞底高) 这份权威记录）；
+//   ② 房子登记表里那个洞的 `CenterS`（弧长，谓词与 clip 场吃的就是它）；
+//   ③ 标记的**世界位置**（用户看得见的那一份）。
+// 三者写岔任意一对，画面上都是"窗贴在离你瞄的地方几十厘米开外"，而窗数、砖数、三角数
+// 全部照绿 —— 所以必须三份对齐着判，只判其中一份等于没判。
+//
+// 顺带钉死**空 `WindowBrushClass` 的退路到底能不能 spawn**：`ACSHouseFeatureMarker` 是
+// `Abstract`，而 `CLASS_Abstract` **不在 `CLASS_Inherit` 里**，所以子类 `ACSWindowMarker`
+// 不是抽象类、退路是好的。这句话靠读代码是猜的，靠这里的断言才是知道的。
+// -----------------------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseWindowBrushPlacementTest,
+	"PCGPlugins.ComputeShaderGenerator.House.WindowBrushPlacement",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseWindowBrushPlacementTest::RunTest(const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Editor test world"), World)) return false;
+
+	// ---- ① 类说明符：退路能不能实例化（复核项，2026-09-06）----
+	//
+	// ⚠️ 这三条**必须一起看**。只判"子类不是抽象的"会在有人把 `Abstract` 抄到子类上时报红，
+	// 但读断言的人无从知道父类本来就是抽象的、这是不是预期；只判父类则完全没测到退路。
+	TestTrue(TEXT("the feature-marker base really is abstract (otherwise the next check is vacuous)"),
+		ACSHouseFeatureMarker::StaticClass()->HasAnyClassFlags(CLASS_Abstract));
+	TestFalse(TEXT("ACSWindowMarker is NOT abstract, so an empty WindowBrushClass can still spawn"),
+		ACSWindowMarker::StaticClass()->HasAnyClassFlags(CLASS_Abstract));
+	// `NotPlaceable` 反过来**是**继承的（它在 `CLASS_Inherit` 里）—— 拖放入口已退役，
+	// 这一条正是想要的，和上一条一起说明了"哪些说明符会传染"这件事没有被记岔。
+	TestTrue(TEXT("but NotPlaceable IS inherited, so it still cannot be dragged into the viewport"),
+		ACSWindowMarker::StaticClass()->HasAnyClassFlags(CLASS_NotPlaceable));
+	// `Blueprintable` 是 metadata（`IsBlueprintBase`），按继承链查 —— 两个基类都是
+	// `NotBlueprintable`，掉了这条就再也建不出 `BP_Window_*` 那一族子蓝图，而且不报错。
+	// （`WITH_METADATA` 守卫：`GetBoolMetaDataHierarchical` 只在带 metadata 的构建里存在。）
+#if WITH_METADATA
+	TestTrue(TEXT("and Blueprintable survived, so BP_Window_* subclasses are still authorable"),
+		ACSWindowMarker::StaticClass()->GetBoolMetaDataHierarchical(TEXT("IsBlueprintBase")));
+#endif
+
+	ACSHouseActor* House = World->SpawnActor<ACSHouseActor>(FVector::ZeroVector, FRotator::ZeroRotator);
+	if (!TestNotNull(TEXT("House"), House)) return false;
+	// 与 `House.WindowMarker` 同一条理由：道路驱动的门会占掉墙面，把门那一路摘干净，
+	// 否则断言会时红时绿地取决于有没有地面。
+	House->Windows.Reset();
+	House->ReevaluateSite();
+
+	UCSHouseSubsystem* Sub = World->GetSubsystem<UCSHouseSubsystem>();
+	if (!TestNotNull(TEXT("House subsystem in the editor world"), Sub)) return false;
+	TestEqual(TEXT("the house registered itself with the subsystem"), Sub->GetTrackedHouseCount(), 1);
+
+	const FVector2D Footprint = House->FootprintSize;
+	const float T = House->WallThickness;
+
+	// -------------------------------------------------------------------------
+	// ② AdoptAnchor：给一个**已知**的 FCSWallHit，三份坐标必须互相印证
+	// -------------------------------------------------------------------------
+	//
+	// 取边 1（+X 那面短墙）弧长 120、命中高度 150 —— 边 1 长 400 − 2×24 = 352，护角 60 ⇒
+	// 可用区间 [60, 292]，120 稳稳落在里面（贴着 `demo_house_window` 里那三扇窗的选点理由）。
+	{
+		ACSWindowMarker* Marker = World->SpawnActor<ACSWindowMarker>(FVector::ZeroVector, FRotator::ZeroRotator);
+		if (!TestNotNull(TEXT("Window marker"), Marker)) return false;
+		// ⚠️ 必须关自毁：spawn 那一瞬间标记在原点、还没 adopt，开着它会当场自删 ——
+		// 而"标记没了"与"标记判它放不下"在断言里长得一模一样。
+		Marker->bDestroyWhenHostless = false;
+
+		FCSWallHit Hit;
+		Hit.bHit = true;
+		Hit.EdgeIndex = 1;
+		Hit.S = 120.0f;
+		Hit.Z = 150.0f;
+
+		// 命中点的 Z 是窗**心**，锚点存的是**洞底** ⇒ 减半个窗高。口径与 `PlaceMarkerAlongRay`
+		// 同源（两处写岔的症状是"窗整体偏高半扇"）。
+		const float HalfHeight = Marker->GetDemandHalfHeight();
+		TestTrue(TEXT("the marker reports a sane demand height to begin with"), HalfHeight > 1.0f);
+		const float SillZ = FMath::Max(0.0f, Hit.Z - HalfHeight);
+		const FCSWallAnchor Want = CSHouse_MakeWallAnchor(Hit, Footprint, T, SillZ);
+		if (!TestTrue(TEXT("the hand-built anchor is valid"), Want.IsValidAnchor())) return false;
+
+		Marker->AdoptAnchor(House, Want);
+
+		// —— 权威那一份：锚点被**原样**收下（AdoptAnchor 不打射线、不重新解析）——
+		TestTrue(TEXT("AdoptAnchor takes the anchor verbatim (it resolves nothing of its own)"),
+			Marker->GetAnchor() == Want);
+		TestEqual(TEXT("the marker adopted that house as its host"), Marker->GetHost(), House);
+		TestTrue(TEXT("and attached to it, so the house carries it around"),
+			Marker->GetAttachParentActor() == House);
+		TestEqual(TEXT("the house holds exactly one marker demand"), House->GetFeatureMarkerCount(), 1);
+		TestEqual(TEXT("the demand was accepted"), Marker->GetLastReject(), ECSFeatureReject::None);
+		TestTrue(TEXT("so the house really cut a hole for it"), Marker->CausesCut());
+		TestEqual(TEXT("and it shows up in the window count"), House->GetWindowCount(), 1);
+
+		// —— ②：洞的 `CenterS` 与锚点同源 ——
+		//
+		// ⚠️ 判据写成"等于 `CSHouse_AnchorS(锚点)`"而**不是**"等于 120"：`CenterS` 是 footprint
+		// 的函数（`S = bFromEndCorner ? Len − Dist : Dist`），硬编 120 只在这一个尺寸下成立，
+		// 房子一改尺寸就变成一条骗人的绿灯。顺便钉一次它此刻确实**就是** 120，
+		// 免得两边一起写错还互相印证。
+		const float WantS = CSHouse_AnchorS(Want, Footprint, T);
+		TestTrue(FString::Printf(TEXT("the anchor really points at the spot we aimed at (S=%.2f)"), WantS),
+			FMath::IsNearlyEqual(WantS, 120.0f, 0.01f));
+
+		const TArray<FCSWallOpening> Openings = House->GetCurrentOpenings();
+		const FCSWallOpening* Cut = Openings.FindByPredicate(
+			[](const FCSWallOpening& O) { return O.Type == ECSOpeningType::Window; });
+		if (!TestNotNull(TEXT("the openings table carries that window"), Cut)) return false;
+		TestEqual(TEXT("the hole sits on the edge the anchor names"), Cut->EdgeIndex, Want.EdgeIndex);
+		TestTrue(FString::Printf(TEXT("the hole's CenterS is the anchor's arc length (%.2f vs %.2f)"),
+				Cut->CenterS, WantS),
+			FMath::IsNearlyEqual(Cut->CenterS, WantS, 0.01f));
+		TestTrue(FString::Printf(TEXT("and its floor is the anchor's SillZ (%.2f vs %.2f)"),
+				Cut->Z0, Want.SillZ),
+			FMath::IsNearlyEqual(Cut->Z0, Want.SillZ, 0.01f));
+
+		// —— ③：世界位置也是同一个锚点派生出来的（`AdoptAnchor` 无条件吸附）——
+		//
+		// ⚠️ 这条钉的是「无条件吸附」那句纪律：不摆的话标记会留在 spawn 时那个临时位姿
+		// （相机跟前 / 原点），用户在墙上根本找不到它，而上面每一条断言照绿。
+		const FVector Want3 =
+			House->AnchorToWorld(Want, HalfHeight, Marker->WallStandoff).GetLocation();
+		TestTrue(FString::Printf(TEXT("the marker snapped onto the anchor's world spot (%s vs %s)"),
+				*Marker->GetActorLocation().ToCompactString(), *Want3.ToCompactString()),
+			Marker->GetActorLocation().Equals(Want3, 0.5));
+		TestTrue(TEXT("which is nowhere near where it was spawned (so the snap is a real move)"),
+			!Marker->GetActorLocation().Equals(FVector::ZeroVector, 1.0));
+
+		// —— 幂等：同一个锚点再收一次，什么都不许变（重复点击 / 重复加载都会走到）——
+		Marker->AdoptAnchor(House, Want);
+		TestEqual(TEXT("adopting the same anchor twice does not double-register"),
+			House->GetFeatureMarkerCount(), 1);
+		TestEqual(TEXT("nor double-cut"), House->GetWindowCount(), 1);
+
+		World->DestroyActor(Marker);
+		House->ReevaluateSite();
+		TestEqual(TEXT("destroying it closes the hole again"), House->GetWindowCount(), 0);
+	}
+
+	// -------------------------------------------------------------------------
+	// ③ PlaceMarkerAlongRay：唯一执行面。退路可 spawn、抽象类被挡住且不静默
+	// -------------------------------------------------------------------------
+	{
+		// 从 −Y 那面长墙外往墙里打。用命中点反推的短射线与 `FCSWindowBrushEdMode::CommitSamples`
+		// 同形（恒垂直于墙 ⇒ `CSHouse_RayHitWall` 的"只认外表面"判据必然成立）。
+		const double HalfY = Footprint.Y * 0.5;
+		const FVector Origin(0.0, -HalfY - 120.0, 150.0);
+		const FVector Dir(0.0, 1.0, 0.0);
+
+		// —— 空 `WindowBrushClass` 的退路：`ACSWindowMarker` 本身 ——
+		//
+		// ⚠️ 这一条是上面那个 `CLASS_Abstract` 断言的**执行面对照**：类标志说"能 spawn"，
+		// 这里证明它**真的**被 spawn 出来并落到了墙上。只判标志不判这条的话，
+		// 将来谁在 `PlaceMarkerAlongRay` 里加一道把退路挡掉的闸，标志断言照样绿。
+		ACSHouseFeatureMarker* Fallback = Sub->PlaceMarkerAlongRay(
+			ACSWindowMarker::StaticClass(), Origin, Dir, 400.0f);
+		if (!TestNotNull(TEXT("the C++ fallback class (empty WindowBrushClass) really spawns"), Fallback))
+		{
+			return false;
+		}
+		TestEqual(TEXT("and it lands on that house"), Fallback->GetHost(), House);
+		TestTrue(TEXT("cutting one hole"), Fallback->CausesCut());
+		TestEqual(TEXT("exactly one"), House->GetWindowCount(), 1);
+
+		// —— 抽象类：什么都不生成，而且**出声**（2026-09-06 新增的闸）——
+		//
+		// ⚠️ 只判返回值为空是不够的：`SpawnActor` 失败之后如果还留下了半个登记，
+		// "生成了但没登记"会静静地漏过去。所以连计数一起判。
+		const int32 WindowsBefore = House->GetWindowCount();
+		const int32 MarkersBefore = House->GetFeatureMarkerCount();
+		// ⚠️ **这条同时是"它真的出声了"的断言**：`AddExpectedError...` 要求这句警告恰好出现
+		// 一次，一次都不出（有人把 `UE_LOG` 删了 / 改了措辞）就报红。用 `...Plain` 而不是
+		// `AddExpectedError`：后者的 `IsRegex` 默认是 **true**，模式里将来混进一个元字符就会
+		// 静默变成另一条正则。
+		AddExpectedErrorPlain(TEXT("is abstract and cannot be spawned"),
+			EAutomationExpectedErrorFlags::Contains, 1);
+		ACSHouseFeatureMarker* Abstract = Sub->PlaceMarkerAlongRay(
+			ACSHouseFeatureMarker::StaticClass(), Origin, Dir, 400.0f);
+		TestNull(TEXT("an abstract marker class places nothing"), Abstract);
+		TestEqual(TEXT("and leaves the window count alone"), House->GetWindowCount(), WindowsBefore);
+		TestEqual(TEXT("and the demand list alone"), House->GetFeatureMarkerCount(), MarkersBefore);
+
+		// —— 打空：同样什么都不生成（没有"游离标记"这种状态）——
+		ACSHouseFeatureMarker* Miss = Sub->PlaceMarkerAlongRay(
+			ACSWindowMarker::StaticClass(), FVector(0.0, 0.0, 100000.0), FVector::UpVector, 400.0f);
+		TestNull(TEXT("a ray that misses every wall places nothing"), Miss);
+		TestEqual(TEXT("and changes nothing"), House->GetWindowCount(), WindowsBefore);
+
+		// —— 执行面与 `AdoptAnchor` 是**同一条**口径：命中的 Z 是窗心，锚点是洞底 ——
+		//
+		// ⚠️ 钉这条是因为两处各自减了一次半窗高，写岔了就是"窗整体偏高半扇"，
+		// 而它在画面上只有贴着檐口时才露馅（那时会莫名判 `AboveEave`）。
+		const FCSWallAnchor Got = Fallback->GetAnchor();
+		TestTrue(FString::Printf(TEXT("the placed anchor's sill is the hit Z minus half the window (%.2f)"),
+				Got.SillZ),
+			FMath::IsNearlyEqual(Got.SillZ, 150.0f - Fallback->GetDemandHalfHeight(), 0.5f));
+		TestTrue(TEXT("and the marker sits exactly where that anchor says it should"),
+			Fallback->GetActorLocation().Equals(
+				House->AnchorToWorld(Got, Fallback->GetDemandHalfHeight(),
+					Fallback->WallStandoff).GetLocation(), 0.5));
+
+		World->DestroyActor(Fallback);
+		House->ReevaluateSite();
+		TestEqual(TEXT("and deleting it closes the hole"), House->GetWindowCount(), 0);
+	}
+
+	return true;
+}
+
+// -----------------------------------------------------------------------------
+// 拉尺寸抓手（D5 交互层）：父子回路的 2x 缺陷、下限记账、模式生命周期
+//
+// 这一条要 world —— 抓手是真 actor、attach 在房子下，而"父级移动 Applied/2 会把抓手一起
+// 带走"正是缺陷的成因，纯函数层复现不出来。`House.EdgePush` 钉的是推拉本身的数学，
+// 这一条钉的是**抓手到房子这段接线**。
+// -----------------------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseResizeHandleTest,
+	"PCGPlugins.ComputeShaderGenerator.House.ResizeHandle",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseResizeHandleTest::RunTest(const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Editor test world"), World)) return false;
+
+	// 带 yaw：中心随动是**世界**方向的量，yaw=0 下测不出把局部量当世界量用的错误
+	// （`House.EdgePush` 的第 ② 例同一条理由）。
+	constexpr float Yaw = 37.0f;
+	ACSHouseActor* House = World->SpawnActor<ACSHouseActor>(FVector(1000.0, 2000.0, 0.0), FRotator(0.0f, Yaw, 0.0f));
+	if (!TestNotNull(TEXT("House"), House)) return false;
+	House->Windows.Reset();
+	House->FootprintSize = FVector2D(600.0, 400.0);
+	House->MinFootprint = 200.0f;
+
+	// ---- ① 进入模式：四面墙各一个，各自落在自己那面墙外 ----
+	House->EnterResizeMode();
+	TestTrue(TEXT("Entering resize mode reports the mode is on"), House->IsInResizeMode());
+
+	// 五个抓手：四个水平锥子 + 一个高度框。
+	TestEqual(TEXT("Five handles: four cones plus the height frame"), House->GetResizeHandles().Num(), 5);
+
+	TArray<ACSHouseResizeHandleActor*> Handles = House->GetEdgeHandles();
+	if (!TestEqual(TEXT("One cone per wall"), Handles.Num(), 4)) return false;
+
+	for (const ACSHouseResizeHandleActor* Handle : Handles)
+	{
+		if (!TestNotNull(TEXT("Handle"), Handle)) return false;
+		TestTrue(TEXT("The handle knows its host"), Handle->GetHost() == House);
+		// 锥子在墙外皮再往外 HandleOffset 处：投影到外法线上应当恰好比墙中心多出这么多。
+		const FVector Outer = Handle->GetOuterNormalWorld();
+		const FVector WallCentre = CSHouseTest_WallCentre(
+			House->FootprintSize, House->GetActorLocation(), Handle->GetEdgeIndex(), Yaw);
+		const double Out = FVector::DotProduct(Handle->GetActorLocation() - WallCentre, Outer);
+		TestEqual(
+			FString::Printf(TEXT("Handle %d sits HandleOffset outside its wall"), Handle->GetEdgeIndex()),
+			Out, double(Handle->HandleOffset), 1.0e-2);
+	}
+
+	// ---- 高度框：停在檐口正上方，框的大小是 footprint 的 FrameScale 倍 ----
+	ACSHouseHeightHandleActor* Height = House->GetHeightHandle();
+	if (!TestNotNull(TEXT("Height handle"), Height)) return false;
+	{
+		// 规范位置：房心正上方、檐口高度 —— 框同时是"墙有多高"的读数。
+		const FVector LocalPos = House->GetActorTransform().InverseTransformPosition(Height->GetActorLocation());
+		TestTrue(TEXT("The height frame sits over the house centre"),
+			FMath::IsNearlyZero(LocalPos.X, 1.0e-2) && FMath::IsNearlyZero(LocalPos.Y, 1.0e-2));
+		TestEqual(TEXT("The height frame sits at the eave"), LocalPos.Z, double(House->WallHeight), 1.0e-2);
+	}
+
+	// 边号必须四条齐全，重号的话有一面墙推不动而另一面被推两次。
+	{
+		TSet<int32> Edges;
+		for (const ACSHouseResizeHandleActor* Handle : Handles) Edges.Add(Handle->GetEdgeIndex());
+		TestEqual(TEXT("The four handles cover four distinct edges"), Edges.Num(), 4);
+	}
+
+	// 幂等：再进一次不许生出第二组（详情面板上的按钮会被连点）。
+	House->EnterResizeMode();
+	TestEqual(TEXT("Re-entering resize mode does not spawn a second set"), House->GetResizeHandles().Num(), 5);
+
+	// ---- ② 拖 1 m 墙恰好走 1 m：父子回路那个 2x 缺陷的钉子 ----
+	ACSHouseResizeHandleActor* East = nullptr;
+	for (ACSHouseResizeHandleActor* Handle : House->GetEdgeHandles())
+	{
+		if (Handle->GetEdgeIndex() == 1) { East = Handle; break; }
+	}
+	if (!TestNotNull(TEXT("East handle"), East)) return false;
+
+	{
+		constexpr double Delta = 100.0;
+		const FVector Outer = East->GetOuterNormalWorld();
+		const FVector PushedBefore = CSHouseTest_WallCentre(House->FootprintSize, House->GetActorLocation(), 1, Yaw);
+		const FVector OppositeBefore = CSHouseTest_WallCentre(House->FootprintSize, House->GetActorLocation(), 3, Yaw);
+
+		// 模拟 gizmo：把抓手挪 Delta，然后走它自己的执行面。
+		East->SetActorLocation(East->GetActorLocation() + Outer * Delta);
+		const float Applied = East->ConsumeDragToHost(false);
+
+		TestEqual(TEXT("A one metre drag applies one metre"), double(Applied), Delta, 1.0e-2);
+		const FVector PushedAfter = CSHouseTest_WallCentre(House->FootprintSize, House->GetActorLocation(), 1, Yaw);
+		const FVector OppositeAfter = CSHouseTest_WallCentre(House->FootprintSize, House->GetActorLocation(), 3, Yaw);
+		TestTrue(TEXT("The pushed wall moves exactly the drag"),
+			PushedAfter.Equals(PushedBefore + Outer * Delta, 1.0e-2));
+		TestTrue(TEXT("The opposite wall does not move"), OppositeAfter.Equals(OppositeBefore, 1.0e-2));
+	}
+
+	// ---- ③ 连续 10 步：单步可能蒙对，2x 回路是**稳态**行为，必须连拖才显形 ----
+	{
+		constexpr double Step = 25.0;
+		constexpr int32 Steps = 10;
+		// ⚠️ 边 1 驱动的是 **X**（`CSHouseResize_EdgeDrivesX(1) == true`）。写死成 .Y 的话
+		// 断言量的是一条根本没被推的轴 —— 恒为 0，而"推拉整个没生效"也是 0，两者读不开。
+		const double SizeBefore = CSHouseTest_PushedDim(House, 1);
+		int32 Jumps = 0;
+		for (int32 i = 0; i < Steps; ++i)
+		{
+			const FVector Outer = East->GetOuterNormalWorld();
+			East->SetActorLocation(East->GetActorLocation() + Outer * Step);
+			const float Applied = East->ConsumeDragToHost(false);
+			if (FMath::Abs(double(Applied) - Step) > 1.0e-2) ++Jumps;
+		}
+		TestEqual(TEXT("Every drag step applies exactly the offset"), Jumps, 0);
+		TestEqual(TEXT("Ten steps grow the footprint by ten steps"),
+			CSHouseTest_PushedDim(House, 1) - SizeBefore, Steps * Step, 1.0e-2);
+	}
+
+	// ---- ④ 顶在 MinFootprint 上：返回实际生效量，且**继续内拖不攒残差** ----
+	{
+		const FVector Outer = East->GetOuterNormalWorld();
+		const double SizeBefore = CSHouseTest_PushedDim(House, 1);
+		East->SetActorLocation(East->GetActorLocation() - Outer * 10000.0);
+		const float Applied = East->ConsumeDragToHost(false);
+
+		TestEqual(TEXT("The floor holds"), CSHouseTest_PushedDim(House, 1), double(House->MinFootprint), 1.0e-2);
+		TestEqual(TEXT("Shrinking past the floor applies only what was possible"),
+			double(Applied), double(House->MinFootprint) - SizeBefore, 1.0e-2);
+
+		// 再往里拖一大截：一步都不许再生效。记账记成请求值的话这里会返回 0 但残差照攒，
+		// 下面那次外拖就会把攒下的量一次性放出来。
+		East->SetActorLocation(East->GetActorLocation() - Outer * 5000.0);
+		TestEqual(TEXT("Dragging further past the floor applies nothing"),
+			double(East->ConsumeDragToHost(false)), 0.0, 1.0e-2);
+
+		// 往外拖 50：必须**恰好**长 50，不许把刚才那 15000 的残差一起吐出来。
+		East->SetActorLocation(East->GetActorLocation() + Outer * 50.0);
+		TestEqual(TEXT("Pulling back out applies exactly the drag, not the swallowed residue"),
+			double(East->ConsumeDragToHost(false)), 50.0, 1.0e-2);
+	}
+
+	// ---- ⑤ 每次推拉后框都保持闭合（**不只是松手**，2026-09-06 纪律 ②）----
+	// 只在松手时回位的话，被拖的那根会以每次事件 0.4δ 的速度跑到光标前面，画面上框会裂开。
+	{
+		// 先拖一把（不松手），四根都必须已经在框上。
+		const FVector Outer = East->GetOuterNormalWorld();
+		East->SetActorLocation(East->GetActorLocation() + Outer * 60.0);
+		East->ConsumeDragToHost(false);
+		for (const ACSHouseResizeHandleActor* Handle : House->GetEdgeHandles())
+		{
+			TestTrue(
+				FString::Printf(TEXT("Handle %d stays on the frame mid-drag"), Handle->GetEdgeIndex()),
+				Handle->GetActorLocation().Equals(Handle->ComputeCanonicalWorldLocation(), 1.0e-2));
+		}
+
+		// 侧向 / 竖向偏一截：松手后必须被清掉（那两个分量本来就不参与推拉）。
+		East->SetActorLocation(East->GetActorLocation() + FVector(0.0, 0.0, 137.0));
+		East->ConsumeDragToHost(true);
+		for (const ACSHouseResizeHandleActor* Handle : House->GetEdgeHandles())
+		{
+			TestTrue(
+				FString::Printf(TEXT("Handle %d is back on its canonical spot after release"), Handle->GetEdgeIndex()),
+				Handle->GetActorLocation().Equals(Handle->ComputeCanonicalWorldLocation(), 1.0e-2));
+		}
+	}
+
+	// ---- ⑥ 退出模式：抓手全销毁 ----
+	House->ExitResizeMode();
+	TestFalse(TEXT("Leaving resize mode reports the mode is off"), House->IsInResizeMode());
+	TestEqual(TEXT("Leaving resize mode destroys every handle"), House->GetResizeHandles().Num(), 0);
+	House->ExitResizeMode();   // 幂等：不在模式里再调一次不许崩
+
+	// ---- ⑦ 删房子：抓手跟着走（编辑器 world 只发 Destroyed，不发 EndPlay）----
+	{
+		House->EnterResizeMode();
+		TArray<TWeakObjectPtr<ACSHouseHandleActor>> Weak;
+		for (ACSHouseHandleActor* Handle : House->GetResizeHandles()) Weak.Add(Handle);
+		if (!TestEqual(TEXT("Handles for the destroy pass"), Weak.Num(), 5)) return false;
+
+		World->DestroyActor(House);
+		for (const TWeakObjectPtr<ACSHouseHandleActor>& Handle : Weak)
+		{
+			TestFalse(TEXT("Destroying the house takes its handles with it"),
+				Handle.IsValid() && !Handle->IsActorBeingDestroyed());
+		}
+	}
+
+	return true;
+}
+
+// -----------------------------------------------------------------------------
+// 高度抓手（D5 的第二个自由度）：上下拖那个"窗框"改墙高
+//
+// 与 `House.ResizeHandle` 分开：那条钉的是**水平**推拉那套父子回路的数学，这条钉的是
+// 竖直这一路 —— 框的几何、只吃 Z 分量、MinWallHeight 下限，以及"改高度之后四个水平锥子
+// 也要跟着抬"这条跨抓手的联动。
+// -----------------------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseHeightHandleTest,
+	"PCGPlugins.ComputeShaderGenerator.House.HeightHandle",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseHeightHandleTest::RunTest(const FString& Parameters)
+{
+	UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+	if (!TestNotNull(TEXT("Editor test world"), World)) return false;
+
+	constexpr float Yaw = 37.0f;
+	ACSHouseActor* House = World->SpawnActor<ACSHouseActor>(FVector(1000.0, 2000.0, 0.0), FRotator(0.0f, Yaw, 0.0f));
+	if (!TestNotNull(TEXT("House"), House)) return false;
+	House->Windows.Reset();
+	House->FootprintSize = FVector2D(600.0, 400.0);
+	House->WallHeight = 300.0f;
+	House->MinWallHeight = 200.0f;
+
+	House->EnterResizeMode();
+	ACSHouseHeightHandleActor* Frame = House->GetHeightHandle();
+	if (!TestNotNull(TEXT("Height handle"), Frame)) return false;
+
+	// ---- ① 框的几何：四条边、大小 = footprint × FrameScale、首尾相接 ----
+	{
+		TArray<USceneComponent*> Bars;
+		Frame->GetComponents<USceneComponent>(Bars);
+		int32 MeshBars = 0;
+		for (const USceneComponent* C : Bars)
+		{
+			if (C->IsA<UStaticMeshComponent>()) ++MeshBars;
+		}
+		TestEqual(TEXT("The frame is made of four bars"), MeshBars, 4);
+	}
+
+	// 框的四条边各自离房心多远：应当恰好是 footprint/2 × FrameScale。
+	// 用世界量反算，顺带把"房子带 yaw 时框也跟着转"一起验掉。
+	for (int32 Edge = 0; Edge < 4; ++Edge)
+	{
+		const FVector2D OuterLocal = CSHouseResize_EdgeOuterLocal(Edge);
+		const double Dim = CSHouseResize_EdgeDrivesX(Edge) ? House->FootprintSize.X : House->FootprintSize.Y;
+		const double Expected = Dim * 0.5 * double(Frame->FrameScale);
+
+		const FVector BarLocal(OuterLocal.X * Expected, OuterLocal.Y * Expected, 0.0);
+		const FVector BarWorld = Frame->GetActorTransform().TransformPosition(BarLocal);
+		const FVector Outer = CSHouseResize_EdgeOuterWorld(Edge, Yaw);
+		const double Out = FVector::DotProduct(BarWorld - House->GetActorLocation(), Outer);
+		TestEqual(
+			FString::Printf(TEXT("Frame edge %d sits at footprint/2 x FrameScale"), Edge),
+			Out, Expected, 1.0e-2);
+	}
+
+	// ---- ② 上下拖 = 改墙高，且 1:1 ----
+	{
+		constexpr double Rise = 80.0;
+		const float Before = House->WallHeight;
+		Frame->SetActorLocation(Frame->GetActorLocation() + FVector(0.0, 0.0, Rise));
+		const float Applied = Frame->ConsumeDragToHost(false);
+
+		TestEqual(TEXT("Dragging up 80 raises the wall by 80"), double(Applied), Rise, 1.0e-2);
+		TestEqual(TEXT("The wall height follows the drag"), double(House->WallHeight), double(Before) + Rise, 1.0e-2);
+		// 框回到新的檐口上 —— 它同时是墙高的读数。
+		const double LocalZ = House->GetActorTransform().InverseTransformPosition(Frame->GetActorLocation()).Z;
+		TestEqual(TEXT("The frame rides back up to the new eave"), LocalZ, double(House->WallHeight), 1.0e-2);
+	}
+
+	// ---- ③ 水平分量不改高度（把框拖歪不该有任何效果）----
+	{
+		const float Before = House->WallHeight;
+		Frame->SetActorLocation(Frame->GetActorLocation() + FVector(250.0, -180.0, 0.0));
+		const float Applied = Frame->ConsumeDragToHost(false);
+		TestEqual(TEXT("A purely horizontal drag applies nothing"), double(Applied), 0.0, 1.0e-2);
+		TestEqual(TEXT("A purely horizontal drag leaves the wall height alone"),
+			double(House->WallHeight), double(Before), 1.0e-2);
+	}
+
+	// ---- ④ 连续 10 步都恰好走一步：记账量法在竖直这一路同样成立 ----
+	{
+		constexpr double Step = 12.0;
+		constexpr int32 Steps = 10;
+		const double Before = House->WallHeight;
+		int32 Jumps = 0;
+		for (int32 i = 0; i < Steps; ++i)
+		{
+			Frame->SetActorLocation(Frame->GetActorLocation() + FVector(0.0, 0.0, Step));
+			if (FMath::Abs(double(Frame->ConsumeDragToHost(false)) - Step) > 1.0e-2) ++Jumps;
+		}
+		TestEqual(TEXT("Every vertical step applies exactly the offset"), Jumps, 0);
+		TestEqual(TEXT("Ten steps raise the wall by ten steps"),
+			double(House->WallHeight) - Before, Steps * Step, 1.0e-2);
+	}
+
+	// ---- ⑤ MinWallHeight 是硬下界，且不攒残差 ----
+	{
+		const double Before = House->WallHeight;
+		Frame->SetActorLocation(Frame->GetActorLocation() - FVector(0.0, 0.0, 10000.0));
+		const float Applied = Frame->ConsumeDragToHost(false);
+		TestEqual(TEXT("The height floor holds"), double(House->WallHeight), double(House->MinWallHeight), 1.0e-2);
+		TestEqual(TEXT("Squashing past the floor applies only what was possible"),
+			double(Applied), double(House->MinWallHeight) - Before, 1.0e-2);
+
+		// 再往下拖一大截：一步都不许再生效。
+		Frame->SetActorLocation(Frame->GetActorLocation() - FVector(0.0, 0.0, 5000.0));
+		TestEqual(TEXT("Dragging further past the floor applies nothing"),
+			double(Frame->ConsumeDragToHost(false)), 0.0, 1.0e-2);
+
+		// 往上拖 40：必须**恰好**长 40，不许把刚才那 15000 的残差一起吐出来。
+		Frame->SetActorLocation(Frame->GetActorLocation() + FVector(0.0, 0.0, 40.0));
+		TestEqual(TEXT("Pulling back up applies exactly the drag, not the swallowed residue"),
+			double(Frame->ConsumeDragToHost(false)), 40.0, 1.0e-2);
+	}
+
+	// ---- ⑥ 跨抓手联动：改墙高之后四个水平锥子也要跟着抬 ----
+	// 锥子挂在 `WallHeight × HandleHeightFraction` 上。不联动的话它们会留在旧高度，
+	// 画面上是"房子长高了，四个锥子还在半腰"。
+	{
+		Frame->SetActorLocation(Frame->GetActorLocation() + FVector(0.0, 0.0, 150.0));
+		Frame->ConsumeDragToHost(true);
+
+		for (const ACSHouseResizeHandleActor* Cone : House->GetEdgeHandles())
+		{
+			const double LocalZ = House->GetActorTransform().InverseTransformPosition(Cone->GetActorLocation()).Z;
+			TestEqual(
+				FString::Printf(TEXT("Cone %d rides the new wall height"), Cone->GetEdgeIndex()),
+				LocalZ, double(House->WallHeight * Cone->HandleHeightFraction), 1.0e-2);
+		}
+	}
 
 	return true;
 }

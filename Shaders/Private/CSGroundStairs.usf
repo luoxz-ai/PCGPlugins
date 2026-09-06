@@ -51,6 +51,8 @@ float  StairGroundBaseZ;           // 地面 actor 的世界 Z
 
 float  StairStepHeight;            // 每层升高（等距分层：石阶语义要求等高，不学 TG 的非等距）
 float  StairRoadThreshold;         // 道路权重门控，与岩壳的隐藏阈值同一个数
+float  StairMinMoundHeight;        // 塑形物峰高低于它就不出台阶（0 = 关掉这条门控）
+uint   StairDropTopStep;           // 1 = 掐掉每座最顶上那一级（台顶那圈）
 float  StairEmbed;                 // 沿坡**向上**推进，让踏面扎进坡里（负值则向外挑出）
 float  StairRise;                  // = -基础网格局部包围盒 Min.Z × 缩放：把块抬起半个身位，
                                    // 否则盒心落在等值线上、石块一半埋在地里（旧路的实测修正）
@@ -225,6 +227,25 @@ void ScanGroundStairsCS(uint3 Id : SV_DispatchThreadID)
 
 	const float2 Centre = Base + 0.5f * StairCellSize;
 	if (CSStairs_SampleRoad(Centre) < StairRoadThreshold) return;   // 画路穿台才长石阶（同 D6 门洞的语言）
+
+	// 矮塑形物不出台阶：一两级的落差抬脚就上去了，摆一排石块反而像路障。
+	// ⚠️ 判据读的是**只含够高塑形物**的那份场，不是本格高度 —— 按本格高度判会把高座
+	//    裙边那几级最低的台阶也一起删掉（那里本格高度同样很小），而那几级正是要走的。
+	// ⚠️ 只当门控：底下解等值线、算块底 Z 仍旧读完整的场，否则矮座压在高座上的那一片
+	//    会读到比真地面低的值，石阶陷进土里。
+	if (StairMinMoundHeight > 0.0f
+		&& GroundShaperHeightAtXYTallOnly(Centre, StairMinMoundHeight) <= 0.0f) return;
+
+	// 掐掉最顶上那一级：台顶那圈等值线贴着平台边缘，人已经站上去了，那一级只是个绊脚的沿。
+	// 顶层号由**整座的峰高**给（本格高度看不出自己离峰顶多远）：跨过的层是 L·Step < Peak，
+	// 所以最顶那层号 = ceil(Peak/Step) − 1，掐掉它就是把上限压到 ceil(Peak/Step) − 2。
+	// ⚠️ 用 ceil 而不是 floor：Peak 正好是 Step 整数倍时（例如 120 / 30），L = 4 那层因为
+	//    `H > Level` 取不到等号本来就不出等值线，真正的顶层是 3，floor 会少掐一级。
+	if (StairDropTopStep != 0u)
+	{
+		L1 = min(L1, (int)ceil(GroundShaperPeakAtXY(Centre) / Step) - 2);
+		if (L1 < L0) return;
+	}
 
 	// 层数上限：LiftHeight 一大层数就线性膨胀，没有这个钳位一格就能把固定容量吃光。
 	L1 = min(L1, L0 + (int)max(StairMaxLayers, 1u) - 1);

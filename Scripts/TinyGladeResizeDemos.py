@@ -114,6 +114,16 @@ move("TG_SkyLight", TERRAIN_CENTRE, TERRAIN_CENTRE)
 move("TG_Start", TERRAIN_CENTRE, TERRAIN_CENTRE - 2400.0)
 s = find("Shaper_Mound")
 if s:
+    # ⚠️ 垂直归位不能省（2026-08-31 实测）：move() 有意保留 Z，而"塑形物上下拖动"实验会把
+    # 下压状态连 Z 一起存进关卡 —— ComputeTopHeight = (Z − 地面Z) + LiftHeight，Z 停在 −400
+    # 时台顶只有一半，回归的三条地形断言（台顶=Lift×1.021 / 裙边中点半高 / 双台交汇）全红，
+    # 而且看起来像高度场坏了。基准态的 Z 就是地面的 Z。
+    g = find("Ground_Demo")
+    gz = g.get_actor_location().z if g else 0.0
+    loc = s.get_actor_location()
+    if abs(loc.z - gz) > 0.01:
+        unreal.log("RESIZE Shaper_Mound z %.0f -> %.0f (vertical reset)" % (loc.z, gz))
+        s.set_actor_location(unreal.Vector(loc.x, loc.y, gz), False, False)
     s.set_editor_property("Radius", SHAPER_RADIUS)
     s.set_editor_property("FalloffDistance", SHAPER_FALLOFF)
     s.set_editor_property("LiftHeight", SHAPER_LIFT)

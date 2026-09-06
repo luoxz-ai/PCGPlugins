@@ -1,0 +1,470 @@
+#include "CSHouseTile.h"
+
+#include "CSHouseResize.h"          // CSHouseResize_EdgeOuterLocal：边号 → 局部外法线，唯一真源
+#include "CSHouseVine.h"            // IdentityHash / Hash01：逐实例随机的身份哈希，别再造一份
+#include "ComputeShaderGenerateHelper.h"
+#include "DataDrivenShaderPlatformInfo.h"
+#include "GlobalShader.h"
+#include "RenderGraphBuilder.h"
+#include "RenderGraphUtils.h"
+#include "RenderingThread.h"
+#include "ShaderParameterStruct.h"
+
+namespace
+{
+// Unity/jumbo 构建共享 TU，file-local 一律 CSHouseTile_ 前缀
+//（与 CSHouseVine.cpp 的 CSHouseVine_、CSHouseDecor.cpp 的 CSHouseDecor_ 都不同）。
+
+constexpr int32 CSHouseTile_GroupSize = 64;
+
+/** 排数 / 列数的硬上限：极端参数（间距被设成 0.01）下不该让容量与循环无界增长。 */
+constexpr int32 CSHouseTile_MaxRows = 256;
+constexpr int32 CSHouseTile_MaxColumns = 512;
+
+class FCSHouseTilePackCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FCSHouseTilePackCS);
+	SHADER_USE_PARAMETER_STRUCT(FCSHouseTilePackCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, TileRecords)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RWTileInstances)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RWTileCounter)
+		SHADER_PARAMETER(FMatrix44f, TileWorldToComponent)
+		SHADER_PARAMETER(FVector3f, TileBaseSphereCentre)
+		SHADER_PARAMETER(FVector3f, TileBlockSize)
+		SHADER_PARAMETER(float, TileBaseSphereRadius)
+		SHADER_PARAMETER(uint32, TileRecordCount)
+		SHADER_PARAMETER(uint32, TileMaxInstances)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), CSHouseTile_GroupSize);
+	}
+};
+
+IMPLEMENT_GLOBAL_SHADER(FCSHouseTilePackCS, "/Plugin/PCGPlugins/Shaders/Private/CSHouseTile.usf", "PackHouseTileCS", SF_Compute);
+
+/** 记录数组 → 上传用的 float4 平铺。布局与 `CSHouseTile.usf` 文件头逐字对应。 */
+void CSHouseTile_Flatten(const TArray<CSHouseTile::FRecord>& In, TArray<FVector4f>& Out)
+{
+	Out.Reset(In.Num() * 4);
+	for (const CSHouseTile::FRecord& R : In)
+	{
+		Out.Add(FVector4f(R.WorldPos.X, R.WorldPos.Y, R.WorldPos.Z, R.Random01));
+		Out.Add(FVector4f(R.AxisX.X, R.AxisX.Y, R.AxisX.Z, R.SizeX));
+		Out.Add(FVector4f(R.AxisY.X, R.AxisY.Y, R.AxisY.Z, R.SizeY));
+		Out.Add(FVector4f(R.AxisZ.X, R.AxisZ.Y, R.AxisZ.Z, R.SizeZ));
+	}
+}
+
+/**
+ * 轴排列的兜底：三根轴必须互不相同，否则基会退化成奇异矩阵（画出来是一片拉到无穷远的黑面）。
+ * 自动判定失手或蓝图里手填错时退回 (上坡 X / 沿排 Y / 法线 Z)，画得对不对另说，至少画得出来。
+ */
+CSHouseTile::FMeshAxes CSHouseTile_SanitizeAxes(const CSHouseTile::FMeshAxes& In)
+{
+	CSHouseTile::FMeshAxes Out = In;
+	Out.UpSlope = FMath::Clamp(Out.UpSlope, 0, 2);
+	Out.AlongRow = FMath::Clamp(Out.AlongRow, 0, 2);
+	Out.Normal = FMath::Clamp(Out.Normal, 0, 2);
+	if (Out.UpSlope == Out.AlongRow || Out.UpSlope == Out.Normal || Out.AlongRow == Out.Normal)
+	{
+		Out.UpSlope = 0;
+		Out.AlongRow = 1;
+		Out.Normal = 2;
+	}
+	if (!(FMath::Abs(Out.NormalSign) > 0.0f)) Out.NormalSign = 1.0f;
+	return Out;
+}
+
+/** 有效排距 cm。≤ 0 时由网格尺寸反解：**瓦按原尺寸画，排距把它压出 RowOverlap 那么多重叠**。 */
+float CSHouseTile_RowPitch(const CSHouseTile::FParams& Params)
+{
+	if (Params.RowPitch > 0.0f) return Params.RowPitch;
+	const float Native = FMath::Max(Params.Axes.NativeAlongSlope(), 1.0f);
+	return FMath::Max(Native / FMath::Max(Params.RowOverlap, 0.05f), 1.0f);
+}
+
+/** 有效列距 cm。同上。 */
+float CSHouseTile_ColumnPitch(const CSHouseTile::FParams& Params)
+{
+	if (Params.ColumnPitch > 0.0f) return Params.ColumnPitch;
+	const float Native = FMath::Max(Params.Axes.NativeAcrossRow(), 1.0f);
+	return FMath::Max(Native / FMath::Max(Params.ColumnOverlap, 0.05f), 1.0f);
+}
+
+/** 这个坡面的坡长（檐口外沿 → 脊 / 尖），四个面同一个值（四面同坡度、同外挑）。 */
+float CSHouseTile_SlopeLength(const FCSRoofDesc& Roof)
+{
+	const float CosP = FMath::Max(Roof.CosPitch(), UE_KINDA_SMALL_NUMBER);
+	return (Roof.HalfSpan() + FMath::Max(Roof.Overhang, 0.0f)) / CosP;
+}
+
+/** 第 Side 面的半长（沿边方向）与它到中心的距离。外法线/沿边方向都是轴对齐单位向量 ⇒ 取分量即可。 */
+void CSHouseTile_EdgeSpan(const FVector2D& Half, const FVector2D& Outward, const FVector2D& Along,
+	double& OutCentreDist, double& OutHalfLength)
+{
+	OutCentreDist = FMath::Abs(Outward.X) * Half.X + FMath::Abs(Outward.Y) * Half.Y;
+	OutHalfLength = FMath::Abs(Along.X) * Half.X + FMath::Abs(Along.Y) * Half.Y;
+}
+}
+
+namespace CSHouseTile
+{
+void BuildPlan(const FCSRoofDesc& Roof, const FTransform& World, const FParams& InParams, TArray<FRecord>& OutTiles)
+{
+	OutTiles.Reset();
+
+	const FVector2D Half = Roof.HalfSize();
+	if (Half.X <= 1.0 || Half.Y <= 1.0) return;
+
+	FParams Params = InParams;
+	Params.Axes = CSHouseTile_SanitizeAxes(Params.Axes);
+
+	const float CosP = FMath::Max(Roof.CosPitch(), UE_KINDA_SMALL_NUMBER);
+	const float SinP = Roof.SinPitch();
+	const float TanP = Roof.TanPitch();
+	const float Overhang = FMath::Max(Roof.Overhang, 0.0f);
+	const float SlopeLen = CSHouseTile_SlopeLength(Roof);
+	if (SlopeLen <= 1.0f) return;
+
+	// 排：沿坡面**等分**（目标间距只决定份数）。四个面共用同一份排数与排距 ⇒ 每一排的高度
+	// 在四个面上逐位相同，角斜脊上两侧的瓦因此是对齐的，不会错半排。
+	const int32 Rows = FMath::Clamp(FMath::RoundToInt(SlopeLen / CSHouseTile_RowPitch(Params)), 1, CSHouseTile_MaxRows);
+	const double RowStep = double(SlopeLen) / double(Rows);
+	const float ColumnPitch = CSHouseTile_ColumnPitch(Params);
+
+	const int32 AxisUp = Params.Axes.UpSlope;
+	const int32 AxisAlong = Params.Axes.AlongRow;
+	const int32 AxisNormal = Params.Axes.Normal;
+
+	// 手性：排列的奇偶 × 法线取向决定这组基是左手还是右手，左手基会把瓦**镜像**过去
+	// （背面朝外、光照整个翻掉，而实例数与位置断言全绿）。在**沿排轴**上补一个符号掰回来 ——
+	// 沿排方向本来就没有正反之分（瓦沿排是对称的），法线与上坡向都不能动。
+	FVector Probe[3];
+	Probe[AxisUp] = FVector(1.0, 0.0, 0.0);
+	Probe[AxisAlong] = FVector(0.0, 1.0, 0.0);
+	Probe[AxisNormal] = FVector(0.0, 0.0, double(Params.Axes.NormalSign) >= 0.0 ? 1.0 : -1.0);
+	const double AlongSign = FVector::DotProduct(FVector::CrossProduct(Probe[0], Probe[1]), Probe[2]) < 0.0 ? -1.0 : 1.0;
+
+	// ≤ 0 = 沿用网格原生厚度（旧行为）；> 0 = 直接给绝对厚度 cm。见 FParams::Thickness 的注释。
+	const float Thickness = Params.Thickness > 0.0f
+		? Params.Thickness
+		: FMath::Max(Params.Axes.NativeThickness(), 0.1f);
+	const float SizeScale = FMath::Max(Params.SizeScale, 0.01f);
+
+	OutTiles.Reserve(MaxTilesBound(Roof, Params));
+
+	for (int32 Side = 0; Side < 4; ++Side)
+	{
+		// 外法线与沿边方向。⚠️ 沿边取 `(n.y, -n.x)` 而不是 `(-n.y, n.x)`：只有这一支能让
+		// (上坡, 沿排, 法线) 成右手基，另一支差一个镜像。
+		const FVector2D Outward = CSHouseResize_EdgeOuterLocal(Side);
+		const FVector2D Along(Outward.Y, -Outward.X);
+		double CentreDist = 0.0, HalfLength = 0.0;
+		CSHouseTile_EdgeSpan(Half, Outward, Along, CentreDist, HalfLength);
+
+		// 局部（actor 空间）的三条轴。法线朝上外、上坡向指向屋脊、沿排水平。
+		const FVector NormalLocal(Outward.X * SinP, Outward.Y * SinP, CosP);
+		const FVector UpSlopeLocal(-Outward.X * CosP, -Outward.Y * CosP, SinP);
+		const FVector AlongLocal(Along.X * AlongSign, Along.Y * AlongSign, 0.0);
+
+		for (int32 Row = 0; Row < Rows; ++Row)
+		{
+			// 沿坡面的弧长（自檐口外沿起）→ 内距。d = −Overhang 是檐口外沿，d = HalfSpan 是脊。
+			const double SlopeS = (double(Row) + 0.5) * RowStep;
+			const double Inset = -double(Overhang) + SlopeS * double(CosP);
+
+			// 这一排的半宽：四坡的每个坡面在平面上都是"底边 + 两条 45° 斜边"的梯形，
+			// 半宽随内距 1:1 收窄（见头文件）。收到 0 就是角上的尖，那一排没有瓦。
+			const double HalfWidth = HalfLength - Inset;
+			if (HalfWidth <= 0.5) continue;
+
+			const int32 Columns = FMath::Clamp(FMath::RoundToInt(2.0 * HalfWidth / ColumnPitch), 1, CSHouseTile_MaxColumns);
+			const double ColumnStep = 2.0 * HalfWidth / double(Columns);
+
+			for (int32 Column = 0; Column < Columns; ++Column)
+			{
+				// 身份 = (面号, 排号, 列号, 佐料, 用户种子)。**刻意不含位置** —— 拖房子时
+				// 屋面在动，位置派生的种子会让整片瓦在拖动过程里不停重掷（同藤蔓那条纪律）。
+				const uint32 Id = CSHouseVine::IdentityHash(Side, Row, Column, 71u, Params.Seed);
+				const float Random01 = CSHouseVine::Hash01(Id);
+				const float ScaleJ = 1.0f + Params.ScaleJitter * (CSHouseVine::Hash01(
+					CSHouseVine::IdentityHash(Side, Row, Column, 72u, Params.Seed)) - 0.5f) * 2.0f;
+				const float YawJ = Params.YawJitter * (CSHouseVine::Hash01(
+					CSHouseVine::IdentityHash(Side, Row, Column, 73u, Params.Seed)) - 0.5f) * 2.0f;
+				const float LiftJ = Params.LiftJitter * (CSHouseVine::Hash01(
+					CSHouseVine::IdentityHash(Side, Row, Column, 74u, Params.Seed)) - 0.5f) * 2.0f;
+
+				const double U = -HalfWidth + (double(Column) + 0.5) * ColumnStep;
+				const FVector2D XY = Outward * (CentreDist - Inset) + Along * U;
+				const double Z = double(Roof.EaveZ) + double(TanP) * Inset;
+				const FVector Local = FVector(XY.X, XY.Y, Z) + NormalLocal * (double(Params.StandOff) + double(LiftJ));
+
+				// 绕法线抖一点朝向：(上坡, 沿排, 法线) 是右手基，绕第三根轴转 a 就是这两句。
+				const double CosY = FMath::Cos(double(YawJ)), SinY = FMath::Sin(double(YawJ));
+				const FVector UpJittered = UpSlopeLocal * CosY + AlongLocal * SinY;
+				const FVector AlongJittered = AlongLocal * CosY - UpSlopeLocal * SinY;
+
+				FVector Dirs[3];
+				Dirs[AxisUp] = World.TransformVectorNoScale(UpJittered).GetSafeNormal();
+				Dirs[AxisAlong] = World.TransformVectorNoScale(AlongJittered).GetSafeNormal();
+				Dirs[AxisNormal] = World.TransformVectorNoScale(NormalLocal * double(Params.Axes.NormalSign)).GetSafeNormal();
+
+				float Sizes[3];
+				// 瓦画多大 = 实际间距 × 重叠系数：等分给出的实际间距逐排不同，瓦跟着变，
+				// 屋面因此永远铺满 —— 拿目标间距去算的话最后一排/一列会露出底下的天空。
+				// `SizeScale` 只乘平面内两轴：排距不动 ⇒ 瓦数不变，只是每片变大或变小。
+				// 想改瓦数请调 RowPitch / ColumnPitch，那是另一件事。
+				Sizes[AxisUp] = float(RowStep) * Params.RowOverlap * ScaleJ * SizeScale;
+				Sizes[AxisAlong] = float(ColumnStep) * Params.ColumnOverlap * ScaleJ * SizeScale;
+				Sizes[AxisNormal] = Thickness;
+
+				// 枢轴补偿：实例变换把网格顶点 v 送到 `原点 + Σ v_i · 方向_i · 缩放_i`，
+				// 所以要让**包围盒中心**落在 Local 上，原点得先把中心那一项减掉。
+				// 枢轴本来就在中心的资产（NativeCentre = 0）这一步是恒等，一分钱不花。
+				FVector Centred = World.TransformPosition(Local);
+				for (int32 Axis = 0; Axis < 3; ++Axis)
+				{
+					const double Scale = double(Sizes[Axis]) / double(FMath::Max(Params.Axes.NativeSize[Axis], 0.01f));
+					Centred -= Dirs[Axis] * (double(Params.Axes.NativeCentre[Axis]) * Scale);
+				}
+
+				FRecord& Rec = OutTiles.AddDefaulted_GetRef();
+				Rec.WorldPos = FVector3f(Centred);
+				Rec.Random01 = Random01;
+				Rec.AxisX = FVector3f(Dirs[0]);
+				Rec.AxisY = FVector3f(Dirs[1]);
+				Rec.AxisZ = FVector3f(Dirs[2]);
+				Rec.SizeX = Sizes[0];
+				Rec.SizeY = Sizes[1];
+				Rec.SizeZ = Sizes[2];
+			}
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// 角斜脊 / 屋脊的盖瓦（用户 2026-08-31：「瓦片交汇处有 mesh 进行遮蔽」）
+	//
+	// TG 侧**没有专门的脊瓦网格** —— `assets/meshes` 里查无 `roof_ridge`，交汇处盖的仍是同一块
+	// `roof_tile`，只是骑在接缝上、法线取两坡法线的**角平分**。所以这里不引入任何新资产，
+	// 只把同一份记录沿五条脊线再铺一遍：4 条角斜脊 + 1 条屋脊。
+	//
+	// 正方形（金字塔）时屋脊长为 0，那一条自然跳过 —— 与 `RidgeLength()` 的 `max(…, 0)` 同源，
+	// 不需要在这里特判形态。
+	// -------------------------------------------------------------------------
+	if (Params.RidgeCapScale > 0.0f)
+	{
+		const double ApexZ = double(Roof.EaveZ) + double(Roof.HalfSpan()) * double(TanP);
+		const double EaveOuterZ = double(Roof.EaveZ) - double(Overhang) * double(TanP);
+		const double RidgeHalf = double(Roof.RidgeHalfLength());
+		const FVector RidgeDir = Roof.bRidgeAlongX() ? FVector(1.0, 0.0, 0.0) : FVector(0.0, 1.0, 0.0);
+
+		// 一条脊线 = 起点 → 终点 + 该处两坡法线的角平分。
+		struct FRidgeLine { FVector A; FVector B; FVector Normal; };
+		TArray<FRidgeLine, TInlineAllocator<5>> Lines;
+
+		// ① 四条角斜脊：檐口外角 → 同侧的屋脊端点。
+		//    角平分线是闭式的：相邻两坡的外法线是 (sx·sinP, 0, cosP) 与 (0, sy·sinP, cosP)，
+		//    和归一化即得 —— 不必去查这个角挨着哪两个 Side，也就不会写出一个与 Side 编号耦合的表。
+		for (int32 Corner = 0; Corner < 4; ++Corner)
+		{
+			const double Sx = (Corner == 0 || Corner == 1) ? 1.0 : -1.0;
+			const double Sy = (Corner == 1 || Corner == 2) ? 1.0 : -1.0;
+			const FVector Foot(Sx * (Half.X + double(Overhang)), Sy * (Half.Y + double(Overhang)), EaveOuterZ);
+			const double AlongRidge = Roof.bRidgeAlongX() ? Sx : Sy;
+			const FVector Top = RidgeDir * (AlongRidge * RidgeHalf) + FVector(0.0, 0.0, ApexZ);
+			const FVector N(Sx * double(SinP), Sy * double(SinP), 2.0 * double(CosP));
+			Lines.Add({ Foot, Top, N.GetSafeNormal() });
+		}
+
+		// ② 屋脊本身：两个端点之间。两坡法线在这里对称 ⇒ 角平分恒为竖直向上。
+		if (RidgeHalf > 0.5)
+		{
+			Lines.Add({ RidgeDir * -RidgeHalf + FVector(0.0, 0.0, ApexZ),
+						RidgeDir * RidgeHalf + FVector(0.0, 0.0, ApexZ),
+						FVector(0.0, 0.0, 1.0) });
+		}
+
+		const float CapPitch = CSHouseTile_ColumnPitch(Params);
+		for (int32 Line = 0; Line < Lines.Num(); ++Line)
+		{
+			const FRidgeLine& L = Lines[Line];
+			const FVector Delta = L.B - L.A;
+			const double Length = Delta.Size();
+			if (Length <= 1.0) continue;
+			const FVector Dir = Delta / Length;
+
+			// 与铺瓦同一条纪律：目标间距只决定份数，实际间距由**等分**给出 ⇒ 脊永远盖满，
+			// 尺寸连续变化时不会在末端忽多忽少一块。
+			const int32 Count = FMath::Clamp(FMath::RoundToInt(Length / double(CapPitch)), 1, CSHouseTile_MaxColumns);
+			const double Step = Length / double(Count);
+
+			for (int32 Index = 0; Index < Count; ++Index)
+			{
+				// 身份用 Side = 4 + 线号，与四个坡面的 (Side, Row, Column) 不会撞。
+				const uint32 Id = CSHouseVine::IdentityHash(4 + Line, Index, 0, 71u, Params.Seed);
+				const float Random01 = CSHouseVine::Hash01(Id);
+				const float ScaleJ = 1.0f + Params.ScaleJitter * (CSHouseVine::Hash01(
+					CSHouseVine::IdentityHash(4 + Line, Index, 0, 72u, Params.Seed)) - 0.5f) * 2.0f;
+
+				const FVector LocalPos = L.A + Dir * ((double(Index) + 0.5) * Step)
+					+ L.Normal * double(Params.StandOff);
+
+				// 基：沿脊 = 线方向，法线 = 角平分，上坡 = 两者叉积（右手，且天然与脊垂直）。
+				FVector Dirs[3];
+				Dirs[Params.Axes.AlongRow] = World.TransformVectorNoScale(Dir).GetSafeNormal();
+				Dirs[Params.Axes.Normal] = World.TransformVectorNoScale(
+					L.Normal * double(Params.Axes.NormalSign)).GetSafeNormal();
+				Dirs[Params.Axes.UpSlope] = FVector::CrossProduct(
+					Dirs[Params.Axes.Normal], Dirs[Params.Axes.AlongRow]).GetSafeNormal();
+
+				// ⚠️ **基必须是右手的**，与四面循环那条 `AlongSign` 同一个理由：镜像基会让瓦
+				// 背面朝外、光照整个翻掉，而位置、瓦数、包围盒断言全绿（`House.TileOnRoof`
+				// 第一次跑就抓到 55 个左手基）。沿脊方向本来就没有正反之分（瓦沿排对称），
+				// 所以掰它最省 —— 法线与上坡向都不能动。
+				if (FVector::DotProduct(FVector::CrossProduct(Dirs[0], Dirs[1]), Dirs[2]) < 0.0)
+				{
+					Dirs[Params.Axes.AlongRow] = -Dirs[Params.Axes.AlongRow];
+				}
+
+				float Sizes[3];
+				Sizes[Params.Axes.AlongRow] = float(Step) * Params.ColumnOverlap * ScaleJ * SizeScale * Params.RidgeCapScale;
+				Sizes[Params.Axes.UpSlope] = float(Step) * ScaleJ * SizeScale * Params.RidgeCapScale;
+				Sizes[Params.Axes.Normal] = Thickness;
+
+				// 枢轴补偿：与铺瓦逐字同一段（实例变换是 `原点 + Σ v_i·方向_i·缩放_i`）。
+				FVector Centred = World.TransformPosition(LocalPos);
+				for (int32 Axis = 0; Axis < 3; ++Axis)
+				{
+					const double Scale = double(Sizes[Axis]) / double(FMath::Max(Params.Axes.NativeSize[Axis], 0.01f));
+					Centred -= Dirs[Axis] * (double(Params.Axes.NativeCentre[Axis]) * Scale);
+				}
+
+				FRecord& Rec = OutTiles.AddDefaulted_GetRef();
+				Rec.WorldPos = FVector3f(Centred);
+				Rec.Random01 = Random01;
+				Rec.AxisX = FVector3f(Dirs[0]);
+				Rec.AxisY = FVector3f(Dirs[1]);
+				Rec.AxisZ = FVector3f(Dirs[2]);
+				Rec.SizeX = Sizes[0];
+				Rec.SizeY = Sizes[1];
+				Rec.SizeZ = Sizes[2];
+			}
+		}
+	}
+}
+
+int32 MaxTilesBound(const FCSRoofDesc& Roof, const FParams& InParams)
+{
+	const FVector2D Half = Roof.HalfSize();
+	if (Half.X <= 1.0 || Half.Y <= 1.0) return 0;
+
+	FParams Params = InParams;
+	Params.Axes = CSHouseTile_SanitizeAxes(Params.Axes);
+
+	const float SlopeLen = CSHouseTile_SlopeLength(Roof);
+	const float Overhang = FMath::Max(Roof.Overhang, 0.0f);
+	// +1 是等分那一步的取整余量（`RoundToInt` 最多多给半格）。
+	const int32 Rows = FMath::Clamp(FMath::CeilToInt(SlopeLen / CSHouseTile_RowPitch(Params)) + 1, 1, CSHouseTile_MaxRows);
+	const float ColumnPitch = CSHouseTile_ColumnPitch(Params);
+
+	int32 Total = 0;
+	for (int32 Side = 0; Side < 4; ++Side)
+	{
+		const FVector2D Outward = CSHouseResize_EdgeOuterLocal(Side);
+		const FVector2D Along(Outward.Y, -Outward.X);
+		double CentreDist = 0.0, HalfLength = 0.0;
+		CSHouseTile_EdgeSpan(Half, Outward, Along, CentreDist, HalfLength);
+		// 最宽的一排就是檐口外沿那一排（半宽 = 半长 + 外挑）。
+		const int32 Columns = FMath::Clamp(
+			FMath::CeilToInt(2.0 * (HalfLength + double(Overhang)) / double(ColumnPitch)) + 1, 1, CSHouseTile_MaxColumns);
+		Total += Rows * Columns;
+	}
+
+	// 脊瓦：4 条角斜脊 + 1 条屋脊。容量是**一次预留、超了截断**（零阻塞纪律），漏算这一段的
+	// 症状是"屋脊末端少几块盖瓦"，而瓦数、零阻塞、三角数全都正常 —— 只有出图看得见。
+	if (InParams.RidgeCapScale > 0.0f)
+	{
+		const double ApexZ = double(Roof.HalfSpan()) * double(Roof.TanPitch());
+		const double Diag = FMath::Sqrt(FMath::Square(Half.X + double(Overhang))
+			+ FMath::Square(Half.Y + double(Overhang)) + FMath::Square(ApexZ + double(Overhang) * double(Roof.TanPitch())));
+		const int32 PerHip = FMath::Clamp(FMath::CeilToInt(Diag / double(ColumnPitch)) + 1, 1, CSHouseTile_MaxColumns);
+		const int32 OnRidge = FMath::Clamp(
+			FMath::CeilToInt(double(Roof.RidgeLength()) / double(ColumnPitch)) + 1, 1, CSHouseTile_MaxColumns);
+		Total += 4 * PerHip + OnRidge;
+	}
+	return Total;
+}
+
+bool Pack(const TArray<FRecord>& Records, const CSShaperSteps::FPaletteBuffers& Buffers, const FMatrix44f& WorldToComponent)
+{
+	if (!Buffers.IsValid()) return false;
+
+	TArray<FVector4f> Flat;
+	CSHouseTile_Flatten(Records, Flat);
+
+	// 渲染线程一趟做完。Work 按**值**捕获（`TRefCountPtr` 拷贝即加引用），录完直接 return。
+	ENQUEUE_RENDER_COMMAND(CSHouseTilePack)(
+		[Rows = MoveTemp(Flat), Work = Buffers, WorldToComponent](FRHICommandListImmediate& RHICmdList)
+		{
+			FRDGBuilder GraphBuilder(RHICmdList, RDG_EVENT_NAME("CSHouseTile.Pack"));
+
+			FRDGBufferRef PackedRef = GraphBuilder.RegisterExternalBuffer(Work.PackedInstances, TEXT("CSHouseTile.PackedInstances"));
+			FRDGBufferRef CounterRef = GraphBuilder.RegisterExternalBuffer(Work.Counter, TEXT("CSHouseTile.Counter"));
+			FRDGBufferUAVRef PackedUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(PackedRef, PF_A32B32G32R32F));
+			FRDGBufferUAVRef CounterUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(CounterRef, PF_R32_UINT));
+
+			const uint32 RecordCount = uint32(Rows.Num() / 4);
+			// 空计划必须显式清零：kernel 一个线程都不跑的话 counter 会留着上一次的值，
+			// 症状是"屋顶已经没了但画面上还在"，而且只在从有到无那一次出现。
+			if (RecordCount == 0)
+			{
+				AddClearUAVPass(GraphBuilder, CounterUAV, 0u);
+				GraphBuilder.SetBufferAccessFinal(PackedRef, ERHIAccess::SRVMask);
+				GraphBuilder.SetBufferAccessFinal(CounterRef, ERHIAccess::SRVMask);
+				GraphBuilder.Execute();
+				return;
+			}
+
+			CSHelper::FRDGStructuredBufferRefs RecordRefs = CSHelper::CreateUploadedStructuredBuffer<FVector4f>(
+				GraphBuilder, Rows, TEXT("CSHouseTile.Records"), false, true);
+			if (!RecordRefs.SRV)
+			{
+				GraphBuilder.Execute();
+				return;
+			}
+
+			FCSHouseTilePackCS::FParameters* PassParams = GraphBuilder.AllocParameters<FCSHouseTilePackCS::FParameters>();
+			PassParams->TileRecords = RecordRefs.SRV;
+			PassParams->RWTileInstances = PackedUAV;
+			PassParams->RWTileCounter = CounterUAV;
+			PassParams->TileWorldToComponent = WorldToComponent;
+			PassParams->TileBaseSphereCentre = Work.BaseSphereCentre;
+			PassParams->TileBlockSize = Work.BlockSize;
+			PassParams->TileBaseSphereRadius = Work.BaseSphereRadius;
+			PassParams->TileRecordCount = RecordCount;
+			PassParams->TileMaxInstances = Work.Capacity;
+
+			TShaderMapRef<FCSHouseTilePackCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("CSHouseTile.Pack"), Shader, PassParams,
+				FComputeShaderUtils::GetGroupCount(int32(RecordCount), CSHouseTile_GroupSize));
+
+			// 剔除 pass 只读这两个 buffer，且明说不负责恢复它们的状态 —— producer 自己留在 SRVMask。
+			GraphBuilder.SetBufferAccessFinal(PackedRef, ERHIAccess::SRVMask);
+			GraphBuilder.SetBufferAccessFinal(CounterRef, ERHIAccess::SRVMask);
+
+			GraphBuilder.Execute();
+		});
+
+	return true;
+}
+}

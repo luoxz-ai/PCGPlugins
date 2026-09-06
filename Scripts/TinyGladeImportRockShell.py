@@ -10,7 +10,7 @@
 逐项理由与实测数字见 `Docs/TinyGlade/CSRockShellPattern.md`。
 
 ⚠️ **别导错文件**：`assets/meshes/terrain_rocks.json`（已经在
-`/Game/TinyGlade/Meshes/terrain_rocks`）是 ±430 m 的背景岩石，零 cell 属性，**不是这一份**。
+`/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/terrain_rocks`）是 ±430 m 的背景岩石，零 cell 属性，**不是这一份**。
 本脚本要的是 `assets/data/rocky_terrain.json` 经 `extract/rocky_terrain2glb.py` 导出的那份。
 
 用法::
@@ -27,12 +27,19 @@ import unreal
 # 参数
 # =============================================================================
 
-SRC_GLB = r"D:\MyProject\Tiny Glade\extracted\meshes\rocky_terrain_shell.glb"
+# 可用环境变量 ROCKSHELL_SRC_GLB 覆盖：假倒角管线用它指向
+# Docs/TinyGlade/geo/bevel/rocky_terrain_shell.glb（COLOR_0 已按通道字典 v2 重烘，
+# 见 Docs/TinyGlade/CSRockShellEdgeBevel.md）。不设则导原件（COLOR_0 = 胞腔辨认色）。
+SRC_GLB = os.environ.get(
+    "ROCKSHELL_SRC_GLB",
+    r"D:\MyProject\Tiny Glade\extracted\meshes\rocky_terrain_shell.glb")
 
-# 与已导入的其它 TG 网格同构：Interchange 的 glTF 管线会在这下面再建一层 StaticMeshes/
-DEST_PATH = "/Game/TinyGlade/Meshes/rocky_terrain_shell"
+# Interchange 的 glTF 管线在 DEST_PATH 下建 <源文件名>/StaticMeshes/ 两层（实测），
+# 所以源文件必须叫 rocky_terrain_shell.glb —— 换名会导去别的文件夹，盖不掉
+# CSGroundRockShell.cpp 的 DefaultPatternAssetPath。
+DEST_PATH = "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/rocky_terrain_shell"
 ASSET_NAME = "rocky_terrain_shell"
-EXPECTED_ASSET = "%s/StaticMeshes/%s" % (DEST_PATH, ASSET_NAME)
+EXPECTED_ASSET = "%s/%s/StaticMeshes/%s" % (DEST_PATH, ASSET_NAME, ASSET_NAME)
 
 # GLB 的 POSITION 已经是 **米**（导出时乘过 ×65 的 rest→world 换算）。
 # UE 的 glTF 导入按 1 uu = 1 cm 收，所以这里给 100 把米换成厘米；
@@ -117,15 +124,17 @@ def apply_build_settings(mesh):
     nanite.set_editor_property("enabled", False)
     mesh.set_editor_property("nanite_settings", nanite)
 
-    mesh.build()
+    # set_lod_build_settings 内部就会触发重建（StaticMeshEditorSubsystem::SetLodBuildSettings
+    # → BuildStaticMesh）；5.7 的 python StaticMesh 上没有 build()，别再调它。
     log("build settings applied to LOD %s + allow_cpu_access + Nanite off" % changed)
 
 
 def verify(mesh):
     """导完立刻核对。对不上就报出来 —— 下一位写 kernel 的人会拿这些数字当真。"""
     ok = True
-    tris = MESH_API.get_number_triangles(mesh, 0)
-    verts = MESH_API.get_number_verts(mesh, 0)
+    # 5.7：三角/顶点数是 StaticMesh 本体的方法；subsystem 上没有老库的 get_number_* 名字。
+    tris = mesh.get_num_triangles(0)
+    verts = mesh.get_num_vertices(0)
     uvs = MESH_API.get_num_uv_channels(mesh, 0)
     bounds = mesh.get_bounding_box()
     size = bounds.max - bounds.min

@@ -20,7 +20,7 @@ import math
 import unreal
 
 PKG = "/PCGPlugins/HouseTest"
-STAIR_MESH = "/Game/TinyGlade/Meshes/stairs_step/StaticMeshes/stairs_step.stairs_step"
+STAIR_MESH = "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/stairs_step.stairs_step"
 CUBE_MESH = "/Engine/BasicShapes/Cube.Cube"
 OUT_DIR = unreal.Paths.project_saved_dir() + "TinyGladeShots"
 W, H = 1600, 900

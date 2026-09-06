@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="720" viewBox="0 0 980 720" font-family="'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif">
+  <defs>
+    <marker id="arw" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0 0L7 3.5L0 7Z" fill="#475569"/></marker>
+    <pattern id="buffer-owner-stripe-bg" patternUnits="userSpaceOnUse" width="10" height="10">
+      <rect width="10" height="10" fill="#e2e8f0"/>
+      <rect y="1" width="10" height="2" fill="#334155" opacity="0.291429"/>
+      <rect y="6" width="10" height="1.5" fill="#334155" opacity="0.291429"/>
+    </pattern>
+    <pattern id="pickable-domain-cross-bg" patternUnits="userSpaceOnUse" width="12" height="12">
+      <rect width="12" height="12" fill="#e0e7ff"/>
+      <path d="M0 6H12" stroke="#4f46e5" stroke-width="1" opacity="0.316770"/>
+      <path d="M6 0V12" stroke="#4f46e5" stroke-width="1" opacity="0.316770"/>
+    </pattern>
+    <style>
+      .lane { font-size: 13px; font-weight: 600; fill: #475569; }
+      .bt   { font-size: 13px; font-weight: 600; fill: #1e293b; }
+      .tx   { font-size: 12px; fill: #334155; }
+      .cap  { font-size: 12px; fill: #64748b; }
+      .quiet  { fill: #f8fafc; stroke: #94a3b8; stroke-width: 0.8; }
+      .owner  { fill: url(#buffer-owner-stripe-bg); stroke: #334155; stroke-width: 1.2; }
+      .core   { fill: url(#pickable-domain-cross-bg); stroke: #4f46e5; stroke-width: 1.2; }
+      .hot    { fill: #fef3c7; stroke: #b45309; stroke-width: 1; }
+      .hott   { font-size: 12px; font-weight: 600; fill: #78350f; }
+      .flow   { stroke: #475569; stroke-width: 1.4; fill: none; marker-end: url(#arw); }
+      .leader { stroke: #94a3b8; stroke-width: 0.8; stroke-dasharray: 3 2; fill: none; }
+    </style>
+  </defs>
+
+  <rect width="980" height="720" fill="#ffffff"/>
+  <text x="40" y="34" font-size="17" font-weight="700" fill="#0f172a">TG 原版：重算法线的存在形式与流转</text>
+
+  <!-- ① 常驻缓冲 -->
+  <text x="40" y="66" class="lane">① 常驻 GPU 缓冲 —— 法线的"家"：逐三角 SSBO 字段，不是顶点属性</text>
+  <rect x="40" y="78" width="280" height="130" rx="6" class="owner"/>
+  <text x="52" y="98" class="bt">Vertices SSBO（148,794 条·汤）</text>
+  <text x="52" y="122" class="tx">position　披挂 CS 每帧改写</text>
+  <text x="52" y="142" class="tx">rest 姿态 · 胞腔身份　烘焙只读</text>
+  <text x="52" y="162" class="tx">（没有任何法线字段）</text>
+
+  <rect x="360" y="78" width="330" height="150" rx="6" class="owner"/>
+  <text x="372" y="98" class="bt">Triangles SSBO（49,598 条）</text>
+  <text x="372" y="122" class="tx">neighbours[3]　烘焙邻接 · 只读</text>
+  <text x="372" y="142" class="tx">is_top　盖/裙 · 烘焙只读</text>
+  <rect x="368" y="152" width="314" height="44" rx="4" class="hot"/>
+  <text x="380" y="170" class="hott">normal　每帧由披挂 CS 重算写回</text>
+  <text x="380" y="188" class="tx">一三角一条 · 平直面法线 · 从不插值</text>
+
+  <path d="M690 174H726" class="leader"/>
+  <rect x="728" y="78" width="212" height="150" rx="6" class="quiet"/>
+  <text x="740" y="98" class="bt">存在形式三要点</text>
+  <text x="740" y="122" class="tx">不进顶点流、不经插值器；</text>
+  <text x="740" y="142" class="tx">像素拿三角形 id 随机访问；</text>
+  <text x="740" y="162" class="tx">邻接表让像素能读到</text>
+  <text x="740" y="182" class="tx">"折缝对面"的那条法线。</text>
+
+  <!-- ② 每帧生产 -->
+  <text x="175" y="252" class="lane">② 每帧生产</text>
+  <rect x="90" y="264" width="380" height="118" rx="6" class="core"/>
+  <text x="102" y="284" class="bt">displace CS（披挂，一线程一三角）</text>
+  <text x="102" y="308" class="tx">顶点各自采高度图，改写 position；</text>
+  <text x="102" y="328" class="tx">再叠胀缩 · 进出 · 缺口噪声（角点钉死）</text>
+  <text x="102" y="352" class="tx">最后 normal = normalize(cross(v2−v0, v1−v0))</text>
+  <text x="102" y="372" class="tx">写回本三角的 Triangle.normal</text>
+  <path d="M160 262V210" class="flow"/>
+  <path d="M420 262V230" class="flow"/>
+
+  <!-- ③ 每帧消费 -->
+  <text x="110" y="412" class="lane">③ 每帧消费 · 绘制 pass</text>
+  <rect x="40" y="424" width="270" height="140" rx="6" class="quiet"/>
+  <text x="52" y="444" class="bt">VS（非索引 draw）</text>
+  <text x="52" y="468" class="tx">只读 position；</text>
+  <text x="52" y="488" class="tx">手造重心坐标、传三角形 id；</text>
+  <text x="52" y="508" class="tx">全程不碰法线 ——</text>
+  <text x="52" y="528" class="tx">法线不走这条门</text>
+  <path d="M60 210V422" class="flow"/>
+
+  <rect x="350" y="424" width="340" height="140" rx="6" class="core"/>
+  <text x="362" y="444" class="bt">PS（逐像素）</text>
+  <text x="362" y="468" class="tx">① 重心坐标选出离自己最近的边</text>
+  <text x="362" y="488" class="tx">② 读 triangles[自己].normal —— 平直底色</text>
+  <text x="362" y="508" class="tx">③ 经 neighbours 读 triangles[邻面].normal</text>
+  <text x="362" y="528" class="tx">④ 噪声啃边带内向邻面法线 mix 0.5</text>
+  <path d="M545 230V422" class="flow"/>
+  <path d="M585 230V422" class="flow"/>
+  <line x1="310" y1="490" x2="348" y2="490" class="flow"/>
+
+  <path d="M690 494H726" class="flow"/>
+  <rect x="728" y="460" width="212" height="66" rx="6" class="quiet"/>
+  <text x="740" y="484" class="tx">G-buffer 法线（8:8:8）</text>
+  <text x="740" y="504" class="tx">→ 延迟光照读成缺口</text>
+
+  <!-- ④ 对比 -->
+  <text x="40" y="600" class="lane">④ 同一根法线在三种管线里的形式</text>
+  <rect x="40" y="612" width="290" height="90" rx="6" class="quiet"/>
+  <text x="52" y="632" class="bt">常规网格</text>
+  <text x="52" y="654" class="tx">顶点属性 → 插值器平滑到像素；</text>
+  <text x="52" y="674" class="tx">像素只被动收自己那份</text>
+  <rect x="350" y="612" width="300" height="90" rx="6" class="quiet"/>
+  <text x="362" y="632" class="bt">TG 岩壳（本图）</text>
+  <text x="362" y="654" class="tx">逐三角 SSBO 字段：CS 每帧写、</text>
+  <text x="362" y="674" class="tx">PS 按 id 查 —— 连邻面的都查得到</text>
+  <rect x="670" y="612" width="270" height="90" rx="6" class="quiet"/>
+  <text x="682" y="632" class="bt">本项目 UE 版</text>
+  <text x="682" y="654" class="tx">顶点 Tangents 流（平直）；</text>
+  <text x="682" y="674" class="tx">邻面查不到 ⇒ 解析目标近似</text>
+</svg>

@@ -114,7 +114,7 @@ void CSMesh_BuildStandardDescs(TArray<FCSGpuStreamDesc>& OutDescs, uint32 NumInd
 	Options.NumIndirectDraws = FMath::Max(NumIndirectDraws, 1u);
 	Options.bMaterialIds = true;
 	Options.bReadbackColors = true;
-	Options.NumTexCoordSets = FMath::Clamp(NumTexCoordSets, 1u, 4u);
+	Options.NumTexCoordSets = FMath::Clamp(NumTexCoordSets, 1u, uint32(FCSGpuMeshCPUData::MaxTexCoordChannels));
 	CSGpuMeshStreams::BuildStandardTriangleStreamDescs(OutDescs, Options);
 }
 
@@ -751,11 +751,17 @@ bool ReadbackResidentSync(const FCSMeshResident& Resident, FCSGpuMeshCPUData& Ou
 	OutMeshData.TexCoords().SetNumUninitialized(VertexCount);
 	OutMeshData.Indices.SetNumUninitialized(IndexCount);
 	{
+		// ⚠️ 一条 TexCoord 流可以**交错**承载多组 UV（ElementsPerUnit = 2 × 组数，见
+		// FStandardStreamOptions::NumTexCoordSets）。只取 TexCoordIndex 的最大值等于只认「第几条
+		// 流」，会把 N 组的那条流算成 1 组 —— 症状是回读 / SaveToStaticMesh 之后 UV1 起全丢，
+		// 而且下面的消费循环还会按 stride 2 走进别的组的数据里，连 UV0 一起错位，且无任何报错。
 		int32 HighestTexCoordIndex = 0;
 		for (const FReadStream& Read : ReadStreams)
 		{
 			if (Read.Desc.CpuSemantic != ECSGpuMeshSemantic::TexCoord) continue;
-			HighestTexCoordIndex = FMath::Max<int32>(HighestTexCoordIndex, Read.Desc.TexCoordIndex);
+			const int32 NumSets = FMath::Max<int32>(int32(Read.Desc.ElementsPerUnit) / 2, 1);
+			HighestTexCoordIndex = FMath::Max<int32>(
+				HighestTexCoordIndex, int32(Read.Desc.TexCoordIndex) + NumSets - 1);
 		}
 		OutMeshData.NumTexCoordChannels = FMath::Clamp(
 			HighestTexCoordIndex + 1, 1, FCSGpuMeshCPUData::MaxTexCoordChannels);
@@ -806,14 +812,23 @@ bool ReadbackResidentSync(const FCSMeshResident& Resident, FCSGpuMeshCPUData& Ou
 					}
 					case ECSGpuMeshSemantic::TexCoord:
 					{
-						const int32 Channel = FMath::Clamp<int32>(
-							Read.Desc.TexCoordIndex, 0, FCSGpuMeshCPUData::MaxTexCoordChannels - 1);
-						if (Channel >= OutMeshData.NumTexCoordChannels) break;
-						TArray<FVector2f>& ChannelUVs = OutMeshData.TexCoordChannels[Channel];
-						if (ChannelUVs.Num() != int32(VertexCount)) ChannelUVs.SetNumUninitialized(VertexCount);
+						// 交错布局：每顶点 NumSets 组，第 s 组落到 TexCoordIndex + s 号通道。
+						// stride 必须按 NumSets 走而不是写死 2 —— 写死的话 N ≥ 2 时第 1 个顶点起
+						// 连 UV0 都读到别组的数据上，且不会报错。
+						const int32 NumSets = FMath::Max<int32>(int32(Read.Desc.ElementsPerUnit) / 2, 1);
 						const float* UV = static_cast<const float*>(Raw);
-						for (uint32 v = 0; v < VertexCount; ++v)
-							ChannelUVs[v] = FVector2f(UV[v * 2 + 0], UV[v * 2 + 1]);
+						for (int32 Set = 0; Set < NumSets; ++Set)
+						{
+							const int32 Channel = int32(Read.Desc.TexCoordIndex) + Set;
+							if (Channel >= OutMeshData.NumTexCoordChannels) break;
+							TArray<FVector2f>& ChannelUVs = OutMeshData.TexCoordChannels[Channel];
+							if (ChannelUVs.Num() != int32(VertexCount)) ChannelUVs.SetNumUninitialized(VertexCount);
+							for (uint32 v = 0; v < VertexCount; ++v)
+							{
+								const uint32 Base = (v * uint32(NumSets) + uint32(Set)) * 2u;
+								ChannelUVs[v] = FVector2f(UV[Base + 0u], UV[Base + 1u]);
+							}
+						}
 						break;
 					}
 					case ECSGpuMeshSemantic::Color:

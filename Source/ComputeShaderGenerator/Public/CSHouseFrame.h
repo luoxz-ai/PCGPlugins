@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "CSGroundShaperSteps.h"   // FPaletteBuffers —— 实例源的容器，与石阶/藤/摆件同一份
 #include "CSHouseProfile.h"        // FCSWallOpening / FCSOpeningClipField
+#include "Templates/TypeHash.h"   // HashCombine —— 柱类砖路的逐实例随机数基
 
 /**
  * 门框砖的 **100% GPU 解析推导**（TinyGladeHouse D6；2026-08-30「裁决一」选乙）。
@@ -300,6 +301,13 @@ struct FBrickParams
 	float Gap = 0.0f;
 	/** 全部砖路加起来的硬上限 = 常驻容量。**超了就截断，绝不扩容**（零阻塞纪律）。 */
 	int32 MaxBricks = 512;
+	/**
+	 * 拱间墩两端的柱头 / 柱础：横截面放大倍数与每块的高度 cm。`CapitalHeight <= 0` 或
+	 * `CapitalScale <= 1` = 不出（墩退回一条均匀的竖直砖路）。只有门框那条路填它；
+	 * 接缝柱与角石沿用默认 0 —— 角石通高到檐口，柱头放在檐下没有意义。
+	 */
+	float CapitalScale = 1.5f;
+	float CapitalHeight = 0.0f;
 };
 
 /** 一条砖路 + 它的世界框架 + 它在全局砖序里占的区间。上传给 GPU 的就是它。 */
@@ -325,7 +333,252 @@ struct FElement
 	 * 接缝那条因此从**接缝身份**派生（`CSHouseSeam::SeamSeed`）。
 	 */
 	uint32 RandomBase = 0;
+	/**
+	 * 横截面缩放：进深轴（kernel 的 +X）与墙法线轴（+Z）同乘，长度轴不动。柱头 / 柱础 > 1，
+	 * 其余恒 1。走 `R5.w`（那一格原本空着）。2026-09-04 为拱间墩的小石柱加的 —— 实拍
+	 * `img/tiny-glade-ref-twin-arch-pier.jpg`：墩是柱础 + 柱身 + **更宽的柱头**，两道拱圈收在柱头上。
+	 */
+	float CrossScale = 1.0f;
+	/**
+	 * **世界 Z 低于它的砖在材质里被 discard**（2026-09-05 用户裁决："转角门处角柱要剔除"）。
+	 * `<= 0` = 不剔（默认，所有既有砖路逐位不变）。
+	 *
+	 * 实现走**逐实例随机数的负值哨兵**：kernel 给要剔的砖写 `-1` 到 packed 行的 `.w`
+	 * （那一格就是材质的 `PerInstanceRandom`），`M_TinyGladeBrick` 的
+	 * `OpacityMask = saturate(PerInstanceRandom + 1)` 把它裁掉。随机数本身恒 ≥ 0，
+	 * 负值因此是一个不会与任何真实取值相撞的哨兵；而被剔掉的砖也不需要色差。
+	 *
+	 * ⚠️ **为什么不走 `PerInstanceCustomData`**：那条通道在 `FCSGpuInstancedMeshVertexFactory`
+	 * 里是关的（`NumCustomDataFloats = 0`），接通它要给 packed 实例加一个 float 流，
+	 * 而那 5 个 float4 一份的布局是 `CSHouseFrame` / `CSHouseVine` / `CSHouseDecor` /
+	 * `CSHouseTile` 与剔除 pass **共用**的契约 —— 为一根角柱去动它不划算。
+	 */
+	float CullBelowZ = 0.0f;
+
+	/**
+	 * 端头砖的**剪切量** cm（≥ 0，洞缘四级的③）：第一块 / 最后一块砖的顶边朝洞多伸出这么多，
+	 * 底边不动。只有砖层的横带会填它，门框 / 接缝 / 角石 / 包边恒 0。
+	 *
+	 * ⚠️ **一条路只有一块砖、两端又都挨着洞时只应用较大的那个**：剪切是平行四边形，一个自由度
+	 * 救不了上下两头都要动的梯形。硬凑两头会把砖推进洞里，而画面上只是"洞缘多了一小块"——不报错。
+	 */
+	float ShearAtS0 = 0.0f;
+	float ShearAtS1 = 0.0f;
 };
+
+/**
+ * 柱类砖路的**逐实例随机数基** = 身份 × 家族 × 序号。
+ *
+ * ⚠️ **不能写成 `Seed ^ (Index * K)`**（本函数取代的就是那个写法）：`Index == 0` 时它是
+ * **恒等映射**，于是任意两个家族只要 seed 撞上，各自的 0 号柱就共享同一个随机数。
+ * 症状要等到有人给砖材质接上 `PerInstanceRandom` 色差那天才显形，而在那之前
+ * 砖数 / 位置 / 三角形数所有几何断言全绿 —— 单测
+ * `House.QuoinSharesTheColumnEmitter` 钉住这条（它就是这么抓到的）。
+ *
+ * `FamilySalt` 区分家族（接缝柱 / 角石 / 将来的墙裙与垛口）；同族内靠 `Index` 区分。
+ */
+inline uint32 PathRandomBase(uint32 Seed, uint32 FamilySalt, int32 Index)
+{
+	return HashCombine(HashCombine(Seed, FamilySalt), uint32(Index) * 2654435761u + 0x9E3779B9u);
+}
+
+/** 家族盐。加新家族时在这里登记，别就地写字面量 —— 撞盐与撞 seed 是同一种静默故障。 */
+namespace EPathFamily
+{
+	static constexpr uint32 Seam     = 0x5345414Du;   // 'SEAM' —— 两房交汇处的接缝柱
+	static constexpr uint32 Quoin    = 0x51554F4Eu;   // 'QUON' —— 房子自身四角的角石
+	static constexpr uint32 TrimTop  = 0x54524D54u;   // 'TRMT' —— 墙顶包边（压顶石）
+	static constexpr uint32 TrimBase = 0x54524D42u;   // 'TRMB' —— 墙脚包边（勒脚石）
+	static constexpr uint32 CornerPier = 0x43505252u; // 'CPRR' —— 转角配成墩时角上的柱础/柱身/柱头
+	/**
+	 * 'BWAL' —— 砖层（两层墙之 A，2026-09-06）。⚠️ **它后面 65536 个值都归它**：
+	 * `CSHouseBrickWall::BuildWall` 拿 `BrickWall + 层号` 当盐，好让每层的随机序列不同。
+	 * 再加新家族时从 `0x42574C00u` 之后另起，别插进这段里。
+	 */
+	static constexpr uint32 BrickWall = 0x4257414Cu;
+}
+
+/**
+ * **一根竖直砖柱**的通用发射器：柱心 + 朝外方向 + 柱底/柱顶 → 追加一条砖路，返回本次的砖数。
+ *
+ * 三家共用它（合卷卷五 A11）：D7 接缝交点柱（`CSHouseSeam::BuildCornerElements`）、
+ * D7 墙自身转角的角石（`CSHouseQuoin::BuildQuoinElements`）、以及将来的墙裙 / 垛口。
+ * TG 侧的实证是同向的：转角、墙裙、缝砖、雉堞、承重柱在那边**全是同一个 `brick` × 逐实例
+ * 非均匀缩放**，连独立的网格资产都没有（合卷卷五 §1、§3.3）。
+ *
+ * ⚠️ **`AxisU` 取的是朝外方向的反向，这不是笔误。** 路径竖直 ⇒ 切向恒 `(0,1)` ⇒ kernel 里
+ * 的面内朝外 `OutwardSZ = (−1, 0)` ⇒ `AxisX = −AxisU`，而 `AxisX` 正是砖的**进深轴**
+ * （`FrameBrickDepth`）。写成 `AxisU = Outward` 的症状是砖整根朝里、进深轴插进房间，
+ * 而位置完全正确 —— 位置断言一条都不会红。
+ *
+ * ⚠️ **只截断，绝不扩容**：`InOutCursor` 撞到 `Params.MaxBricks` 就返回 0。容量是注册期
+ * 一次付清的常量（`ReserveCapacity`），扩容是阻塞刷新，落在用户恰好画到的那一笔上。
+ */
+/** 竖直柱路的墙框架：原点在角点、世界高度吃进 Origin.z，U 指向房内（−Outward），V 竖直。三种柱类砖路共用。 */
+inline FWallFrame ColumnFrame(const FVector2D& Point, const FVector2D& Outward, float BottomZ)
+{
+	FWallFrame Frame;
+	Frame.Origin = FVector3f(float(Point.X), float(Point.Y), BottomZ);
+	Frame.AxisU = FVector3f(float(-Outward.X), float(-Outward.Y), 0.0f).GetSafeNormal();
+	Frame.AxisV = FVector3f(0.0f, 0.0f, 1.0f);
+	Frame.AxisN = FVector3f(float(-Outward.Y), float(Outward.X), 0.0f).GetSafeNormal();
+	return Frame;
+}
+
+inline int32 AppendColumn(const FVector2D& Point, const FVector2D& Outward, float BottomZ, float TopZ,
+	uint32 RandomBase, const FBrickParams& Params, TArray<FElement>& InOutElements, int32& InOutCursor)
+{
+	const float Length = FMath::Max(Params.Length, 1.0f);
+	const int32 MaxBricks = FMath::Max(Params.MaxBricks, 0);
+	// 半块砖都摆不下就不出 —— 与门框那条下限同一个口径。
+	if (TopZ - BottomZ < Length * 0.5f) return 0;
+
+	FPath Path;
+	Path.BaseZ = 0.0f;                      // 世界高度全部吃进 Frame.Origin，路自己从 0 起算
+	Path.TopZ = TopZ - BottomZ;
+	Path.LeftS = Path.RightS = Path.CenterS = 0.0f;
+	Path.MidKind = EMidKind::None;
+	Path.bLeftJamb = true;
+
+	float Scale = 0.0f;
+	int32 Count = SolveRun(Path.TotalLen(), Length, Params.Gap, Scale);
+	if (Count <= 0 || Scale <= 0.0f) return 0;
+	Count = FMath::Min(Count, MaxBricks - InOutCursor);
+	if (Count <= 0) return 0;
+
+	FElement Element;
+	Element.Path = Path;
+	Element.Frame = ColumnFrame(Point, Outward, BottomZ);
+	Element.BrickBegin = InOutCursor;
+	Element.BrickCount = Count;
+	Element.Pitch = (Length + FMath::Max(Params.Gap, 0.0f)) * Scale;
+	Element.HalfLen = Length * Scale * 0.5f;
+	Element.LayoutScale = Scale;
+	Element.RandomBase = RandomBase;
+	InOutElements.Add(Element);
+	InOutCursor += Count;
+	return Count;
+}
+
+/**
+ * 一块横截面放大的**单砖**（柱头 / 柱础），立在竖直柱路的框架上，恰好铺满世界高度 [Z0, Z1]。
+ * `BuildEdgeElements` 里 `EmitSlab` 的柱路版本：那个只能沿墙边摆（吃边框架 + S），这个吃角点 + 朝向。
+ * 追加写，返回砖数（0 或 1）。
+ */
+inline int32 AppendSlab(const FVector2D& Point, const FVector2D& Outward, float Z0, float Z1,
+	uint32 RandomBase, const FBrickParams& Params, TArray<FElement>& InOutElements, int32& InOutCursor)
+{
+	const float H = Z1 - Z0;
+	if (H <= UE_KINDA_SMALL_NUMBER || InOutCursor >= FMath::Max(Params.MaxBricks, 0)) return 0;
+
+	FElement Element;
+	Element.Path.BaseZ = 0.0f;
+	Element.Path.TopZ = H;
+	Element.Path.LeftS = Element.Path.RightS = Element.Path.CenterS = 0.0f;
+	Element.Path.MidKind = EMidKind::None;
+	Element.Path.bLeftJamb = true;
+	Element.Frame = ColumnFrame(Point, Outward, Z0);
+	Element.BrickBegin = InOutCursor;
+	Element.BrickCount = 1;
+	Element.Pitch = 0.0f;
+	Element.HalfLen = H * 0.5f;
+	Element.LayoutScale = H / FMath::Max(Params.Length, 1.0f);
+	Element.RandomBase = RandomBase;
+	Element.CrossScale = Params.CapitalScale;
+	InOutElements.Add(Element);
+	++InOutCursor;
+	return 1;
+}
+
+/**
+ * 转角墩：柱础 + 柱身 + 柱头，与 `BuildEdgeElements` 给拱廊的墩砌的三段**同一个口径**
+ * （柱头 / 柱础夹在墩高的 40% 内；`CapitalHeight <= 0` 或 `CapitalScale <= 1` 退回一条均匀柱路）。
+ * 区别只在框架：拱廊的墩沿墙边摆，这根立在角点上、沿角平分线。追加写，返回砖数。
+ *
+ * 三段各取一个随机数基（`Index * 3 + 段序`），与 `EmitSlab` 那边"每段一个元素"的结构一致。
+ */
+inline int32 AppendCornerPier(const FVector2D& Point, const FVector2D& Outward, float BottomZ, float TopZ,
+	uint32 Seed, int32 Index, const FBrickParams& Params, TArray<FElement>& InOutElements, int32& InOutCursor)
+{
+	const float H = TopZ - BottomZ;
+	if (H <= UE_KINDA_SMALL_NUMBER) return 0;
+	auto Base = [&](int32 Part) { return PathRandomBase(Seed, EPathFamily::CornerPier, Index * 3 + Part); };
+
+	const float Cap = FMath::Clamp(Params.CapitalHeight, 0.0f, H * 0.4f);
+	if (Cap <= UE_KINDA_SMALL_NUMBER || Params.CapitalScale <= 1.0f)
+	{
+		return AppendColumn(Point, Outward, BottomZ, TopZ, Base(1), Params, InOutElements, InOutCursor);
+	}
+	int32 Added = 0;
+	Added += AppendSlab(Point, Outward, BottomZ, BottomZ + Cap, Base(0), Params, InOutElements, InOutCursor);
+	Added += AppendColumn(Point, Outward, BottomZ + Cap, TopZ - Cap, Base(1), Params, InOutElements, InOutCursor);
+	Added += AppendSlab(Point, Outward, TopZ - Cap, TopZ, Base(2), Params, InOutElements, InOutCursor);
+	return Added;
+}
+
+/**
+ * **一段水平砖路**的通用发射器：沿墙边从 `S0` 铺到 `S1`、课程中心高 `BandZ`。
+ *
+ * 包边石（墙顶压顶 / 墙脚勒脚，`CSHouseTrim`）走它。与 `AppendColumn` 的唯一区别是路的形状：
+ * 那边是竖直段（`EMidKind::None` + 只出左樘），这边是平顶段（`EMidKind::Flat`），两者都只有
+ * 一段、都由同一个 `SolveRun` 定砖数与铺装缩放。
+ *
+ * ⚠️ **砖的三轴在这里换了个位置，不是笔误。** kernel 对切向 `(1,0)` 算出面内朝外
+ * `OutwardSZ = (0,1)` ⇒ `AxisX`（砖的 `FrameBrickDepth`）指向**竖直向上**、`AxisY`（长度轴）
+ * 沿边、`AxisZ`（`FrameBrickThickness`，默认退化成墙厚）横跨墙厚。也就是说包边这一课的
+ * **高度是 `FrameBrickDepth`**、进深是墙厚 —— 和拱缘砖共用同一组尺寸，因为它们共用一个组件、
+ * 一份 `BlockSize`（TG 全库也只有一块 `brick`）。想让包边比拱缘更厚只能连拱缘一起改。
+ */
+inline int32 AppendFlatRun(const FWallFrame& Frame, float S0, float S1, float BandZ,
+	uint32 RandomBase, const FBrickParams& Params, TArray<FElement>& InOutElements, int32& InOutCursor,
+	float ShearAtS0 = 0.0f, float ShearAtS1 = 0.0f)
+{
+	const float Length = FMath::Max(Params.Length, 1.0f);
+	const int32 MaxBricks = FMath::Max(Params.MaxBricks, 0);
+	const float Span = S1 - S0;
+	// 半块砖都摆不下就不出 —— 与门框、角石同一个下限。门洞切出来的碎段靠它自然消失。
+	if (Span < Length * 0.5f) return 0;
+
+	FPath Path;
+	Path.MidKind = EMidKind::Flat;
+	Path.FlatLen = Span;
+	Path.LeftS = S0;
+	Path.RightS = S1;
+	// 平顶段取 `TopZ` 作高度（`EvalPath` 的 Flat 分支：`OutSZ = (LeftS + T, TopZ)`）。
+	// `BaseZ` 写成同一个值只是为了让读到这个结构体的人不必猜哪个字段在起作用。
+	Path.TopZ = BandZ;
+	Path.BaseZ = BandZ;
+	// 三个 bool 全 false ⇒ `TotalLen() == FlatLen`，路上只有中段。
+
+	float Scale = 0.0f;
+	int32 Count = SolveRun(Path.TotalLen(), Length, Params.Gap, Scale);
+	if (Count <= 0 || Scale <= 0.0f) return 0;
+	Count = FMath::Min(Count, MaxBricks - InOutCursor);
+	if (Count <= 0) return 0;
+
+	FElement Element;
+	Element.Path = Path;
+	Element.Frame = Frame;
+	Element.BrickBegin = InOutCursor;
+	Element.BrickCount = Count;
+	Element.Pitch = (Length + FMath::Max(Params.Gap, 0.0f)) * Scale;
+	Element.HalfLen = Length * Scale * 0.5f;
+	Element.LayoutScale = Scale;
+	Element.RandomBase = RandomBase;
+	Element.ShearAtS0 = FMath::Max(ShearAtS0, 0.0f);
+	Element.ShearAtS1 = FMath::Max(ShearAtS1, 0.0f);
+	InOutElements.Add(Element);
+	InOutCursor += Count;
+	return Count;
+}
+
+/** 已排定的砖数 = 全部元素的 `BrickBegin + BrickCount` 上确界。柱类发射器靠它接着数。 */
+inline int32 NextBrickSlot(const TArray<FElement>& Elements)
+{
+	int32 Cursor = 0;
+	for (const FElement& E : Elements) Cursor = FMath::Max(Cursor, E.BrickBegin + E.BrickCount);
+	return Cursor;
+}
 
 /**
  * 一个洞 → 它的解析砖路。`PierBefore/After` 来自 `FCSWallOpening::StyleFlags`：

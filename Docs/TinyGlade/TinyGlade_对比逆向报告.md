@@ -127,6 +127,9 @@ Writer.AddTri(PrevInner, TopAi, TopBi, SlotWall, { 0, 0 }, { 0, 0 }, { 0, 0 });
 
 **载荷通道用 UV0，不要动 UV1，也不用顶点色。**
 
+⚠️ **本条已过期（2026-09-04 复核）**：多 UV 通路已打通——口径统一成**单条交错流**（`CSGpuMeshTypes.cpp:44` `ElementsPerUnit = 2 * Clamp(NumTexCoordSets, 1u, 4u)`、`CSGpuMeshSceneProxy.cpp` 逐组挂 stream component 且 SRV 只设一次），上限 8 组。下文保留作当时的评审记录。
+
+
 - **UV1 是结构性不可用**（我复核属实）：`Private/CSGpuMeshSceneProxy.cpp:303` `Data.TextureCoordinatesSRV = S.SRV;` 在 `:289` 的 switch 循环里，后一条 TexCoord 流会直接覆盖前一条；`Private/CSGpuMeshTypes.cpp:37-50` TexCoord 描述符写死 `ElementsPerUnit = 2`；引擎 `LocalVertexFactory.ush` 的 `VertexFetch_TexCoordBuffer[NumFetchTexCoords*VertexId + Index]` 是**交错取数**，两条独立 buffer 物理上表达不了。真要 UV1 得改 5 个 C++ 处 + 7 个 .usf 的 stride，不划算。
 - **征用 UV0 的损失为零**：拱上墙内脸 UV 本来就是全 `(0,0)`（见 2.0），墙纹理改世界三平面即可。
 - **顶点色是可行的备选但精度不够**：`Private/CSGpuMeshTypes.cpp:51-63` 是 BGRA8，`Private/CSHouseActor.cpp:41` 四通道恒 `(1,1,1,1)` 完全空闲。用 `q/16+0.5` 这类线性映射插值仍是仿射的（**不会**产生伪洞），问题纯是精度：8 bit 在 110 cm 拱上是约 0.9 cm 的洞缘量化台阶，贴脸可见。
@@ -559,9 +562,9 @@ float Skew = 0.0f;               // Z1 沿 S 的线性斜率——楼梯洞的�
 
 即：TG 从未把「手柄」做成「被编辑物的子 actor」，因此从没遇到过本条的父子回路。这个对照是成立的。
 
-**当前方案怎么做**：D5 三条规定（行号已核对）：:208「生成后 `AttachToActor` 挂在房子下，房子整体移动/旋转时跟着走」；:210「handle 的 `PostEditMove` 把自身当前位置投影到所属墙的外法线轴，算出推拉量后直调宿主房 `NotifyHandleDragged(WallIndex, Offset)`……房屋**单边推拉该墙（对侧不动、中心随动**——Tiny Glade 行为，clamp `MinFootprint` 如 200 cm）」；:211「拖拽期间（`bFinished=false`）程序**不回写** handle 位置」。
+**当前方案怎么做**：[`TinyGladeHouse_Plan.md` D5](TinyGladeHouse_Plan.md#d5-拉尺寸实体-handle-actor--标准-gizmo用户裁决) 三条规定（下称 **规定①②③**；原文此处引的 `:208/:210/:211` 是旧行号，D5 已移位，改用小节锚点）：①「生成后 `AttachToActor` 挂在房子下，房子整体移动/旋转时跟着走」；②「handle 的 `PostEditMove` 把自身当前位置投影到所属墙的外法线轴，算出推拉量后直调宿主房 **`PushEdge(EdgeIndex, Offset, bFinished)`**……房屋**单边推拉该墙（对侧不动、中心随动**——Tiny Glade 行为，clamp `MinFootprint`，默认 200 cm）」；③「拖拽期间（`bFinished=false`）程序**不回写** handle 位置」。
 
-D5 尚未落地（代码里无 `ACSHouseResizeHandleActor`、无 `NotifyHandleDragged`，grep 零命中），所以这是动工前免费修掉的设计缺陷。
+⚠️ **原文这里写的 `NotifyHandleDragged(WallIndex, Offset)` 这个名字从未存在**：2026-08-31 机制入口是以 `ACSHouseActor::PushEdge(EdgeIndex, Offset, bFinished)` 落地的（`WallIndex` 在那边叫 `EdgeIndex`）。**D5 交互层已于 2026-09-05 落地**（`ACSHouseResizeHandleActor` / `EnterResizeMode` / `OnResizeModeChanged` / `FCSHouseResizeSelectionWatcher`），本条的 2× 缺陷**按下面的修法 (A) 记账量法实装并单测钉死**（`House.ResizeHandle` 第 ②③ 段：单次拖 1 m 走 1 m，连续 10 步每步恰好 25 cm）。所以它确实是"动工前免费修掉"的 —— 一次都没在画面上发生过。
 
 **差距**：【你的推断，递推已闭合；需一次 10 行实验确认 gizmo 增量语义】
 
@@ -578,13 +581,15 @@ D5 尚未落地（代码里无 `ACSHouseResizeHandleActor`、无 `NotifyHandleDr
 
 剩下的真实症状：拖 1 m，墙走 2 m；且拖拽期每次事件都触发一次全量 `RebuildBodyMesh`（`CSHouseActor.cpp:343`）。
 
-**建议**：**修法 (A)：记账量法（推荐，~15 行，与 :211 逐字兼容）**
-`ACSHouseResizeHandleActor` 上加 transient `FVector LastConsumedWorld`。`PostEditMove` 里 `Offset = FVector::DotProduct(GetActorLocation() - LastConsumedWorld, OutNormalWorld)`；调完 `NotifyHandleDragged`（此时房子已改完 `FootprintSize` 与中心，attach 已把 handle 拖走）**之后**立刻 `LastConsumedWorld = GetActorLocation()`。代入上面的递推：Offset ≡ δ，1× 行为，且**只更新一个记账变量、不写 handle transform**，与 :211「拖拽期不回写 handle 位置」完全一致。
+**建议**：**修法 (A)：记账量法（推荐，~15 行，与规定③逐字兼容）**
+`ACSHouseResizeHandleActor` 上加 transient `FVector LastConsumedWorld`。`PostEditMove` 里 `Offset = FVector::DotProduct(GetActorLocation() - LastConsumedWorld, OutNormalWorld)`；调完 `PushEdge`（此时房子已改完 `FootprintSize` 与中心，attach 已把 handle 拖走）**之后**立刻 `LastConsumedWorld = GetActorLocation()`。代入上面的递推：Offset ≡ δ，1× 行为，且**只更新一个记账变量、不写 handle transform**，与规定③「拖拽期不回写 handle 位置」完全一致。
 
-**修法 (B)：去掉父子关系 —— 【核验后需加限定，原稿说它「不推翻 :211」是错的】**
-原稿写「handle 不 attach，由房子在 `PostEditMove` 与 `ReevaluateSite` 末尾统一摆放全部 handle」。但 handle 拖拽本身会经 `NotifyHandleDragged` 走进 `ReevaluateSite`，于是房子会在拖拽中写正在被拖的那个 handle 的位置——**直接违反 :211**。若要用 (B)，必须限定为「摆放除当前被拖那一个之外的全部 handle」，并在房子侧记录 `ActiveHandle`。这使 (B) 的复杂度反超 (A)。**建议直接选 (A)。**
+⚠️ **累加器要记 `PushEdge` 的返回值，不是喂进去的 `Offset`**：它返回经 `MinFootprint` 修正后**实际**生效的位移。顶在下限上时记成请求值，残差会在"墙拖不动"的那段时间里一路累积，松手瞬间房子跳一大截。`CSHouseResize.h:57` 与单测第 ③ 例已钉死这条。
 
-**配套单测（无论选哪条）**：把推拉抽成纯函数 `static void CSHouse_ApplyEdgePush(FVector2D& InOutSize, FVector& InOutCenter, int32 EdgeIndex, float Yaw, float Offset, float MinFootprint)` 进 `CSHouseLogicTests`，第一条断言是「连续 10 次 Offset=0 的调用不改变任何量」，第二条是「单次 Offset=Δ 后，对侧墙世界位置不变、被推墙世界位置恰好移动 Δ」——后者正好把 2× 放大钉死。
+**修法 (B)：去掉父子关系 —— 【核验后需加限定，原稿说它「不推翻规定③」是错的】**
+原稿写「handle 不 attach，由房子在 `PostEditMove` 与 `ReevaluateSite` 末尾统一摆放全部 handle」。但 handle 拖拽本身会经 `PushEdge` 走进 `ReevaluateSite`，于是房子会在拖拽中写正在被拖的那个 handle 的位置——**直接违反规定③**。若要用 (B)，必须限定为「摆放除当前被拖那一个之外的全部 handle」，并在房子侧记录 `ActiveHandle`。这使 (B) 的复杂度反超 (A)。**建议直接选 (A)。**
+
+**配套单测（无论选哪条）**：✅ **已落地（2026-08-31）** —— 纯函数 `CSHouse_ApplyEdgePush(FVector2D& InOutSize, FVector& InOutCenter, int32 EdgeIndex, float Yaw, float Offset, float MinFootprint)` 在 `CSHouseResize.h`，单测 `FCSHouseEdgePushTest`（`House.EdgePush`）三例：①「连续 10 次 Offset=0 不改变任何量」；②「单次 Offset=Δ 后对侧墙世界位置不变、被推墙恰好移动 Δ」，**四条边 × yaw=37° 各验一遍**（中心随动是世界方向的量，只在 yaw=0 下验是最常见的漏法）——这条正好把 2× 放大钉死；③「推穿 `MinFootprint` 时返回实际生效位移而非请求值」。无头回归侧另有 `demo_house_resize()`：60 步 × 5 cm 断言 `jumps == 0`。
 
 **代价**：(A) ~15 行 + 一条单测；是 D5 动工前的设计修正，零返工。
 
@@ -1342,6 +1347,8 @@ README `Plugins/PCGPlugins/README.md:162-180` 给的是**两个数**：`Generate
 
 **当前方案怎么做**：8 条流是固定集（`CSGpuMeshTypes.cpp:7-118` BuildStandardTriangleStreamDescs；`CSMesh.cpp:98-105` 强制 bMaterialIds/bReadbackColors；`CSMesh.h:78` 注释）。其中**只有 4 条能被材质看见**：Position / TangentBasis / TexCoord0 / Color。AuxVertex 明写"extension slot: per-vertex data with no built-in VF role"（`CSGpuMeshTypes.h:63`），proxy 的绑定 switch 对它是 `default: break; // MeshCounters, AuxVertex: no VF / draw binding`（`CSGpuMeshSceneProxy.cpp:325-326`）——扩展槽只到 compute，到不了材质。实际占用：房屋每顶点写常数白 `S.Colors.Add(FVector4f(1,1,1,1))`（`CSHouseActor.cpp:41`），UV0 是逐面平铺 200 cm（`CSHouseActor.cpp:17` + AddQuad `:48-53`）；地面 R = 道路权重（`CSGroundActor.h:34`），BaseColor 默认 (0,0,0,1)（`CSGroundActor.h:97`）⇒ G/B 空、A 恒 1。CPU 快照支持 4 条 UV（`CSGpuMeshTypes.h:127/136-141`），但上传路径只打包通道 0（`CSMeshOps.cpp:1062/1108`，`TexCoords[Vertex] = Snapshot.TexCoords()[UVIndex]`）。
 
+⚠️ **本条已过期（2026-09-04 复核）**：多 UV 通路已打通——口径统一成**单条交错流**（`CSGpuMeshTypes.cpp:44` `ElementsPerUnit = 2 * Clamp(NumTexCoordSets, 1u, 4u)`、`CSGpuMeshSceneProxy.cpp` 逐组挂 stream component 且 SRV 只设一次），上限 8 组。下文保留作当时的评审记录。
+
 **差距**：今天房屋真正可用的逐顶点参数就是 **4 字节 RGBA8**（且全白空转），地面剩 GBA 三通道。TG 那套"每砖 seed / 3 点拱高 / bone_0/1/2_pos 弯曲骨点 / 换季色"里只有 seed 和一两个标量塞得进。**扩容路上有一颗静默地雷，我在引擎源码里确认了它**：再声明一条 `{Role=TexCoord, TexCoordIndex=1}` 的流时，`CSGpuMeshSceneProxy.cpp:303` 的 `Data.TextureCoordinatesSRV = S.SRV` 会被后声明的流整体覆盖（只赋一次单指针），`:305` 把 `NumTexCoords` 抬到 2；而 D3D12/SM5+ 上 `MANUAL_VERTEX_FETCH` 恒被定义为 1（`LocalVertexFactory.cpp:306-308`），uniform buffer 取 `VertexFetch_TexCoordBuffer = GetTextureCoordinatesSRV()` 与 `NumTexCoords`（`LocalVertexFactory.cpp:89/115/120`），shader 按**单条交错缓冲**取数 `Buffer[NumFetchTexCoords * (VertexOffset + VertexId) + i]`（`LocalVertexFactory.ush:734`）。两条独立缓冲 ⇒ 连只用 UV0 的材质都会按 stride 2 读进 UV1 那条缓冲并越界，且 proxy 关了 `bVerifyUsedMaterials`（`CSGpuMeshSceneProxy.cpp:25`），不会有任何报错。**但原结论漏了一件关键事**：回读侧**已经**按"每通道一条独立流"设计好了——`CSMesh.cpp:686-698` 扫所有 `CpuSemantic==TexCoord` 的流取 `max(TexCoordIndex)+1` 当通道数，`:742-746` 按 `Read.Desc.TexCoordIndex` 分发。也就是说：**项目预期的扩容形态是"多流"，而 proxy 绑定实现的是"单交错流"，两处口径本来就不一致**，这才是地雷的真正根因，不是单纯"没人加过 UV1"。
 
 **建议**：**先在一处把两种口径对齐，再谈花预算。**
@@ -1352,7 +1359,7 @@ README `Plugins/PCGPlugins/README.md:162-180` 给的是**两个数**：`Generate
 2）**先花掉顶点色那 4 字节**（与 1）无依赖，可立刻做）：把 `FCSHouseMeshWriter::AddTri`（`CSHouseActor.cpp:41`）的常数白换成语义写入——R = 构件类型枚举（墙/檐/柱/门框，量化 8 级）、G = 离地归一化高度、B = hash(HouseGuid, 面索引) 的 8-bit seed、A = 风化/苔藓权重。只改一个 `Add` 的实参，不动任何流、不动哈希，立刻让"每面墙不同随机相位"在材质里可算。
 3）只有真需要 float 精度的逐顶点向量（拱剖面、弯曲骨点）时才启用 UV1/UV2——那时第 1 步已经把口径统一了。
 
-**代价**：第 2 步是纯收益、一行量级。第 1 步纯改造无功能收益，但它是 UV1 的前置：不做则第一次加 UV1 会撞上无报错的黑洞（症状是"贴图错位/闪烁"，最难往回追）。另一个易漏点：编辑器构建下 `LocalVertexFactory.cpp:494-498` 的 `#if !WITH_EDITOR` 使顶点声明分支**不会**被 MVF 跳过（UE-165187 的遗留），所以编辑器里还会额外多出一个 UV 顶点元素——无害但会让"编辑器好使打包坏"这类误判更难查。显存：每多一套 UV 每顶点 +8 B（地面 256² = 66049 顶点 ≈ +0.5 MB，1024² ≈ +8 MB；房屋千级三角可忽略）。UE 侧硬上限：`FLocalVertexFactory` 的 UV 属性槽只有 `MAX_STATIC_TEXCOORDS/2 = 4` 条（`LocalVertexFactory.cpp:528-548`），加上 `FCSGpuMeshCPUData::MaxTexCoordChannels = 4`（`CSGpuMeshTypes.h:127`），天花板是 4 套 UV = 8 个 float，离 TG 的 41 种属性仍差一个数量级——这个差距靠加流抹不平，只能靠上一条的逐图元通道 + 把语义压到 8-bit。
+**代价**：第 2 步是纯收益、一行量级。第 1 步纯改造无功能收益，但它是 UV1 的前置：不做则第一次加 UV1 会撞上无报错的黑洞（症状是"贴图错位/闪烁"，最难往回追）。另一个易漏点：编辑器构建下 `LocalVertexFactory.cpp:494-498` 的 `#if !WITH_EDITOR` 使顶点声明分支**不会**被 MVF 跳过（UE-165187 的遗留），所以编辑器里还会额外多出一个 UV 顶点元素——无害但会让"编辑器好使打包坏"这类误判更难查。显存：每多一套 UV 每顶点 +8 B（地面 256² = 66049 顶点 ≈ +0.5 MB，1024² ≈ +8 MB；房屋千级三角可忽略）。UE 侧硬上限：`FLocalVertexFactory` 的 UV 属性槽只有 `MAX_STATIC_TEXCOORDS/2 = 4` 条（`LocalVertexFactory.cpp:528-548`），加上当时的 `FCSGpuMeshCPUData::MaxTexCoordChannels = 4`（⚠️ **2026-09-04 已抬到 8**；属性槽只有 4 条那一半仍然属实，第 5 组起只走 manual fetch 的 SRV），天花板是 8 套 UV = 16 个 float，离 TG 的 41 种属性仍差一个数量级——这个差距靠加流抹不平，只能靠上一条的逐图元通道 + 把语义压到 8-bit。
 
 **证据**：TG 侧【逆向报告确凿】（§9.1/§1.6/§9.2）；项目侧全为代码事实（含我新核出的 CSMesh.cpp:686-698/742-746 多流回读，原结论未提）；UV1 地雷为【我的推断】，由 UE 5.7.4 引擎源码（LocalVertexFactory.cpp:89/115/120/306-308/494-498/528-548、LocalVertexFactory.ush:734）与插件绑定代码交叉推出，未实测。
 

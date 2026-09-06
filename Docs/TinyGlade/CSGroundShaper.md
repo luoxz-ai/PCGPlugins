@@ -149,14 +149,68 @@ f@dot = dot(@N, set(0, 1, 0));
 `blast10` 删 `@road>0`、`blast1` 留 `@dot<1`，两步之后得到**「没有路的坡面」**，
 它是链 B 唯一的输入。UE 侧没有等价物（UE 不需要，因为没有链 B）。
 
-## 链 B：侧面碎石（✅ 已落地，2026-08-30）
+## ⚠️ 链 B 已被用户在 Houdini 里重构（2026-08-31 现场实测，本节后的旧链描述已成历史）
+
+用 MCP 逐节点读了正在运行的 Houdini 会话：旧链 B 的 `scatter1/fuse1/Voronoiscatter/
+polyextrude1/polyreduce1` **全部不在了**，换成一条新链，观感明显优于 UE 现状与 TG 原版。
+下表是实测配方（数值全部读自节点，非猜测；场景单位下胞腔间距 ≈ 0.35）：
+
+| 步 | 节点 | 实测参数 | 作用 |
+| --- | --- | --- | --- |
+| 图案 | `grid2 → scatter2 → voronoifracture1` | 10×10 格、**808 点**、不松弛 | 平面 Voronoi，**没有裙圈** —— TG 的 LipOffset 语义整个不存在 |
+| 负缝 | `attribwrangle8` | 每胞腔绕质心 **×1.22** | **比例**放大互相压住（UE 的 `CellExpand` 是定长 12 cm，胞腔越大越不够） |
+| 边界 | `Findmargin3` | — | 标每片边界 `margin=1` |
+| 密化 | `remesh2` | targetsize **0.1**（≈ 胞腔 28%） | **面内有顶点，片才能弯** —— 圆鼓包的前提 |
+| 距缝场 | `distancealonggeometry1 → attribremap1` | 从 `@margin=1` 测地；距缝 6.7% 内 0→1，**输出封顶 0.068**（≈胞腔 19%） | `distbound`：缝边一圈快速塌 0、内部平台 —— **卷边** |
+| 逐胞腔阈值 | `attribrandomize1` | `deform ∈ 0.1..0.5`，**seedattrib=class** | 分批显隐的种子 |
+| 披挂 | `ray2` | 方向 (0,1,0)、**scale=0 只导属性** | 导入地面的 `rest/N/dist/road/heightscale`，点不动；`@P.y = v@rest.y` 在 wrangle 里替换 —— 与 TG 的"Y 替换"同构 |
+| 带 mask | `kalou_fitvalue2` | `rockdeform = ramp(dist)`：0→0、0.37→1、0.95→1、0.98→0 | **用 dist 场不用坡度** —— 与台高解耦，缓坡照样长（UE 版 ReliefFloor 那一坑在此根本不存在） |
+| 路 | `kalou_fitvalue3` | road 0.05→0、0.2→1 | 路权重 0.2 即满 |
+| 大尺度噪声 | `attribnoise1` | `noiseheight` amp **0.2**（≈胞腔 57%）、elementsize 0.38（≈1.1 胞腔） | 石头逐个高矮胖瘦不同 —— 剪影的主源 |
+| 位移 | `attribwrangle9` | 见下 | 心脏 |
+| 法线 | `normal4` | cusp 27.7° | 硬边 |
+
+`attribwrangle9` 的位移（`distbound` 幅度 0.917、`boundpow` 1.7、`boundoffset` 0.018）：
+
+```vex
+@P.y = v@rest.y;                                        // Y 替换披挂
+float deform = linearstep(0.104, 0.163, heightscale - f@deform);   // 逐胞腔阈值 + 0.06 淡入窗
+if (margin || rockdeform == 0 || road == 1 || heightscale == 0 || deform == 0)
+    @P.y -= 0.018;                                      // 不合格：只沉 ≈ 胞腔 5%（藏，不删）
+else
+    @P += @N * (noiseheight + pow(distbound, 1.7)) * 0.917
+             * rockdeform * (1 - road) * deform;        // 面内圆鼓包
+```
+
+`heightscale` 是链 A 新增 `attribwrangle10`（`f@dist *= chf('scale')`，实测 0.795）的**全局台高滑杆**
+—— 塑形物上下移动的对位物。它对上逐胞腔阈值 ⇒ **台子升降时石头一个个按自己的阈值快速
+长出 / 缩没**（0.06 宽 ramp，连续，不是 NaN pop；永不删三角）。
+
+### 为什么这版比 UE / TG 都好看（机制级，非调参级）
+
+1. **缝**：TG/UE 的缝是"相邻刚性平板各自浮沉出的裸台阶 + 全遮蔽黑槽"（UE 出图实测 0.77%
+   纯黑像素）；这里每片边缘被 `distbound` 陡 ramp **卷回贴地**，缝是两块鼓包之间的浅沟 ——
+   没有裸侧壁、没有黑洞。
+2. **体积**：TG/UE 的盖是刚体平移（`CellRelief` 错位）；这里 remesh 之后**面内真变形**，
+   石头是圆润鼓包。
+3. **显隐**：TG/UE 是坡度阈硬 NaN；这里是逐胞腔随机阈值 + 淡入窗 + 浅沉藏 ——
+   分批且连续，popping 彻底消失。
+4. **mask 与台高解耦**：`dist` 场定义带位，不看坡度 ⇒ 缓坡小土台照样长满。
+
+### 移植到 UE 的落点（✅ 已裁决 2026-08-31：**不移植**，保留 UE 大体方案；只取「裙圈倾斜」一个点子落成 `RockShellSkirtTilt`。下面是当时的评估，留档）
+
+要动的裁决：裁决一（图案改烘 Voronoi+remesh+distbound，不再用 TG 原件）、裁决四（裙边高度
+不再是 LipOffset 的副产品 —— 没有裙圈了）、显隐机制（NaN 换成浅沉 + 逐胞腔阈值；NaN 只留给
+域外剔除）。kernel 核心 ≈ 40 行重写；`GroundShaperEvalOne` 的 `S` 就是现成的 `dist` 场。
+
+## 链 B（旧版）：侧面碎石（✅ 已落地，2026-08-30 —— **已被上面的重构取代，留档**）
 
 这是用户提到的「侧面石头 mesh」。原型 15 个节点全部落在**离线**，运行时只剩逐三角的
 披挂 + mask 显隐（裁决一）。下面还是原型的逐节点口径，**实现现状先列在这里**：
 
 | 件 | 路径 |
 | --- | --- |
-| 图案（Tiny Glade 原件） | `/Game/TinyGlade/Meshes/rocky_terrain_shell/rocky_terrain_shell/StaticMeshes/rocky_terrain_shell` |
+| 图案（Tiny Glade 原件） | `/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/rocky_terrain_shell/rocky_terrain_shell/StaticMeshes/rocky_terrain_shell` |
 | 导入 / 收尾 | `Scripts/TinyGladeImportRockShell.py` → `Scripts/TinyGladeSetupRockShell.py` |
 | kernel | `Shaders/Private/CSGroundRockShell.usf`（一线程一三角） |
 | 主机 | `Public/CSGroundRockShell.h` / `Private/CSGroundRockShell.cpp` |
@@ -447,7 +501,7 @@ _761 = _718 + (_748 * mix(-0.3, 0.1 * mix(0, 3, rand(cell)), cell_bby)) * rockMa
 
 ⚠️ **两个同名文件的坑**：`assets/meshes/terrain_rocks.json` 是 ±430 m 的**背景岩石**
 （10,732 顶点、只有 Position/Normal/Color/UV、零 cell 属性），已经被导进
-`Content/TinyGlade/Meshes/terrain_rocks/`；本节讲的是 `assets/data/rocky_terrain.json`。
+`Content/HouseTest/TinyGladeAsset/Meshes/terrain_rocks/`；本节讲的是 `assets/data/rocky_terrain.json`。
 `MESH_GENERATION_ANALYSIS.md` §7.2 把后者的属性挂在了前者的文件名下，**文件名记错了**，照它去找会拿到错的那份。
 
 ### 两座隆起交汇处：没有"融合"这一步
@@ -585,7 +639,9 @@ Houdini 是 Y-up、UE 是 Z-up，石阶盒的三轴按下表对应，**长度轴
 | 裙边噪声 | `dist −= \|turb·(1−dist)\|` | `SkirtNoiseAmount`（默认 0.5），加在 `max` 之前 | 已落地；闭式环半径随之只作数值求交的初值 |
 | 二次抬升 | `pow(dist/max, 1.5)·max·0.021` | `SecondaryLiftScale`（默认 0.021） | 已落地；台顶因此是 `LiftHeight × 1.021` |
 | 噪声实现 | Houdini `turbnoise` | 自写整数哈希 value noise + 3 倍频 fbm | 换实现，为的是 CPU/GPU 逐位可复刻 |
-| 坡面碎石 | Voronoi 15 节点链（cook 时） | 无 | **缺失**；方案改走 TG 式披挂岩壳，见计划 D9 |
+| 坡面碎石 | Voronoi 15 节点链（cook 时） | TG 式披挂岩壳（`CSGroundRockShell.usf`） | 已落地；原型那条链整体作废，改抄 TG 的运行时披挂 |
+| 壳的体积 | — | 基准偏移 `mix(−BaseSink, +BaseLift, Rock−Road)` + 起伏幅度 ∝ 坡度 | 已落地（2026-08-31），逐项对位 TG `displace:563` / `:721` |
+| 壳的岩石度输入 | — | 只有坡度那一路（TG `rocky_terrain.x` 的对位物） | **缺失** `rocky_terrain.y/.z`（笔画自带的岩石度）与全部水体项 |
 | 碎石归属 | — | — | 由塑形物翻给**地面**（推翻计划 D9 :504 的岩石那一半） |
 | 等高线求解 | 线性锥近似 + `ray` 投影 | `smoothstep` 闭式反函数 | 即将换成 GPU marching squares |
 | 石阶尺寸 | 单一 `Step` 盒等距 | palette + `SolveBlockLayout` 变长铺装 | 即将回退成单一网格 + 逐实例哈希（同 TG） |

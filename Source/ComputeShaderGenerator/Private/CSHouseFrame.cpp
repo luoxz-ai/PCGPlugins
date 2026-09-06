@@ -16,7 +16,7 @@ namespace
 constexpr int32 CSHouseFrame_GroupSize = 64;
 
 /** 逐路常量占几个 float4。**与 `CSHouseFrame.usf` 的 `FRAME_PATH_STRIDE` 必须一致。** */
-constexpr int32 CSHouseFrame_PathStride = 6;
+constexpr int32 CSHouseFrame_PathStride = 7;
 
 /** Row4.x 的位。与 kernel 里那几个 `FRAME_FLAG_*` 逐字对应。 */
 constexpr uint32 CSHouseFrame_FlagLeftJamb = 1u << 0;
@@ -85,7 +85,11 @@ void CSHouseFrame_Flatten(const TArray<CSHouseFrame::FElement>& In, TArray<FVect
 			*reinterpret_cast<const float*>(&E.BrickCount),
 			E.Pitch));
 		Out.Add(FVector4f(E.HalfLen, E.LayoutScale,
-			*reinterpret_cast<const float*>(&E.RandomBase), 0.0f));
+			*reinterpret_cast<const float*>(&E.RandomBase), E.CrossScale));
+		// [6] 剔除高度（世界 Z，≤ 0 = 不剔）| 首块砖剪切 | 末块砖剪切 | 保留。
+		// 单开一行而不是挤进上面某一格：六行里没有一格是空的，而这份 stride 只有本文件与
+		// `CSHouseFrame.usf` 两个消费者。
+		Out.Add(FVector4f(E.CullBelowZ, E.ShearAtS0, E.ShearAtS1, 0.0f));
 	}
 }
 }
@@ -218,12 +222,45 @@ int32 BuildEdgeElements(const FWallFrame& Frame, TArrayView<const FCSWallOpening
 		Cursor += Count;
 	};
 
+	// 一块横截面放大的**单砖**（柱头 / 柱础）：不走 `SolveRun`，一块砖恰好铺满 [Z0, Z1]。
+	auto EmitSlab = [&](float S, float Z0, float Z1)
+	{
+		const float H = Z1 - Z0;
+		if (H <= UE_KINDA_SMALL_NUMBER || Cursor >= MaxBricks) return;
+		FElement Element;
+		Element.Path.BaseZ = Z0;
+		Element.Path.TopZ = Z1;
+		Element.Path.LeftS = Element.Path.RightS = Element.Path.CenterS = S;
+		Element.Path.MidKind = EMidKind::None;
+		Element.Path.bLeftJamb = true;
+		Element.Frame = Frame;
+		Element.BrickBegin = Cursor;
+		Element.BrickCount = 1;
+		Element.Pitch = 0.0f;
+		Element.HalfLen = H * 0.5f;
+		Element.LayoutScale = H / Length;
+		Element.RandomBase = uint32(Cursor);
+		Element.CrossScale = Params.CapitalScale;
+		InOutElements.Add(Element);
+		++Cursor;
+	};
+
 	for (int32 Index = 0; Index < EdgeOpenings.Num(); ++Index)
 	{
 		const FCSWallOpening& Opening = EdgeOpenings[Index];
 
+		// **窗不出框砖**（2026-09-06 用户裁决「附属物自己持有 mesh」的直接后果）：窗的洞缘由
+		// 附属物自带的预制框盖住（`ACSWindowMarker::OpeningMesh`），房子再沿洞缘砌一圈就是
+		// **双份几何** —— TG 那边窗洞周围同样一条砖路都没有（卷二 §1.2：洞缘靠预制框兜底）。
+		//
+		// ⚠️ 只掐**产线**这一路，`MakeOpeningPath` 本身一个字不动：它的第四段（窗台底边）是
+		// 2026-08-30 特意补回来的，头文件里写着"别再把它删掉"，而单测 `House.FrameWindowSill`
+		// 直接调它、继续覆盖着那段逻辑。将来窗要改回房子出砖，掀掉这一行就行。
+		//
+		// ⚠️ 代价（已知并接受）：属性面板 `Windows` 那份没有标记、没有网格 ⇒ 从此是**裸洞**。
+		// 那条路在文档里一直写着是"授权 / 测试用的便利入口"，真正的来源是标记。
 		FPath Path;
-		if (MakeOpeningPath(Opening, Path))
+		if (Opening.Type != ECSOpeningType::Window && MakeOpeningPath(Opening, Path))
 		{
 			// 墩侧不出门樘：那一截由墩自己那条砖路砌，两拱各铺各的正是竖缝的成因（见头文件）。
 			if (Opening.StyleFlags & CSHouse_StylePierBefore) Path.bLeftJamb = false;
@@ -237,7 +274,26 @@ int32 BuildEdgeElements(const FWallFrame& Frame, TArrayView<const FCSWallOpening
 			&& (EdgeOpenings[Index + 1].StyleFlags & CSHouse_StylePierBefore))
 		{
 			FPath Pier;
-			if (MakePierPath(Opening, EdgeOpenings[Index + 1], Pier)) Emit(Pier);
+			if (MakePierPath(Opening, EdgeOpenings[Index + 1], Pier))
+			{
+				// 小石柱（2026-09-04，实拍 `tiny-glade-ref-twin-arch-pier.jpg`）：柱础 + 柱身 + 柱头。
+				// 柱头/柱础是横截面放大的**单砖**，柱身仍是原来那条均匀砖路，三段同一个 S。
+				// 柱头高度夹在墩高的 40% 内 —— 墩很矮时（起拱线压得很低）两块帽子不能把柱身挤没。
+				const float Cap = FMath::Clamp(Params.CapitalHeight, 0.0f, Pier.JambLen() * 0.4f);
+				if (Cap > UE_KINDA_SMALL_NUMBER && Params.CapitalScale > 1.0f)
+				{
+					EmitSlab(Pier.CenterS, Pier.BaseZ, Pier.BaseZ + Cap);
+					FPath Shaft = Pier;
+					Shaft.BaseZ += Cap;
+					Shaft.TopZ -= Cap;
+					Emit(Shaft);
+					EmitSlab(Pier.CenterS, Pier.TopZ - Cap, Pier.TopZ);
+				}
+				else
+				{
+					Emit(Pier);
+				}
+			}
 		}
 	}
 

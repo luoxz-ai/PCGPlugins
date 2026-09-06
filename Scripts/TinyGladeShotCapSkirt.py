@@ -38,7 +38,7 @@ import unreal
 TAG = os.environ.get("TG_SHOT_TAG", "v1")
 PKG = "/PCGPlugins/HouseTest"
 OUT_DIR = unreal.Paths.project_saved_dir() + "TinyGladeShots"
-SHELL_MI = "/Game/TinyGlade/MaterialInstances/MI_rocky_terrain"
+SHELL_MI = "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_rocky_terrain"
 PARAM = "RockShellCapSkirt"
 
 W, H = 1600, 900

@@ -47,6 +47,15 @@ constexpr float CSRockShellTest_Radius = 600.0f;
 constexpr float CSRockShellTest_Falloff = 800.0f;
 constexpr float CSRockShellTest_Lift = 700.0f;
 
+/**
+ * 本档土台的最大坡度，= `Lift × 1.5 / Falloff`（剖面是 smoothstep，最大斜率 1.5）。
+ *
+ * **容差里必须有它**：表面起伏的幅度自 2026-08-31 起是「坡度 = 1 时的满幅」而不是常幅
+ * （照 TG `displace:721`），所以壳自身厚度里那一项是 `NoiseAmount × 本值`，不是 `NoiseAmount`。
+ * 上面那三个常数动了，这个数跟着动 —— 别把它写成字面量。
+ */
+constexpr double CSRockShellTest_MaxSlope = double(CSRockShellTest_Lift) * 1.5 / double(CSRockShellTest_Falloff);
+
 ACSGroundActor* CSRockShellTest_SpawnGround(UWorld* World, UMaterialInterface* ShellMaterial)
 {
 	ACSGroundActor* Ground = World->SpawnActor<ACSGroundActor>(FVector::ZeroVector, FRotator::ZeroRotator);
@@ -59,6 +68,15 @@ ACSGroundActor* CSRockShellTest_SpawnGround(UWorld* World, UMaterialInterface* S
 	Ground->StairMesh = nullptr;
 	Ground->bRockShell = true;
 	Ground->RockShellMaterial = ShellMaterial;
+	// 图案资产：C++ CDO 刻意留空（只硬编码引擎自带资产，见 ACSGroundActor::RockShellPatternMesh），
+	// 演示关卡由 BP_TinyGladeGround 填。这里从那张蓝图的 CDO 抄一份，测试才与演示关卡吃同一张图案
+	// （2026-09-02 资产迁进 /PCGPlugins/HouseTest 后 C++ 默认值被去掉，四条测试因此空手而归）。
+	// 蓝图不在时保持空，让下面"图案抽得出来"的断言把话说清楚，而不是在这里静默跳过。
+	if (Ground->RockShellPatternMesh.IsNull())
+	{
+		UClass* DemoClass = LoadClass<ACSGroundActor>(nullptr, TEXT("/PCGPlugins/HouseTest/BP_TinyGladeGround.BP_TinyGladeGround_C"));
+		if (DemoClass) Ground->RockShellPatternMesh = GetDefault<ACSGroundActor>(DemoClass)->RockShellPatternMesh;
+	}
 	Ground->RebuildGroundMesh();
 	return Ground;
 }
@@ -103,14 +121,9 @@ bool CSRockShellTest_TriangleAlive(const TArray<FVector>& Positions, int32 Tri)
 	return Positions.IsValidIndex(Base + 2) && !Positions[Base].ContainsNaN();
 }
 
-/** 材质：优先 TG 自己那张岩壁贴图，退回引擎基础材质 —— 判据是"非空"，不是"哪一张"。 */
+/** 材质：引擎基础材质 —— 判据是"非空"，不是"哪一张"，所以不碰项目资产。 */
 UMaterialInterface* CSRockShellTest_LoadShellMaterial()
 {
-	if (UMaterialInterface* Mat = LoadObject<UMaterialInterface>(
-		nullptr, TEXT("/Game/TinyGlade/MaterialInstances/MI_rocky_terrain.MI_rocky_terrain")))
-	{
-		return Mat;
-	}
 	return LoadObject<UMaterialInterface>(nullptr, TEXT("/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial"));
 }
 }
@@ -131,9 +144,9 @@ bool FCSRockShellContractTest::RunTest(const FString&)
 	// **岩壳默认是开的，而且开关不是"材质为空"** —— 这一条直接来自石阶那个坑：
 	// 拿资产是否为空兼任开关，就会在演示关卡里一直是空的而所有断言照绿。
 	TestTrue(TEXT("岩壳默认开着"), CDO->bRockShell);
-	TestFalse(TEXT("图案资产的默认值不是空（不能靠别人去填）"), CDO->RockShellPatternMesh.IsNull());
-	TestEqual(TEXT("图案资产的默认路径就是导入脚本的落点"),
-		CDO->RockShellPatternMesh.ToSoftObjectPath().ToString(), FString(CSRockShell::DefaultPatternAssetPath));
+	// 图案资产的默认值**是空的**：C++ 只硬编码引擎自带资产，这张图案网格由
+	// `/PCGPlugins/HouseTest/BP_TinyGladeGround` 填。CDO 上因此无路径可断言，
+	// 「演示关卡里到底填没填」改由 `TinyGladeDemoRegression.py` 在关卡上验。
 
 	// 坡度软阈：Hi 必须严格大于 Lo，否则 smoothstep 是 0/0 ⇒ 整片 mask 变 NaN ⇒
 	// NaN 顺着 Relief 写进位置，症状是"壳整个消失"，而且看起来跟坡度判据毫无关系。
@@ -148,7 +161,10 @@ bool FCSRockShellContractTest::RunTest(const FString&)
 		ShellFullySunkAt < CDO->StairRoadThreshold);
 
 	// 下沉量必须盖得住壳自身的起伏，否则路面上还会露出石头尖。
-	const float OwnRelief = CDO->RockShellCellRelief + CDO->RockShellNoiseAmount;
+	// 三项：沿法线的厚度 + 表面起伏（`NoiseAmount` 是**坡度 = 1 时**的满幅，这里按 1 估）
+	// + 基准偏移把壳浮起来的那一截（`BaseLift`，路上会翻成 −BaseSink，所以只算 Lift 一边）。
+	const float OwnRelief = CDO->RockShellCellRelief + CDO->RockShellNoiseAmount
+		+ CDO->RockShellChipAmount + CDO->RockShellBaseLift;
 	TestTrue(
 		FString::Printf(TEXT("下沉量 %.0f cm 盖得住壳自身起伏 %.0f cm"), CDO->RockShellRoadSink, OwnRelief),
 		CDO->RockShellRoadSink > OwnRelief);
@@ -202,6 +218,37 @@ bool FCSRockShellDrapeTest::RunTest(const FString&)
 
 	ACSGroundShaperActor* Mound = CSRockShellTest_SpawnMound(World, CSRockShellTest_Centre, CSRockShellTest_Centre);
 	if (!TestNotNull(TEXT("Shaper mound"), Mound)) return false;
+
+	// ⚠️ **披挂契约要在「隆起中性」下量**（2026-08-31 用户规格上线后加的这一段）。
+	// 「石头隆起」那一组（RiseMultiplier / RiseExtend / CellExpand）是**有意**把壳抬离地面的，
+	// 与本用例要钉的「壳贴着坡面、偏差只等于壳自身厚度」正好相反 —— 两件事必须分开测，
+	// 否则只能靠不停放宽容差来续命，而那等于把这条验收删掉。
+	// 隆起本身在下面单独断言，量的是"抬起来了多少"，不是"贴得多紧"。
+	const float SavedRiseMultiplier = Ground->RockShellRiseMultiplier;
+	const float SavedRiseExtend = Ground->RockShellRiseExtend;
+	const float SavedRiseNoise = Ground->RockShellRiseNoiseAmount;
+	const float SavedCellExpand = Ground->RockShellCellExpand;
+	const float SavedPatternScale = Ground->RockShellPatternScale;
+	const float SavedReliefFloor = Ground->RockShellReliefFloor;
+	// 基准偏移（TG `:563`）与「石头隆起」那一组是同一类东西 —— **有意**把壳整体推离坡面，
+	// 所以同样归中性。它自己的判据在下面 ⓒ'' 单独立着。
+	const float SavedBaseLift = Ground->RockShellBaseLift;
+	const float SavedBaseSink = Ground->RockShellBaseSink;
+	Ground->RockShellBaseLift = 0.0f;
+	Ground->RockShellBaseSink = 0.0f;
+	Ground->RockShellRiseMultiplier = 1.0f;
+	Ground->RockShellRiseExtend = 0.0f;
+	Ground->RockShellRiseNoiseAmount = 0.0f;
+	Ground->RockShellCellExpand = 0.0f;
+	// 图案缩放也归中性（原生 1.0）。**理由不是"调到能过"**：下面那条容差里的
+	// 「镜像重建余量」是在原生密度下实测标定的，而它量的是 4000 个采样的**最大值** ——
+	// `PatternScale = 0.35` 让活三角从 1,112 涨到 7,922，同一份重建误差在密得多的点集上
+	// 取最大自然更差（实测 66 → 77.3 cm）。密度是别的用例的事，本条只钉"壳贴着坡面"。
+	Ground->RockShellPatternScale = 1.0f;
+	// 厚度的 mask 下限同样归中性：容差里的 `CellRelief` 那一项是按"厚度被 mask 压着"标定的，
+	// 抬下限等于让更多顶点拿到接近满额的厚度，最大垂直距离随之上去（实测 0.5 ⇒ 83.9 cm）。
+	Ground->RockShellReliefFloor = 0.0f;
+	Ground->RebuildHeightsFromShapers();
 
 	// 披挂 pass 必须真的跑过 —— 否则下面读到的只是分配时那份平的静止姿态，断言绿着却什么都没测
 	// （同 GroundShaper.CpuGpuFieldParity 用 GetGpuDisplaceCount 防假绿的那一手）。
@@ -263,11 +310,154 @@ bool FCSRockShellDrapeTest::RunTest(const FString&)
 	TestEqual(TEXT("平台顶上不长岩壳"), LiveOnPlateau, 0);
 	TestEqual(TEXT("羽化之外的平地上不长岩壳"), LiveOnFlat, 0);
 	// ⓒ 披挂真的贴在坡面上（不是浮在空中，也不是塌进地里）
-	// 容差 = 壳自己的厚度（沿法线的 Relief + 噪声）+ 镜像重建的余量：
+	// 容差 = 壳自己的厚度（沿法线的 Relief + 表面起伏）+ 镜像重建的余量：
 	// SampleHeight 是 50 cm 格上的双线性重建，而 kernel 读的是解析场，曲面在格中间本来就会下垂。
-	const double DrapeTolerance = double(Ground->RockShellCellRelief + Ground->RockShellNoiseAmount) + 30.0;
+	//
+	// ⚠️ 起伏那一项是 `NoiseAmount × 坡度` 而不是 `NoiseAmount`（2026-08-31 起幅度 ∝ 坡度，
+	// 照 TG `displace:721`）。写成常数会低估上界，本条就会在陡坡上莫名其妙地红。
+	const double DrapeTolerance =
+		double(Ground->RockShellCellRelief)
+		+ double(Ground->RockShellNoiseAmount) * CSRockShellTest_MaxSlope
+		+ double(Ground->RockShellChipAmount)
+		+ 30.0;
 	TestTrue(FString::Printf(TEXT("披挂贴住解析坡面（到面垂直距离 %.1f cm ≤ %.1f）"), WorstDrapeError, DrapeTolerance),
 		DrapeSamples > 0 && WorstDrapeError <= DrapeTolerance);
+
+	// ⓒ' 「石头隆起」（用户规格 ③）：把倍数打开，同一批裙边顶点必须**整体抬高**。
+	//
+	// 量的是同一组采样在两种配置下的 Z 均值之差，而不是绝对高度 —— 绝对值受壳厚、噪声、
+	// 逐胞腔浮高影响，差值把它们全消掉，剩下的只有隆起本身。
+	// 倍数写死 2.0 而不是读属性：读属性的话，谁把默认值调回 1.0 这条就变成恒真的空判据。
+	double SumFlat = 0.0;
+	int32 NumFlat = 0;
+	for (int32 Tri = 0; Tri < Triangles; ++Tri)
+	{
+		if (!CSRockShellTest_TriangleAlive(Positions, Tri)) continue;
+		const FVector& P = Positions[Tri * 3];
+		const double R = FVector2D::Distance(FVector2D(P.X, P.Y), Centre);
+		if (R > CSRockShellTest_Radius && R < CSRockShellTest_Radius + CSRockShellTest_Falloff)
+		{
+			SumFlat += double(P.Z);
+			++NumFlat;
+		}
+	}
+
+	Ground->RockShellRiseMultiplier = 2.0f;
+	Ground->RebuildHeightsFromShapers();
+	TArray<FVector> Raised;
+	Ground->DebugReadRockShellSync(Raised);
+
+	double SumRaised = 0.0;
+	int32 NumRaised = 0;
+	for (int32 Tri = 0; Tri < Triangles; ++Tri)
+	{
+		if (!CSRockShellTest_TriangleAlive(Raised, Tri)) continue;
+		const FVector& P = Raised[Tri * 3];
+		const double R = FVector2D::Distance(FVector2D(P.X, P.Y), Centre);
+		if (R > CSRockShellTest_Radius && R < CSRockShellTest_Radius + CSRockShellTest_Falloff)
+		{
+			SumRaised += double(P.Z);
+			++NumRaised;
+		}
+	}
+
+	const double MeanFlat = NumFlat > 0 ? SumFlat / double(NumFlat) : 0.0;
+	if (NumFlat > 0 && NumRaised > 0)
+	{
+		const double MeanRaised = SumRaised / double(NumRaised);
+		AddInfo(FString::Printf(TEXT("隆起：倍数 1.0 时裙边均高 %.1f cm（%d 点），倍数 2.0 时 %.1f cm（%d 点）"),
+			MeanFlat, NumFlat, MeanRaised, NumRaised));
+		// 裙边的场高在 0..台高 之间，倍数从 1 到 2 至少要抬起几十 cm 才算真起作用。
+		TestTrue(FString::Printf(TEXT("隆起倍数把壳抬起来了（+%.1f cm）"), MeanRaised - MeanFlat),
+			MeanRaised - MeanFlat > 20.0);
+	}
+	else
+	{
+		TestTrue(TEXT("两种配置下裙边都有采样点（否则上面那条是空判据）"), false);
+	}
+
+	// ⓒ'' TG `:563` 的**基准偏移**：把 `BaseLift` 打开，同一批裙边顶点同样必须整体抬高。
+	//
+	// 与 ⓒ' 是两条独立的体积来源，必须分开测：③ 的倍数按**台高**放大（缓坡小土台上几乎给不出
+	// 体积），本项是**有界常量**（多高的台子都只浮这么多）。只测其中一条的话，另一条被误删了
+	// 也不会有人发现 —— 而"壳看着没有体积"正是这两条都缺时的症状。
+	//
+	// 倍数先归回 1.0，否则量到的是隆起而不是基准偏移。`BaseLift` 写死 100 而不是读属性，
+	// 同 ⓒ' 的理由：读属性的话，谁把默认调成 0 这条就变成恒真的空判据。
+	Ground->RockShellRiseMultiplier = 1.0f;
+	Ground->RockShellBaseLift = 100.0f;
+	Ground->RebuildHeightsFromShapers();
+	TArray<FVector> Lifted;
+	Ground->DebugReadRockShellSync(Lifted);
+
+	double SumLifted = 0.0;
+	int32 NumLifted = 0;
+	for (int32 Tri = 0; Tri < Triangles; ++Tri)
+	{
+		if (!CSRockShellTest_TriangleAlive(Lifted, Tri)) continue;
+		const FVector& P = Lifted[Tri * 3];
+		const double R = FVector2D::Distance(FVector2D(P.X, P.Y), Centre);
+		if (R > CSRockShellTest_Radius && R < CSRockShellTest_Radius + CSRockShellTest_Falloff)
+		{
+			SumLifted += double(P.Z);
+			++NumLifted;
+		}
+	}
+
+	if (NumFlat > 0 && NumLifted > 0)
+	{
+		const double MeanLifted = SumLifted / double(NumLifted);
+		AddInfo(FString::Printf(TEXT("基准偏移：BaseLift 0 时裙边均高 %.1f cm（%d 点），100 cm 时 %.1f cm（%d 点）"),
+			MeanFlat, NumFlat, MeanLifted, NumLifted));
+		// 偏移按 `saturate(Rock − Road)` 淡入，裙边上 Rock 大多在 0.1~0.5 ⇒ 100 cm 到不了满额。
+		// 20 cm 是"这一层真的接上了"的下界，不是它的标称值。
+		TestTrue(FString::Printf(TEXT("基准偏移把壳浮起来了（+%.1f cm）"), MeanLifted - MeanFlat),
+			MeanLifted - MeanFlat > 20.0);
+	}
+	else
+	{
+		TestTrue(TEXT("BaseLift 打开后裙边仍有采样点（否则上面那条是空判据）"), false);
+	}
+
+	Ground->RockShellBaseLift = SavedBaseLift;
+	Ground->RockShellBaseSink = SavedBaseSink;
+	Ground->RockShellRiseMultiplier = SavedRiseMultiplier;
+	Ground->RockShellRiseExtend = SavedRiseExtend;
+	Ground->RockShellRiseNoiseAmount = SavedRiseNoise;
+	Ground->RockShellCellExpand = SavedCellExpand;
+	Ground->RockShellPatternScale = SavedPatternScale;
+	Ground->RockShellReliefFloor = SavedReliefFloor;
+	Ground->RebuildHeightsFromShapers();
+
+	// ⓒ''' **反火山口：默认档下壳的绝对形态必须是 TG 的**（2026-08-31 看图裁决后补的断言）。
+	//
+	// 这条缺口正是"顶圈高出台顶 2 m、读成一圈独立石墙"那个缺陷逃过全部断言的原因：
+	// ⓒ 的披挂契约在**中性档**量、ⓒ' 只量倍数的**差值** —— 默认档的绝对高度从来没人量过。
+	// TG 的壳从不离开地形（全部位移有界），所以判据是：恢复默认之后，**没有任何活顶点
+	// 高过台顶 + 有界预算**。预算按属性现算，谁把默认调回"无界抬升"这里立刻红。
+	{
+		TArray<FVector> Defaults;
+		Ground->DebugReadRockShellSync(Defaults);
+		const double PlateauZ = Ground->SampleHeight(FVector2D(CSRockShellTest_Centre, CSRockShellTest_Centre));
+		double WorstAbovePlateau = -TNumericLimits<double>::Max();
+		int32 DefaultLive = 0;
+		for (int32 Tri = 0; Tri < Triangles; ++Tri)
+		{
+			if (!CSRockShellTest_TriangleAlive(Defaults, Tri)) continue;
+			++DefaultLive;
+			WorstAbovePlateau = FMath::Max(WorstAbovePlateau, double(Defaults[Tri * 3].Z) - PlateauZ);
+		}
+		// 预算 = 基准浮起 + 顶圈浮高 + 表面起伏满幅（∝ 坡度）+ 40 cm 余量（镜像重建 + 半径淡入）。
+		const double CrownBudget =
+			double(Ground->RockShellBaseLift) + double(Ground->RockShellCellRelief)
+			+ double(Ground->RockShellNoiseAmount) * CSRockShellTest_MaxSlope
+			+ double(Ground->RockShellChipAmount) + 40.0;
+		AddInfo(FString::Printf(TEXT("默认档：活三角 %d，最高点相对台顶 %+.1f cm（预算 %.1f）"),
+			DefaultLive, WorstAbovePlateau, CrownBudget));
+		TestTrue(FString::Printf(TEXT("默认档下没有石墙冠：最高点 ≤ 台顶 + %.0f cm（实测 %+.1f）"),
+			CrownBudget, WorstAbovePlateau),
+			DefaultLive > 100 && WorstAbovePlateau <= CrownBudget);
+	}
 
 	// ⓓ 删掉塑形物 ⇒ 高度场塌回 ⇒ 坡度降到阈下 ⇒ 那批胞腔自己写 NaN。
 	// **裁决二的执行面**：没有一行注销代码，归属簿记整个消失。
@@ -382,8 +572,16 @@ bool FCSRockShellRoadSinkTest::RunTest(const FString&)
 	TestTrue(FString::Printf(TEXT("路下的壳沉下去了（平均 %.1f cm）"), MeanSink), MeanSink < -40.0);
 	TestTrue(FString::Printf(TEXT("最深处沉了大半个 RoadSink（%.1f cm / %.0f cm）"), DeepestSink, Ground->RockShellRoadSink),
 		DeepestSink < -0.5 * double(Ground->RockShellRoadSink));
-	// 沉降不许超过物理上限：RoadSink + 壳自身厚度 + 噪声。超了说明公式里多叠了一项。
-	const double SinkLimit = double(Ground->RockShellRoadSink + Ground->RockShellCellRelief + Ground->RockShellNoiseAmount) + 5.0;
+	// 沉降不许超过物理上限。四项：`RoadSink` 本身，加上画路会**撤掉**的那些正向量 ——
+	// 沿法线的厚度、表面起伏（幅度 ∝ 坡度）、以及基准偏移从 +BaseLift 翻到 −BaseSink 的整段落差。
+	// 超了说明公式里多叠了一项。
+	const double SinkLimit =
+		double(Ground->RockShellRoadSink)
+		+ double(Ground->RockShellCellRelief)
+		+ double(Ground->RockShellNoiseAmount) * CSRockShellTest_MaxSlope
+		+ double(Ground->RockShellChipAmount)
+		+ double(Ground->RockShellBaseLift + Ground->RockShellBaseSink)
+		+ 5.0;
 	TestTrue(FString::Printf(TEXT("下沉量不超过 RoadSink + 自身厚度（%.1f cm ≤ %.1f）"), -DeepestSink, SinkLimit),
 		-DeepestSink <= SinkLimit);
 

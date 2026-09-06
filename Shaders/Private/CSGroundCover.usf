@@ -1,0 +1,259 @@
+// 地被（草 + 花）：100% GPU 散布 + 零回读，形状照 Tiny Glade 的 `_generate_grass.cs` +
+// `_grass.raster` 那条链（见 Docs/TinyGlade 的对照）。
+//
+// **一线程 = 一株**。散布格是"抖动网格"（stratified / jittered grid）：一格出一株，落点是
+// 格心加一个由**格身份**哈希出来的抖动。这与 TG 用低差异序列在 tile 内撒点是同一件事的
+// 简化版 —— 两者要的都是同一条性质：**均匀但不成簇**。纯随机撒点会自发扎堆并留下空洞，
+// 抖动网格从构造上就杜绝了这两样，而且不需要前缀和/bundle 那一整套（TG 需要它是因为它
+// 每帧重算并要做 tile 级 HZB 剔除，本项目是"地面变了才重扫"，剔除交给实例组件自己的 pass）。
+//
+// ⚠️ **随机源永远是格身份，绝不是 `InterlockedAdd` 的槽位**（石阶 S1 栽过的那一枪，
+// `CSGroundStairs.usf:CSStairs_CellSeed` 的注释里有完整现场）：槽位由线程组完成顺序决定，
+// 同一份世界状态两次 dispatch 能把同一株草放进不同的槽。而本 pass 是**每一笔落笔都重扫**的
+// （FlushPaintToGpu → RebuildGroundCover），拿槽位当种子的症状就是"画一笔路，整片草原地重掷"，
+// 而且不会有任何断言报红。格身份则只在"这一格还长不长草"真的变化时才变。
+//
+// 同一个 kernel 被**每个物种各 dispatch 一次**（草一次，每种花各一次），物种之间只差
+// uniform：格距（= 密度）、抽签概率、遮罩阈值、缩放范围、盐。不为花另写一个 kernel 的理由与
+// 石子跟着石阶走同一份代码相同 —— 分两份的话，将来只有一份会跟着 packed 行布局改，
+// 而漂掉的那份不报错、只是安静地画出垃圾。
+//
+// packed 行布局照抄 CSGpuInstancedMesh.usf（那份才是权威，石阶/门框砖/裙边摆件都用它）：
+//   前三行 = 被缩放过的基，第 4 行 = 原点 + 每实例随机数，第 5 行 = 剔除球。
+// 基的约定：+Z 是株的"上"（受 CoverAlignToNormal 控制在世界上 ↔ 地形法线之间插值），
+// +X/+Y 是水平的两轴，绕 +Z 的偏航由格身份哈希给。
+
+#include "/Engine/Public/Platform.ush"
+#include "/Plugin/PCGPlugins/Shaders/Private/CSGroundShaperField.ush"
+
+#ifndef THREADGROUPSIZE_X
+#define THREADGROUPSIZE_X 8
+#endif
+#ifndef THREADGROUPSIZE_Y
+#define THREADGROUPSIZE_Y 8
+#endif
+
+// `Platform.ush` 里**没有** `PI`（那是 `Common.ush` 的，而 Common.ush 不能在 global shader
+// 里随便 include）。自己写一个常数比 include 一堆渲染管线头文件便宜得多。
+#define CSCOVER_TWO_PI 6.28318530717958647692f
+
+Buffer<uint> CoverGroundColors;      // 地面常驻色流，packed BGRA / 顶点，V = Y * VertsX + X
+
+RWBuffer<float4> RWCoverInstances;   // 5 个 float4 / 实例
+RWBuffer<uint>   RWCoverCounter;     // [0] = 活跃实例数（只有 GPU 知道这个数）
+
+float4x4 CoverWorldToComponent;
+
+float2 CoverGridOriginXY;            // 散布格 (0,0) 角的世界 XY
+float  CoverCellSize;                // 格边长 = 1/√密度（CPU 侧换算，见 CSGroundCover.cpp）
+uint2  CoverGridDims;                // 散布**格数**
+
+float2 CoverGroundOriginXY;          // 地面镜像格点 (0,0) 的世界 XY —— 取遮罩用
+float  CoverGroundCellSize;
+uint2  CoverGroundVerts;
+float  CoverGroundBaseZ;             // 地面 actor 的世界 Z
+
+// --- 遮罩：地面顶点色的某一个通道 -------------------------------------------
+//
+// 一律读**GPU 色流**而不是让 CPU 上传一份镜像拷贝，理由同石阶：色流就是笔刷双写出来的那一份
+// 权威投影，读它意味着"画面上看到的路"与"这里长不长草"构造上同源。上传一份拷贝是第三条路，
+// 迟早与另外两条错开一帧，而症状（草比路慢一笔）只在快速涂抹时才看得见。
+float4 CoverMaskChannel;             // one-hot，与色流 dot；默认 (1,0,0,0) = R = 道路权重
+float  CoverMaskStart;               // 遮罩值 ≤ Start：完全不受抑制
+float  CoverMaskEnd;                 // 遮罩值 ≥ End：完全长不出来
+float  CoverMaskShorten;             // 遮罩值 → 高度压缩比例（TG 在路上把草高压到 0.3 倍）
+
+float  CoverChance;                  // 一格出一株的概率（草 ≈ 1，花是稀疏支线）
+float  CoverJitter;                  // 落点抖动幅度，格距的比例（0 = 规则网格，1 = 整格）
+float  CoverMinSlopeCos;             // 地形法线 .z 的下限：比这更陡的坡不长（岩壁不长草）
+float  CoverSink;                    // 根部沉入地表的深度（cm）——浮在地表上会读成"掉了个道具"
+// 坐底修正 = −基础网格局部包围盒 Min.Z（**未缩放**，kernel 里乘高度缩放）。
+// ⚠️ 不是可有可无的美化：TG 提取出来的 `lowpoly_flower` 的包围盒**离原点 30 cm 才开始**，
+// 不补这一项，整片花会齐刷刷悬空 30 cm —— 而剔除球、包围盒、实例数全都看不见它。
+// 与石阶那条 `StairRise`（"块底钉在等值线上"）是同一个量、同一个理由。
+float  CoverRise;
+
+float2 CoverScaleRange;              // 均匀缩放 [min, max]
+float  CoverHeightJitter;            // Z 轴额外抖动（±），只改高矮不改粗细
+float  CoverLeanMaxRad;              // 最大倾倒角（绕水平轴），草有、花基本没有
+float  CoverAlignToNormal;           // 0 = 世界上（TG 的草就是世界上），1 = 完全贴地形法线
+
+uint   CoverSeed;                    // 用户种子
+uint   CoverSalt;                    // 物种盐：同一格上草与各种花必须掷出不同的数
+uint   CoverMaxInstances;            // 固定容量。越界静默丢弃 —— 宁可少长一株也不能踩出 buffer
+
+float3 CoverBaseSphereCentre;        // 基础网格局部包围球（未缩放）
+float  CoverBaseSphereRadius;
+
+/** 与 CSGpuInstancedMesh.usf:120-126 / CSGroundStairs.usf 同一份哈希的收尾段（uint → [0,1)）。 */
+float CSCover_Hash01(uint H)
+{
+	H = ((H >> ((H >> 28) + 4u)) ^ H) * 277803737u;
+	return float((H >> 22 ^ H) & 0xFFFFFFu) / float(0x1000000u);
+}
+
+/**
+ * 随机源：**格身份**（格坐标 + 物种盐 + 通道盐 + 用户种子）。见文件头那条 ⚠️。
+ *
+ * 物种盐（`CoverSalt`）不可省：草与花跑的是同一个格、同一份 kernel，盐相同的话
+ * "这一格出不出花"与"这一格出不出草"会完全相关 —— 每一朵花的位置上必定也有一株草，
+ * 花因此永远长在草心里，看起来像穿模而不是像野花。
+ */
+uint CSCover_CellSeed(uint2 Cell, uint Channel)
+{
+	uint H = Cell.x * 0x9E3779B1u;
+	H ^= Cell.y * 0x85EBCA77u;
+	H ^= Channel * 0x27D4EB2Fu;
+	H ^= CoverSalt * 0xC2B2AE3Du;
+	H ^= CoverSeed * 0x9E3779B9u;
+	return H;
+}
+
+/** 色流是 packed BGRA（同 CSMeshOps.usf 的 PackColorBGRA）：B=0..7, G=8..15, R=16..23, A=24..31。 */
+float4 CSCover_ReadColor(uint X, uint Y)
+{
+	const uint Packed = CoverGroundColors[Y * CoverGroundVerts.x + X];
+	return float4(
+		float((Packed >> 16u) & 0xFFu),
+		float((Packed >> 8u) & 0xFFu),
+		float(Packed & 0xFFu),
+		float((Packed >> 24u) & 0xFFu)) / 255.0f;
+}
+
+/**
+ * 与 `ACSGroundActor::SampleColor` 同一口径的双线性采样，出界返回 0。
+ *
+ * 出界取 0 而不是"照 BaseColor 补"：地被的格是按地面矩形铺的，理论上不会出界；真出界时
+ * （浮点边界）取 0 意味着"没有路" ⇒ 照常长草，比凭空冒出一片秃地安全。
+ */
+float CSCover_SampleMask(float2 P)
+{
+	if (CoverGroundVerts.x < 2u || CoverGroundVerts.y < 2u) return 0.0f;
+	const float2 G = (P - CoverGroundOriginXY) / max(CoverGroundCellSize, 1e-3f);
+	if (G.x < 0.0f || G.y < 0.0f || G.x > float(CoverGroundVerts.x - 1u) || G.y > float(CoverGroundVerts.y - 1u)) return 0.0f;
+
+	const uint X0 = min(uint(floor(G.x)), CoverGroundVerts.x - 2u);
+	const uint Y0 = min(uint(floor(G.y)), CoverGroundVerts.y - 2u);
+	const float Fx = saturate(G.x - float(X0));
+	const float Fy = saturate(G.y - float(Y0));
+
+	const float C00 = dot(CSCover_ReadColor(X0, Y0), CoverMaskChannel);
+	const float C10 = dot(CSCover_ReadColor(X0 + 1u, Y0), CoverMaskChannel);
+	const float C01 = dot(CSCover_ReadColor(X0, Y0 + 1u), CoverMaskChannel);
+	const float C11 = dot(CSCover_ReadColor(X0 + 1u, Y0 + 1u), CoverMaskChannel);
+	return lerp(lerp(C00, C10, Fx), lerp(C01, C11, Fx), Fy);
+}
+
+/**
+ * 水平梯度 ∇h，指向上坡。差分跨距取**地面格距**，与石阶 `CSStairs_GradientXY` 和地面位移
+ * pass 的中心差分同形 —— 三处求出来的法线因此互相自洽（换跨距会让"坡度 mask"与"地面看起来
+ * 有多陡"对不上，而两边各自都自洽，最难归因）。
+ */
+float2 CSCover_GradientXY(float2 P)
+{
+	const float D = max(CoverGroundCellSize, 1e-3f);
+	const float Dx = GroundShaperHeightAtXY(P + float2(D, 0.0f)) - GroundShaperHeightAtXY(P - float2(D, 0.0f));
+	const float Dy = GroundShaperHeightAtXY(P + float2(0.0f, D)) - GroundShaperHeightAtXY(P - float2(0.0f, D));
+	return float2(Dx, Dy) / (2.0f * D);
+}
+
+[numthreads(THREADGROUPSIZE_X, THREADGROUPSIZE_Y, 1)]
+void ScatterGroundCoverCS(uint3 Id : SV_DispatchThreadID)
+{
+	if (Id.x >= CoverGridDims.x || Id.y >= CoverGridDims.y) return;
+
+	const uint2 Cell = Id.xy;
+
+	// 1) 稀疏抽签。**排在最前面**：花的概率可以低到 1%，先抽签能让 99% 的线程在读任何
+	//    buffer / 求任何场之前就退掉。草的概率是 1，这一句被编译成恒真，不花钱。
+	if (CSCover_Hash01(CSCover_CellSeed(Cell, 3u)) >= CoverChance) return;
+
+	// 2) 落点 = 格心 + 抖动。抖动幅度按格距归一，所以调密度不用重调抖动。
+	const float2 CellBase = CoverGridOriginXY + float2(Cell) * CoverCellSize;
+	const float Jx = CSCover_Hash01(CSCover_CellSeed(Cell, 11u)) - 0.5f;
+	const float Jy = CSCover_Hash01(CSCover_CellSeed(Cell, 13u)) - 0.5f;
+	const float2 P = CellBase + (0.5f + CoverJitter * Jx) * float2(CoverCellSize, 0.0f)
+	                          + (0.5f + CoverJitter * Jy) * float2(0.0f, CoverCellSize);
+
+	// 3) 遮罩门控。**用概率拒绝而不是硬阈值**：硬阈值会沿等值线切出一条肉眼可见的直边，
+	//    而草的边界在自然界里是"越靠近路越稀"。抽签用的是格身份，所以边界同样是稳定的
+	//    （重扫不会让边缘那圈草闪烁）。
+	const float Mask = CSCover_SampleMask(P);
+	const float Reject = smoothstep(CoverMaskStart, CoverMaskEnd, Mask);
+	if (CSCover_Hash01(CSCover_CellSeed(Cell, 17u)) < Reject) return;
+
+	// 4) 坡度门控：岩壁不长草（TG 用 `rocky_terrain` mask 做同一件事，本项目的岩壳 mask
+	//    本来就由坡度决定，所以这里直接判坡度 = 与岩壳同源，不需要再引一张贴图）。
+	const float2 Grad = CSCover_GradientXY(P);
+	const float3 Normal = normalize(float3(-Grad, 1.0f));
+	if (Normal.z < CoverMinSlopeCos) return;
+
+	// 5) 姿态。+Z 在世界上与地形法线之间插值：TG 的草是**世界上**（`_grass.raster` 的基
+	//    第二列写死 `vec3(0,1,0)`），贴坡的是岩壳不是草；但花插在坡上时贴一点法线更自然，
+	//    所以留成参数而不是写死。
+	float3 AxisZ = normalize(lerp(float3(0.0f, 0.0f, 1.0f), Normal, saturate(CoverAlignToNormal)));
+
+	// 偏航：整圈随机。草叶是片状的，没有偏航的话整片草会朝同一个方向，从某个角度看会集体消失。
+	float SinYaw, CosYaw;
+	sincos(CSCover_Hash01(CSCover_CellSeed(Cell, 23u)) * CSCOVER_TWO_PI, SinYaw, CosYaw);
+	float3 AxisX = float3(CosYaw, SinYaw, 0.0f);
+	// AxisZ 被法线拉歪之后 AxisX 不再与它正交，先投影回切平面再单位化。
+	AxisX = AxisX - AxisZ * dot(AxisX, AxisZ);
+	const float LenX = length(AxisX);
+	AxisX = (LenX > 1e-4f) ? (AxisX / LenX) : normalize(cross(float3(0.0f, 1.0f, 0.0f), AxisZ));
+	float3 AxisY = cross(AxisZ, AxisX);
+
+	// 倾倒：绕 AxisY 转一个随机角，让株不是根根笔直（TG 在 `packed0 >> 16` 里存的
+	// `_1378` 就是这条，VS 里换算成绕 X 的 0..−90° 旋转）。绕 **Y** 而不是绕 X 只是取
+	// "倾倒方向 = AxisX"这一个约定；偏航已经随机，倾倒方向跟着一起随机。
+	if (CoverLeanMaxRad > 1e-5f)
+	{
+		const float Lean = CoverLeanMaxRad * (CSCover_Hash01(CSCover_CellSeed(Cell, 29u)) * 2.0f - 1.0f);
+		float SinL, CosL;
+		sincos(Lean, SinL, CosL);
+		const float3 RotZ = AxisZ * CosL + AxisX * SinL;
+		AxisX = AxisX * CosL - AxisZ * SinL;
+		AxisZ = RotZ;                                   // (X') × (Y) 仍是 (Z')，右手系不破
+	}
+
+	// 6) 缩放。均匀缩放定粗细，Z 再单独抖一次定高矮 —— 两者共用一个哈希的话，"高的那株一定
+	//    也粗"，一片草会读成"几种尺寸的同一株"而不是"长短不齐的一片"。
+	const float Uniform = lerp(CoverScaleRange.x, CoverScaleRange.y, CSCover_Hash01(CSCover_CellSeed(Cell, 31u)));
+	float HeightScale = Uniform * (1.0f + CoverHeightJitter * (CSCover_Hash01(CSCover_CellSeed(Cell, 37u)) * 2.0f - 1.0f));
+	// 遮罩压高：TG 在路上把草高乘 (1 − path × 0.7)，路边因此是"矮草过渡"而不是一刀切。
+	HeightScale *= saturate(1.0f - Mask * CoverMaskShorten);
+	if (HeightScale < 1e-4f) return;                    // 压到看不见就干脆不占槽位
+
+	// 7) 落高。**重新求一次场**而不是复用格角：格距可以比地面格粗，格心的真实地面能差几厘米，
+	//    而一株浮空 3 cm 的草是看得出来的（石子那条踩过同一个坑）。
+	//    坐底修正跟着高度缩放走 —— 抖了 Z 却不抖 Rise，株底就不再钉在地面上（症状是一部分
+	//    浮起来、一部分陷进去，而且只在斜看时看得出，同石阶那条）。
+	const float Z = CoverGroundBaseZ + GroundShaperHeightAtXY(P) + CoverRise * HeightScale - CoverSink;
+
+	// 8) 领槽位；越界静默丢弃（容量一次性定死、永不重算，这是零回读的代价与保证）。
+	uint Slot;
+	InterlockedAdd(RWCoverCounter[0], 1u, Slot);
+	if (Slot >= CoverMaxInstances) return;
+
+	const float3 LocalX = mul(float4(AxisX, 0.0f), CoverWorldToComponent).xyz * Uniform;
+	const float3 LocalY = mul(float4(AxisY, 0.0f), CoverWorldToComponent).xyz * Uniform;
+	const float3 LocalZ = mul(float4(AxisZ, 0.0f), CoverWorldToComponent).xyz * HeightScale;
+	const float3 Origin = mul(float4(P, Z, 1.0f), CoverWorldToComponent).xyz;
+
+	const uint Row = Slot * 5u;
+	RWCoverInstances[Row + 0u] = float4(LocalX, 0.0f);   // .w 必须是 0：引擎拿它做选中/hitproxy
+	RWCoverInstances[Row + 1u] = float4(LocalY, 0.0f);
+	RWCoverInstances[Row + 2u] = float4(LocalZ, 0.0f);
+	// .w 是顶点工厂读的 PerInstanceRandom，材质拿它做逐株色变（TG 的草色也是逐叶的）。
+	// **种子同样必须是格身份**：用槽位的话每一笔落笔全场变色，而这一条不会有任何断言报红。
+	RWCoverInstances[Row + 3u] = float4(Origin, CSCover_Hash01(CSCover_CellSeed(Cell, 41u)));
+
+	const float3 SphereCentre = Origin
+		+ LocalX * CoverBaseSphereCentre.x
+		+ LocalY * CoverBaseSphereCentre.y
+		+ LocalZ * CoverBaseSphereCentre.z;
+	// 剔除球必须包住**变换后**的基础网格：基向量是单位长，按最大轴缩放放大即可。
+	// 少放大一点点就会在视锥边缘闪掉实例，而且只在斜看时出现，最难复现。
+	const float MaxAxisScale = max(Uniform, HeightScale);
+	RWCoverInstances[Row + 4u] = float4(SphereCentre, CoverBaseSphereRadius * max(MaxAxisScale, 1e-3f));
+}

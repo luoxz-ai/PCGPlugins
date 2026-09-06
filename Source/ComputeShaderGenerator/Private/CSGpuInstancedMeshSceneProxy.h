@@ -38,6 +38,13 @@ enum class ECSGpuInstancedAuxSlot : uint8
 	VisibleOrigins = 20,    // Buffer<float4>, 1 per visible slot -> VertexFetch_InstanceOriginBuffer
 	VisibleLightmap = 21,   // Buffer<float4>, 1 per visible slot -> VertexFetch_InstanceLightmapBuffer
 	LodCounters = 22,       // Buffer<uint>,   compaction cursor per LOD
+	/**
+	 * Buffer<float>, CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS per visible slot
+	 * -> FInstancedStaticMeshVertexFactoryUniformShaderParameters::InstanceCustomDataBuffer。
+	 * ⚠️ 格式**必须 PF_R32_FLOAT**：引擎按 `Buffer<float>` 取，照抄邻居那几条的
+	 * float4 视图会读出错位数据，而画面上只是"数值不对"，不报错。
+	 */
+	VisibleCustomData = 23,
 };
 
 /** Appends this leaf's seven aux stream descriptors to OutStreams, sized from Layout.

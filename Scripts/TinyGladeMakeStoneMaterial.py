@@ -28,8 +28,8 @@ PKG = "/PCGPlugins/HouseTest"
 MEL = unreal.MaterialEditingLibrary
 TOOLS = unreal.AssetToolsHelpers.get_asset_tools()
 
-NORMAL_TEX = "/Game/TinyGlade/Textures/stone_floor/stone_floor_normal"
-ROUGH_TEX = "/Game/TinyGlade/Textures/stone_floor/stone_floor_roughness"
+NORMAL_TEX = "/PCGPlugins/HouseTest/TinyGladeAsset/Textures/stone_floor_normal"
+ROUGH_TEX = "/PCGPlugins/HouseTest/TinyGladeAsset/Textures/stone_floor_roughness"
 WORLD_ALIGNED = ("/Engine/Functions/Engine_MaterialFunctions01/Texturing/"
                  "WorldAlignedTexture.WorldAlignedTexture")
 

@@ -1,6 +1,15 @@
 #pragma once
 
 #include "CoreMinimal.h"
+
+// ⚠️ 这三条**显式写出来**，别指望 CoreMinimal 捎带：`TArrayView`（`PackTubePath` 的入参）、
+// `FIntVector4`（`FTubePath::PointMeta` / `SegmentMeta`）、`FVector2f`（`FStrandPoint::WallSZ`）。
+// 本插件是 unity 构建，漏 include 在全量构建里**一声不吭**、只在 Live Coding 或 `-SingleFile`
+// 下炸 —— `CSGpuMeshComponent.cpp` 的 `MD_Surface` 已经栽过一次，那个坑藏了很久。
+#include "Containers/ArrayView.h"
+#include "Math/IntVector.h"
+#include "Math/Vector2D.h"
+
 #include "CSGroundShaperSteps.h"   // FPaletteBuffers / ReserveCapacity / ReleaseOnRenderThread
 
 class UStaticMesh;
@@ -33,26 +42,32 @@ struct FWallStrip
 	FVector Up = FVector::UpVector;         // 世界单位，向上
 	FVector N = FVector::RightVector;       // 世界单位，墙面外法线
 	float Length = 0.0f;
-	float Height = 0.0f;                    // 檐口高（= 墙高）。山墙的三角部分见下面三个字段
+	float Height = 0.0f;                    // 墙顶高（= 墙高）。四坡屋顶下四面墙顶都是平的，藤爬到这条线就停
 	int32 EdgeIndex = 0;                    // 与 FCSWallOpening::EdgeIndex 同一套编号
 
 	/**
-	 * 山墙三角：墙顶在 S 处比 `Height` 高出多少（檐墙三项全 0 ⇒ `TopAt` 恒等于 `Height`）。
+	 * 沿墙**均匀采样**的地面空隙（房底 Z − 该处地面高度，cm），首尾含端点。
 	 *
-	 * ⚠️ **刻意存成三个标量而不是让规划器去问 `FCSRoofDesc`**：`BuildPlan` 是纯函数、单测里
-	 * 没有 actor 也没有屋顶描述；把"墙顶在哪"降成墙自己的一维剖面，屋面方程仍然只有
-	 * `CSHouseRoof.h` 那一份真源（`ACSHouseActor::BuildVineStrips` 负责把它折算成这三个数）。
-	 * 折算成立的前提是**跨度坐标沿 S 线性**——矩形 footprint 上成立；将来 footprint 变成
-	 * 多边形时这三个数要跟着重新推导，别以为它是普适的。
+	 * 用途只有一个：**悬空不长藤**（用户裁决 2026-09-06）。藤是从地里长出来爬上墙的，
+	 * 房子底下悬空的那一段没有土，藤也就无从谈起 —— 这与承重柱恰好互补：柱子在
+	 * `Gap > PillarMinGap` 处**出现**，藤在同一处**消失**。
+	 *
+	 * ⚠️ **空数组 = 不知道，按贴地处理**，不是按悬空处理。判据是纯函数的入参，而单测里
+	 * 的墙没有地面可采 —— 缺省成"悬空"会让既有的十几条几何断言一次全红，而且红得毫无信息。
+	 * 采样点数由调用方定；`ACSHouseActor::BuildVineStrips` 按 `VineGroundSampleSpacing` 取。
 	 */
-	float GableTan = 0.0f;                  // 屋面坡度的 tan：离山尖每远 1 cm，墙顶降低多少
-	float GablePeakS = 0.0f;                // 山尖（脊线）落在这面墙的哪个 S 上
-	float GableHalfSpan = 0.0f;             // 山墙半跨（S 单位）。超出这个范围墙顶就回到 Height
+	TArray<float> GroundGaps;
 
-	/** 墙顶在 S 处的高度。藤爬到这条线就停 —— 它上面是屋面板，不是墙。 */
-	float TopAt(float S) const
+	/** 在弧长 S 处线性插值出空隙。空数组返回 0（= 贴地）。 */
+	float SampleGroundGap(float S) const
 	{
-		return Height + GableTan * FMath::Max(0.0f, GableHalfSpan - FMath::Abs(S - GablePeakS));
+		// 局部名一律避开 N —— 那是本结构的**墙面法线**成员，而 /we4458 把遮蔽当错误。
+		const int32 SampleCount = GroundGaps.Num();
+		if (SampleCount == 0) return 0.0f;
+		if (SampleCount == 1 || Length <= UE_KINDA_SMALL_NUMBER) return GroundGaps[0];
+		const float T = FMath::Clamp(S / Length, 0.0f, 1.0f) * float(SampleCount - 1);
+		const int32 Index = FMath::Clamp(int32(T), 0, SampleCount - 2);
+		return FMath::Lerp(GroundGaps[Index], GroundGaps[Index + 1], T - float(Index));
 	}
 };
 
@@ -87,6 +102,28 @@ struct FParams
 	 * 0 = 完全关掉（回到第一档行为）。
 	 */
 	float JumpChance = 0.5f;
+	/**
+	 * 藤脚允许的最大地面空隙（cm）。超过它那一根就不长 —— 房子整个悬空时四面墙都超阈，
+	 * 于是**一根藤都没有**，正是用户要的行为；只有一角翘起时则只秃那一角。
+	 *
+	 * ⚠️ 取值应当**略大于** `ACSHouseActor::PillarMinGap`（默认 10）：两者共用同一个
+	 * `Gap` 量，取成一样的话会出现"柱子已经冒出来了、藤还在长"或反过来的一线之差，
+	 * 而那条线上的抖动只由地面采样噪声决定，看起来像 bug。
+	 */
+	/**
+	 * 梢部收紧的**辐射长度**（cm）：从梢往回这么长的一段里，管径由主锥度平滑压到
+	 * `TipTaperMin`。用户裁决 2026-09-06："收紧需要辐射一段距离"。
+	 *
+	 * ⚠️ 只压最后一两环的后果是"钝头上插了个小锥子" —— 转折太急，读起来像被截断后
+	 * 又接了一节，而不是长出来的尖。取值与藤总长同量级的 1/5 上下比较自然。
+	 */
+	float TipTaperLength = 60.0f;
+
+	/** 梢尖处相对主锥度的残留比例。**不能取 0** —— 整圈环顶点收到同一点会退化成
+	 *  零面积三角形、法线变 NaN（与材质里 `VineThickenStart` 同一条）。 */
+	float TipTaperMin = 0.06f;
+
+	float MaxGroundGap = 25.0f;
 	int32 Seed = 1;
 };
 
@@ -102,17 +139,101 @@ struct FRecord
 	float Random01 = 0.0f;
 	FVector3f Normal = FVector3f(0.0f, 1.0f, 0.0f);
 	float SizeScale = 1.0f;
+
+	/**
+	 * 生长动画的两个量 → per-instance custom data（2026-09-06 裁决 5）。
+	 * `SpawnTime` = 这根藤首次出现时的 GameTime（秒）；`ArcLength` = 该实例在藤上的弧长（cm）。
+	 *
+	 * ⚠️ **它们不参与几何**，也不该进任何形状哈希 —— `SpawnTime` 只是相位。
+	 * ⚠️ 弧长沿**未细分**的折线累加，而管子的弧长是在细分后的折线上量的，两者差几个百分点。
+	 * 叶子因此可能比枝的前沿早/晚一点点冒出来，用 `VineLeafLag` 补即可，别去追平 ——
+	 * 追平要么把细分搬进 BuildPlan，要么让叶子等管子建完，都不值当。
+	 */
+	float SpawnTime = 0.0f;
+	float ArcLength = 0.0f;
+
+	/**
+	 * 这条记录属于 `FPlan::Strands` 的第几根。**`SpawnTime` 的回填靠它**。
+	 *
+	 * 为什么不把 SpawnTime 做成 `BuildPlan` 的入参：它的键是 `FStrand::RootKey`，
+	 * 而 RootKey 要规划跑完才知道 —— 做成入参就得先跑一遍规划去问，等于每次重求值
+	 * 都白跑一遍纯函数。带上下标，回填只是一趟 O(n) 扫描。
+	 */
+	int32 StrandIndex = INDEX_NONE;
 };
 
-/** 一次规划的产物：三个调色板（0 = 枝、1 = 叶、2 = 花）各自的记录。 */
+/**
+ * 折线上的一个点。**存墙面参数坐标**，不存世界 —— 与 TG 的 `WallCoord` 同构：
+ * 在这个坐标里做的一切（游走、避洞、细分）都天然贴墙，映射到世界是最后一步。
+ */
+struct FStrandPoint
+{
+	FVector2f WallSZ = FVector2f::ZeroVector;   // (沿墙弧长 S, 墙面高度 Z)
+	int32 EdgeIndex = 0;                        // 该点所在的墙。跨墙以后会变，细分要据此断开
+};
+
+/**
+ * 一根藤 = 一条**不分叉**的折线（2026-09-06 裁决 2，与 TG 的 `Ivy`/`VecDeque<IvyPoint>` 同构）。
+ *
+ * 它是枝（管子）的**唯一形状来源**；叶与花仍从 `FRecord` 走实例路，两者由 `RootKey` 关联 ——
+ * 同一根藤的枝与叶必须共用一个 `SpawnTime`，否则生长动画会各长各的。
+ */
+struct FStrand
+{
+	TArray<FStrandPoint> Points;
+
+	/**
+	 * 与 `Points` 等长的**累计世界弧长**（cm），`Arc[0] = 0`。
+	 *
+	 * 它是生长动画的**唯一一把尺**：枝（管子）、叶、花、以及"改了门之后从哪儿接着长"
+	 * 那个变化点，全部以它为单位。管子的顶点虽然经过细分，生长通道也是从这把尺**插值**
+	 * 出来的、而不是重新累加细分后的长度 —— 后者比它长几个百分点，两把尺混用的症状是
+	 * "叶子比枝的前沿早/晚一点点冒出来"，以及续长时接缝对不齐。
+	 */
+	TArray<float> Arc;
+	int32 RootEdgeIndex = 0;   // 起点那面墙。身份哈希用它，跨墙不改（见 IdentityHash 的注释）
+	int32 StrandIndex = 0;     // 这面墙上的第几根
+	uint32 RootKey = 0;        // = IdentityHash(RootEdgeIndex, StrandIndex, -1, 7u, Seed)，SpawnTime 的键
+};
+
+/** 一次规划的产物：三个调色板（0 = 枝、1 = 叶、2 = 花）各自的记录，外加枝的折线。 */
 struct FPlan
 {
+	/**
+	 * ⚠️ **`Branch` 已不是交付物**（2026-09-06 裁决 1）：枝改成扫掠管子，形状由 `Strands` 给。
+	 * 这个数组留着只为两件事 —— 幂等哈希的诚实来源、以及单测里"段数/避洞"那一族断言。
+	 * 别再拿它去填实例。
+	 */
 	TArray<FRecord> Branch;
 	TArray<FRecord> Leaf;
 	TArray<FRecord> Flower;
 
-	bool IsEmpty() const { return Branch.IsEmpty() && Leaf.IsEmpty() && Flower.IsEmpty(); }
-	void Reset() { Branch.Reset(); Leaf.Reset(); Flower.Reset(); }
+	/** 枝的折线，逐根藤。喂给 `PackTubePath`。 */
+	TArray<FStrand> Strands;
+
+	bool IsEmpty() const { return Branch.IsEmpty() && Leaf.IsEmpty() && Flower.IsEmpty() && Strands.IsEmpty(); }
+	void Reset() { Branch.Reset(); Leaf.Reset(); Flower.Reset(); Strands.Reset(); }
+};
+
+/** `PackTubePath` 的产物：vinegenerator 的 **CPU 折线通路**（`bUseGPULines = false`）那四条缓冲，外加生长通道。 */
+struct FTubePath
+{
+	/** xyz = 世界位置，**w = 逐点半径缩放** —— Pass C 的环半径 = `10 * CircleScale * w`。锥度就靠它。 */
+	TArray<FVector4f> Points;
+	/** 逐点轴向覆盖。我们不用，但**必须显式清零**：`BuildRawVoxelVineFrame` 的回退判据是
+	 *  `dot(Axis, Axis) > 1e-8`，池子里的旧内容会让它误以为有轴可用。 */
+	TArray<FVector4f> Axes;
+	/** `int4(prev, next, 线起点下标, 线点数)`。⚠️ **两套口径都在用**：Pass C 读 `.x/.y`，
+	 *  `VineFrameCommon.ush::GetLinePointIndex` 读 `.z/.w`。只填一半的症状是切线在端点处乱。 */
+	TArray<FIntVector4> PointMeta;
+	/** `int4(点A, 点B, 0, 0)`，一段一条。 */
+	TArray<FIntVector4> SegmentMeta;
+	/** 生长动画通道：`(SpawnTime 秒, 该点的世界弧长 cm)` → Pass C 写进 UV1。 */
+	TArray<FVector2f> Growth;
+
+	int32 NumPoints() const { return Points.Num(); }
+	bool IsEmpty() const { return Points.IsEmpty() || SegmentMeta.IsEmpty(); }
+	void Reset() { Points.Reset(); Axes.Reset(); PointMeta.Reset(); SegmentMeta.Reset(); Growth.Reset(); }
 };
 
 /** 调色板序号。**与 `ACSHouseActor::VineGpuBuffers` / `Pack` 的下标是同一套**，别各写各的。 */
@@ -164,6 +285,29 @@ COMPUTESHADERGENERATOR_API void BuildPlan(const TArray<FWallStrip>& Strips, cons
  */
 COMPUTESHADERGENERATOR_API bool IsInsideOpening(const TArray<FCSWallOpening>& Openings, int32 EdgeIndex,
 	float S, float Z, float Clearance);
+
+/**
+ * 折线 → vinegenerator 的 CPU 折线通路缓冲（`FVineBuildInput` 的 `PathPoints/Axes/Meta/SegmentMeta`）。
+ *
+ * **纯函数，不碰 GPU**，与 `BuildPlan` 一样能在没有 world 的用例里跑。
+ *
+ * 三件事在这里发生：
+ *  ① **细分**：同一面墙上的连续点做 Catmull-Rom（`Subdivide` 段/原段）。
+ *     ⚠️ 细分在**世界空间**做是安全的，不必回到 `(S,Z)` —— Catmull-Rom 是**仿射组合**（权重和为 1），
+ *     同一面墙上的点共面，仿射组合必然还在那个平面里，所以不会被平滑拽离墙面。
+ *     **但跨墙那一段不能这么做**：两端不共面，四个控制点混着算会把线甩到墙里去。跨墙段走线性插值
+ *     （几何上就是把转角切一刀，正是想要的圆角）。
+ *  ② **锥度**：写进 `Points[i].w`。Pass C 的环半径 = `10 * CircleScale * w`，所以这里给的是
+ *     "想要的半径 / (10 * CircleScale)"，与 `FParams::Thickness` 对齐。
+ *  ③ **弧长**：沿**细分后**的世界折线累加，写进 `Growth[i].y`（cm）。
+ *     ⚠️ 别拿 shader 里的 `CurveV` 当它用 —— 那个除过平均环周长，单位是"周长"，细枝会长得快。
+ *
+ * `StrandSpawnTimes` 与 `Plan.Strands` 一一对应；给空数组则 `Growth[i].x` 全填 0。
+ * `CircleScale` 必须与递交给 vinegenerator 的那个值一致，否则管子粗细对不上。
+ */
+COMPUTESHADERGENERATOR_API void PackTubePath(const TArray<FWallStrip>& Strips, const FPlan& Plan,
+	const FParams& Params, int32 Subdivide, float CircleScale,
+	TArrayView<const float> StrandSpawnTimes, FTubePath& OutPath);
 
 /**
  * 把基础网格读成一份自带**法线与 UV** 的快照，并把它的长度轴换到 +Z。

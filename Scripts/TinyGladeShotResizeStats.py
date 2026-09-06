@@ -6,10 +6,11 @@
 三条判据：
 
   A **相邻帧差异率**（`diff%` = 通道差 > 8 的像素占比）。
-    禁带**开**时，除跳带那一帧外，逐帧差异应当是连续拉伸该有的那一小段；
-    禁带**关**时，屋脊翻面的那一帧会顶出一个明显更大的尖峰。
-    ⚠️ 这一条同时就是"门是活的"的证明：翻轴在像素上**看得见**（off 那组顶了出来），
-    所以 on 那组"没看见"才有意义。看不见的话这整套判据是空的。
+    逐帧差异应当是连续拉伸该有的那一小段，**全程不许有尖峰**。
+    ⚠️ 旧口径是拿"禁带关"那组当对照（屋脊翻面会顶出尖峰，以此证明相机看得见翻轴，
+    于是"禁带开时没看见"才有意义）。**禁带与翻轴已随四坡屋顶于 2026-08-31 删除** ——
+    脊向由长轴连续导出、正方形处脊长为 0，没有翻轴事件可拍，`off` 那组不再产出。
+    判据 A 因此退化成单组的正向连续性检查；"这组图确实拍到了东西"改由判据 B 承担。
 
   B **派生物可见性**：`on_no{frame,vine,decor}` 与同尺寸基准帧 `on_f8` 比。
     差异率必须明显不为零 —— 某一类关掉后画面纹丝不动，就说明这组图**根本没拍到它**，
@@ -54,19 +55,27 @@ def main(shots_dir):
     def p(tag):
         return os.path.join(shots_dir, "resize_%s.png" % tag)
 
-    missing = [t for t in (["on_f%d" % i for i in range(FRAMES)]
-                           + ["off_f%d" % i for i in range(FRAMES)]
-                           + ["on_noframe", "on_novine", "on_nodecor"]) if not os.path.exists(p(t))]
+    required = (["on_f%d" % i for i in range(FRAMES)]
+                + ["on_noframe", "on_novine", "on_nodecor"])
+    missing = [t for t in required if not os.path.exists(p(t))]
     if missing:
         print("missing: %s" % ", ".join(missing))
         return 1
+
+    # `off`（禁带关的对照组）已随四坡屋顶于 2026-08-31 停产 —— 出图脚本不再生成它。
+    # 这里做成**存在才读**而不是必需：旧的图集拿过来仍然算得出两组对照，新图集不会因为
+    # 少了一组直接 missing 退出（此前就是这么把整个判据 A 卡死的）。
+    groups = ["on"]
+    if all(os.path.exists(p("off_f%d" % i)) for i in range(FRAMES)):
+        groups.append("off")
+    tags = ([("%s_f%d" % (g, i)) for g in groups for i in range(FRAMES)]
+            + ["on_noframe", "on_novine", "on_nodecor"])
 
     # C 先打：它是**故障指纹**，不是观感量。任何一帧不为 0 都说明这组图的渲染路径有问题，
     # 后面两条判据在那种情况下读出来的数没有意义（坑 ⑨ / 坑 ⑪，见出图脚本文件头）。
     print("== C  zero% (精确 (0,0,0)；预热与空转都对了应当接近 0.000) ==")
     worst = 0.0
-    for tag in (["on_f%d" % i for i in range(FRAMES)] + ["off_f%d" % i for i in range(FRAMES)]
-                + ["on_noframe", "on_novine", "on_nodecor"]):
+    for tag in tags:
         z = zero_pct(load(p(tag)))
         worst = max(worst, z)
         if z > 0.20:
@@ -75,7 +84,7 @@ def main(shots_dir):
 
     print("== A  相邻帧差异率（同机位，通道差 > %d）==" % CHANNEL_TOL)
     peaks = {}
-    for group in ("on", "off"):
+    for group in groups:
         frames = [load(p("%s_f%d" % (group, i))) for i in range(FRAMES)]
         seq = [diff_pct(frames[i], frames[i + 1]) for i in range(FRAMES - 1)]
         peaks[group] = (max(seq), seq.index(max(seq)))

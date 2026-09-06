@@ -3,16 +3,24 @@
 #include "CoreMinimal.h"
 #include "CSGroundShaperSteps.h"
 #include "CSHouseDecor.h"
+#include "CSHouseDoorRuns.h"
 #include "CSHouseFrame.h"
 #include "CSHouseProfile.h"
+#include "CSHouseQuoin.h"
 #include "CSHouseResize.h"
 #include "CSHouseRoof.h"
 #include "CSHouseSeam.h"
+#include "CSHouseTile.h"
+#include "CSHouseTrim.h"
 #include "CSHouseVine.h"
 #include "CSTinyGlade.h"
 #include "CSHouseActor.generated.h"
 
 class ACSGroundActor;
+class ACSHouseFeatureMarker;
+class ACSHouseHandleActor;
+class ACSHouseHeightHandleActor;
+class ACSHouseResizeHandleActor;
 class UCSGpuInstancedMeshComponent;
 class UCSMesh;
 class UCSMeshRenderComponent;
@@ -21,21 +29,51 @@ class UStaticMesh;
 struct FCSGpuMeshCPUData;
 
 /**
+ * 进入 / 退出拉尺寸模式（计划 D5）。`bEntered = false` 表示退出。
+ *
+ * **静态**多播，沿用 `ACSGroundActor::OnGroundPaintEditorRequest` 那条"runtime 请求、
+ * editor 应答"的既有分工：runtime 模块只管广播，编辑器模块（`PCGEditorProcess`）接管
+ * 失选监听。房子这一侧因此零编辑器依赖，无头测试也能完整走完整条模式。
+ */
+DECLARE_MULTICAST_DELEGATE_TwoParams(FCSHouseResizeModeChanged, ACSHouseActor*, bool /*bEntered*/);
+
+/**
+ * `StartWindowBrush()` 广播它，编辑器模块（`PCGEditorProcess`）应答成激活窗笔刷 EdMode。
+ * 与地面那条 `FCSGroundPaintEditorRequest` 同一条接线：运行时模块不认识 EdMode，只发请求。
+ */
+DECLARE_MULTICAST_DELEGATE_OneParam(FCSHouseWindowBrushRequest, ACSHouseActor*);
+
+/**
  * 房体三角汤的**全部**输入。ACSHouseActor::RebuildBodyMesh 从自己的属性组一份，
  * automation 测试从字面量组一份 —— 后者是这个结构存在的唯一理由：
- * 「墙顶到屋面底那道楔形缝里到底有没有实体」只能逐三角验，而 actor 进不了纯 CPU 用例
- * （测试不起 world、不碰 RHI，见 Tests/CSHouseLogicTests.cpp 的文件头）。
+ * 「洞是不是真的没在几何里挖」「墩跨度砌没砌实」这类判据只能逐三角验，而 actor 进不了纯 CPU
+ * 用例（测试不起 world、不碰 RHI，见 Tests/CSHouseLogicTests.cpp 的文件头）。
+ *
+ * ⚠️ **没有屋面** —— 四坡屋顶由瓦片实例承担，一片屋面三角都不进这份汤（2026-08-31）。
  */
+/**
+ * 门洞滞回的一条记忆：某条边上一帧的一个洞区间（沿边弧长，与 `CSHouse_GetEdge` 同口径）。
+ *
+ * 扁平数组而不是 `TMap<边, TArray<区间>>`：UHT 不支持容器套容器，而边最多 4 条、
+ * 每条边的洞是个位数，线性扫描比建索引便宜。
+ */
+USTRUCT()
+struct FCSDoorRunMemory
+{
+	GENERATED_BODY()
+
+	UPROPERTY() int32 EdgeIndex = 0;
+	UPROPERTY() float S0 = 0.0f;
+	UPROPERTY() float S1 = 0.0f;
+};
+
 struct FCSHouseBodyDesc
 {
-	/** 屋面描述。三处关键高度与墙顶该砌到哪都从 CSHouseRoof.h 的求值器取。 */
-	FCSRoofDesc Roof;
-
-	/** 底面尺寸 cm（局部 X/Y），与 Roof.Footprint 同值。 */
+	/** 底面尺寸 cm（局部 X/Y）。 */
 	FVector2D Footprint = FVector2D(600.0, 400.0);
 
 	float WallThickness = 24.0f;
-	/** 墙顶高，与 Roof.EaveZ 同值。 */
+	/** 墙顶高。四坡屋顶下四面墙顶都平在这个高度上（= 屋面求值器的 EaveZ）。 */
 	float WallHeight = 300.0f;
 	/** 相邻洞之间保留的墩宽 cm。 */
 	float PierWidth = 40.0f;
@@ -70,7 +108,8 @@ enum class ECSHousePart : uint8
 {
 	Wall = 0,
 	Roof = 1,
-	Gable = 2,
+	// 2 号空着：原为山墙，四坡屋顶没有这个构件（2026-08-31）。别顺手占用 ——
+	// 这张表是 P2 冻结的字典，已烘进 StaticMesh 的旧网格里可能还留着 2。
 	/** 门框砖：沿洞缘曲线铺的离散块，负责填满 clip 留下的厚度断口（不是扫掠面）。 */
 	Frame = 3,
 	Pillar = 4,
@@ -121,6 +160,18 @@ struct COMPUTESHADERGENERATOR_API FCSHouseWindow
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Window")
 	ECSOpeningShape Shape = ECSOpeningShape::Rect;
+
+	/**
+	 * 逐字段相等。标记每 tick 都会重登记一次诉求，靠它把"没动"的那些**在标脏之前**挡掉 ——
+	 * 少了它，拖动一扇窗会让宿主每帧重求值一次（幂等，所以不会出错，只会白烧）。
+	 * 浮点直接比不做容差：诉求是标记算出来的确定值，同一摆位逐位相同。
+	 */
+	bool operator==(const FCSHouseWindow& Other) const
+	{
+		return EdgeIndex == Other.EdgeIndex && CenterS == Other.CenterS && Width == Other.Width
+			&& SillZ == Other.SillZ && Height == Other.Height && Shape == Other.Shape;
+	}
+	bool operator!=(const FCSHouseWindow& Other) const { return !(*this == Other); }
 };
 
 /**
@@ -157,7 +208,7 @@ enum class ECSVineSeason : uint8
  * -----------------------------------------------------------------------------
  * 房体顶点色的通道字典（P2 冻结；**全项目唯一仲裁点**，别在别处先到先得地占用）
  * -----------------------------------------------------------------------------
- *   R = 构件色号 ECSHousePart / 255   墙 0 / 屋顶 1 / 山墙 2 / 门框砖 3 / 柱 4
+ *   R = 构件色号 ECSHousePart / 255   墙 0 / 屋顶 1 / (2 空) / 门框砖 3 / 柱 4
  *   G = 洞的 Tag / 255                悬停高亮单个拱用；非洞构件恒 0
  *   B = 洞形状 id / 255               ECSOpeningShape；255 = 这块面板没有洞
  *   A = 保留                          预定：季节 t
@@ -171,8 +222,13 @@ enum class ECSVineSeason : uint8
  * 也不会被邻接顶点插值污染。**地面正相反** —— 它的顶点是共享的、插值会毁掉位域，而且 R 已经
  * 被道路权重占用，所以地面绝不打包位域。
  *
- * 这三十二位是本项目能被材质读到的**唯一**自定义逐顶点语义（对照 Tiny Glade 的 41 种自定义
- * 语义属性），扩 UV1 在 proxy 绑定处有静默地雷，见计划 D14 通道二。
+ * 顶点色这三十二位 + 最多 8 组 UV，是本项目能被材质读到的全部自定义逐顶点语义（对照
+ * Tiny Glade 的 41 种）。⚠️ 早先注释里「扩 UV1 在 proxy 绑定处有静默地雷」**已过期**：
+ * `CSGpuMeshTypes.cpp:44` 已改成 `ElementsPerUnit = 2 * Clamp(NumTexCoordSets, 1u, MaxTexCoordChannels)`
+ * 的单条交错流，`CSGpuMeshSceneProxy.cpp` 的 TexCoord 分支逐组挂 stream component、SRV 只设
+ * 一次；上限 `FCSGpuMeshCPUData::MaxTexCoordChannels = 8`（2026-09-04 由 4 抬到引擎天花板
+ * `MAX_STATIC_TEXCOORDS`），开关是 `UCSMeshOps::EnsureTexCoordSets`。第 5 组起只走 manual
+ * fetch 的 SRV，理由见该分支的注释。
  */
 UCLASS(Blueprintable, BlueprintType)
 class COMPUTESHADERGENERATOR_API ACSHouseActor : public ACSTinyGlade
@@ -202,51 +258,244 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House", meta = (ClampMin = "5.0", ClampMax = "70.0"))
 	float RoofPitch = 35.0f;
 
-	/** 屋檐外挑 cm。 */
+	/**
+	 * 屋面整体的**竖直偏移** cm，加在檐口高（= `WallHeight`）上。
+	 *
+	 * 正值把整个屋顶抬起来（檐口与墙顶之间露出一条缝），负值往下坐进墙里。
+	 * 屋面方程只有 `FCSRoofDesc::EaveZ` 这一份真源，所以偏移加在它身上 —— 瓦、脊瓦、
+	 * 以及将来任何读屋面的消费者都会一起跟上，不会出现"瓦抬了、别的没抬"。
+	 *
+	 * ⚠️ 想让瓦离开屋面一点点用 `RoofTileStandOff`（沿**屋面法线**抬），那是另一件事：
+	 * 本值是竖直的、且改的是屋面本身。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House", meta = (ClampMin = "-200.0", ClampMax = "200.0"))
+	float RoofHeightOffset = 12.0f;
+
+	/** 屋檐外挑 cm。四面都挑同样多（四坡）。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House", meta = (ClampMin = "0.0"))
 	float RoofOverhang = 25.0f;
 
-	/** 屋顶板厚 cm。 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House", meta = (ClampMin = "2.0"))
-	float RoofThickness = 12.0f;
+	// -------------------------------------------------------------------------
+	// 屋面瓦（四坡的屋面**全部**由瓦铺成 —— 房体三角汤里一片屋面都没有）
+	//
+	// 轴向不需要在这里配：`ACSHouseActor::MakeRoofTileParams` 从网格包围盒自动判定
+	// （最薄的一轴 = 屋面法线，剩下两轴按 `bRoofTileSwapAxes` 分配），判定结果会打进日志。
+	// -------------------------------------------------------------------------
+
+	/** 屋面瓦。留空 = 不铺瓦（房子就只剩四面墙）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Roof Tile")
+	TObjectPtr<UStaticMesh> RoofTileMesh;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Roof Tile")
+	bool bRoofTilesEnabled = true;
 
 	/**
-	 * 屋脊沿哪根局部轴走。**显式状态而非从长轴隐式导出**（计划 D4）：隐式的话 D5 单边推拉
-	 * 一旦让 X 穿过 Y，脊与山墙就原地 90° 跳变。每次重求值按 RidgeSwitchRatio 做滞回更新，
-	 * 用户也可以在这里直接指定。
+	 * 瓦沿屋面法线的**厚度** cm。≤ 0 = 用网格原生尺寸。
 	 *
-	 * NonTransactional 与 DoorSlotOpen 同理：它是滞回的记忆，被无关改参的 Ctrl+Z 回滚会让
-	 * 屋顶莫名其妙翻面（凡双阈滞回的状态一律照此办理）。
+	 * ⚠️ **不给的话瓦是一米厚的方块。** TG 的 `roof_tile` 原件实测 **1.188 × 1.0 × 1.0 m** ——
+	 * 它是个**单位块**，真实厚度由 TG 的逐实例缩放压出来（`_nani_instanced_roof` 的 VS 里那个
+	 * `scale_t`）。我们这边平面内两轴按排距缩了、法线轴却一直取原生 100 cm，屋顶因此看着像
+	 * 堆了一层砖。默认 6 cm ≈ 真实瓦片的厚度量级。
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, NonTransactional, Category = "CS House")
-	ECSRidgeAxis RidgeAxis = ECSRidgeAxis::X;
-
-	/** 脊向换轴的滞回比：另一根轴要长出当前脊轴这么多倍才换向。1 = 无滞回。 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House", meta = (ClampMin = "1.0", ClampMax = "3.0"))
-	float RidgeSwitchRatio = 1.15f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Roof Tile", meta = (ClampMin = "0.0", ClampMax = "100.0"))
+	float RoofTileThickness = 6.0f;
 
 	/**
-	 * 尺寸禁带的半宽比例（2026-08-30 裁决四「房屋尺寸更换有最小距离」的落地口径）。
+	 * 每片瓦画多大的**总系数**，只乘在平面内两轴上。
 	 *
-	 * `PushEdge` 推拉时，被推的那一维不许停在 `|X − Y| < FootprintBandFraction × 另一维` 里面，
-	 * 落进去就跳到带外沿。**它与 `RidgeSwitchRatio` 是一对**：带宽的实际下界由滞回比反解
-	 * （见 `CSHouseResize_EffectiveBandFraction`），保证整段滞回模糊区被吞掉 ——
-	 * 尺寸因此永远停不到翻轴阈上，翻轴只可能与"跳带"那一步的尺寸跳变同步发生。
-	 *
-	 * 0 = 关掉禁带（退回纯滞回：单边推拉扫过阈值时屋顶仍会在某个连续步里原地翻面）。
-	 * 默认 0.20 > 1.15 − 1，已经在下界之上，改小到 0.15 以下会被下界顶回去。
-	 *
-	 * ⚠️ 只作用在 `PushEdge` 这条**推拉**路径上，**不回写** `FootprintSize` 属性本身 ——
-	 * 程序去纠正用户正在 details 面板里输入的数是"与输入源抢写"，与拖拽期回写 handle 位置
-	 * 同一条教训（计划 D5「回位规则」）。脚本/蓝图直接设 `FootprintSize` 时不受约束，那是
-	 * 显式赋值不是推拉。
+	 * 排距一步不动 ⇒ **瓦数不变**，只是每片变大或变小（< 1 会在瓦之间露出屋面底下的天空，
+	 * > 1 让相邻瓦压得更狠）。想改瓦数请调 `RoofTileRowPitch` / `ColumnPitch`，那是另一件事。
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House", meta = (ClampMin = "0.0", ClampMax = "0.9"))
-	float FootprintBandFraction = 0.20f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Roof Tile", meta = (ClampMin = "0.05", ClampMax = "4.0"))
+	float RoofTileSizeScale = 1.0f;
 
-	/** 单边推拉的尺寸下限 cm（`PushEdge` 的硬下界，禁带给它让路）。 */
+	/**
+	 * 角斜脊 / 屋脊上盖瓦的尺寸系数。≤ 0 = 不铺脊瓦。
+	 *
+	 * 交汇处两坡的瓦是**对切**的，接缝一眼看得见；盖瓦骑在缝上、法线取两坡法线的角平分把它遮住。
+	 * TG 侧没有专门的脊瓦网格（`assets/meshes` 查无 `roof_ridge`），盖的仍是同一块 `roof_tile`，
+	 * 所以这里不引入新资产。> 1 让盖瓦比普通瓦大一圈，才压得住两侧。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Roof Tile", meta = (ClampMin = "0.0", ClampMax = "3.0"))
+	float RoofRidgeCapScale = 1.15f;
+
+	// -------------------------------------------------------------------------
+	// 尖顶（TG: `system_roof::visual::place_spires::place_roof_spires`）
+	//
+	// 逆向侧的三条硬证据（PDB + 反编译 VS，2026-08-31）：
+	//  · 组件 `system_roof::utils::components::RoofSpire` 挂在**屋顶实体自己**身上，产出走
+	//    `Query<(&Roof, &RoofAnimation), With<RoofSpire>>` 的一次 `filter_map` ⇒
+	//    **一座屋顶最多一根**，且有屋顶拿不到（平顶 / 山墙顶那一档）。
+	//  · SSBO 只有 `{ vec4 position; float roof_animation_t; float roof_profile; float radius; }`
+	//    —— **没有任何旋转**。尖顶恒竖直、绕自身轴对称，摆位只是一个点。
+	//  · `_instanced_roof_spire` 的 VS 只对 `roof_profile_mult > -0.001` 的顶点（= 底裙那 504 个）
+	//    横向放大 `radius·2 · lerp(.6,1,mult) · lerp(.4,1.5,1-profile)`，竖直分量一动不动，
+	//    最后整体 **×0.5**。所以「屋顶越大、裙摆越张，杆子不变粗」，本项目的 `RoofFinialScale`
+	//    默认取 0.5 就是那个常数。
+	//
+	// ⚠️ **本项目摆的是"每个屋脊端点一根"，与 TG 的"每屋顶一根"有意分叉。** 理由：TG 的
+	// `roof_tip_offset_xz` 给的是一个点（他们的屋顶形状族里尖顶那一档本来就是锥/金字塔），
+	// 而我们的四坡顶脊是一条**线段**，两端各有一处"两条角斜脊 + 一条屋脊"三面交汇的破口 ——
+	// 用户 2026-08-31 指的正是那里。正方形时脊长为 0、两端重合 ⇒ 自动退化成金字塔尖上的一根，
+	// 不需要为金字塔写特例。
+	// -------------------------------------------------------------------------
+
+	/**
+	 * 屋脊端点的尖顶。**留空 = 不长**（同 `RoofTileMesh` 的口径）。
+	 *
+	 * ⚠️ 竖直轴**从包围盒自动判**（最长的一轴 = 尖顶朝上那根），判定结果会打进日志。
+	 * TG 的源 `roof_spire.json` 是 y-up 的（y ∈ [−0.858, 2.18]，x/z 对称到 ±1.103），
+	 * 本仓库导入后已被转成 Z-up（实测 220.6 × 220.6 × 303.8 cm，判定 up axis=2）。
+	 * 自动判轴是为了**两种口径都不必手工转资产** —— 换一张 y-up 直进的资产同样立得起来。
+	 * 代价是"矮胖的尖顶"会判错轴，那种资产得自己转正。
+	 *
+	 * ⚠️ 摆位按**资产自己的枢轴**放在脊端点上。TG 那张的枢轴恰在裙摆与杆子的交界
+	 * （包围盒 z ∈ [−85.8, +218.0] cm，0 在底裙上沿），所以裙摆天然垂到瓦面以下、把破口盖住
+	 * （默认 0.5 缩放下垂 42.9 cm）。换一张枢轴在底面的资产会整根浮在脊上，用 `RoofFinialSink` 压下去。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Roof Finial")
+	TObjectPtr<UStaticMesh> RoofFinialMesh;
+
+	/** 留空 = 用网格自带的材质槽。尖顶走普通 `UStaticMeshComponent`，**不吃**实例化路径，
+	 *  所以这里不需要 `bUsedWithInstancedStaticMeshes`（瓦/藤蔓那条坑在这儿不成立）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Roof Finial")
+	TObjectPtr<UMaterialInterface> RoofFinialMaterial;
+
+	/** 整体缩放。默认 0.5 = TG VS 里那个硬编码常数。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Roof Finial", meta = (ClampMin = "0.01", ClampMax = "10.0"))
+	float RoofFinialScale = 0.5f;
+
+	/** 沿竖直方向往屋面里压 cm（正值往下）。资产枢轴不在裙摆上沿时用它对齐。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Roof Finial", meta = (ClampMin = "-200.0", ClampMax = "200.0"))
+	float RoofFinialSink = 0.0f;
+
+	// -------------------------------------------------------------------------
+	// Door Leaf（门扇，2026-09-04）
+	//
+	// TG 侧：`construct_gates` 按 `segment_length` **现搭** quad 网格
+	// （`DoorMeshInProgress::add_quad` + `door_mesh` / `door_mesh_gap`），资产里只有把手
+	// （`wooden_gate/door_handle_circle.glb`），**没有门扇网格**。所以那边的门扇天生随洞宽变宽。
+	//
+	// 本项目：用**现成网格按洞宽缩放**，不现搭。差异是有意的 ——
+	// 现搭 quad 要自己管板条排布/UV/法线，而本仓库已经有 `door` 这张提取资产；
+	// 代价是宽度差得多时板条比例会被拉伸，用 `DoorLeafMaxStretch` 夹住。
+	// -------------------------------------------------------------------------
+
+	/**
+	 * 门扇网格**按尺寸分档**（空数组 = 不长门扇，同 `RoofFinialMesh` 的口径）。
+	 *
+	 * 顺序无所谓 —— 代码按每张网格**自己的包围盒宽度**排序，再挑"native 宽度不超过洞宽的
+	 * 最大一档"，挑不到就用最小那档。剩下的差值才交给缩放，所以拉伸量天然被压到最小。
+	 *
+	 * ⚠️ **这是 TG 自己的做法**：那边的门就是 `balcony_door_rank1/2/3`
+	 * （120 / 150 / 180 cm 宽 × 262.5 高，1002 / 1242 / 1716 顶点，带 COLOR_0 + UV），
+	 * `DecoratorSubtype` 里按 rank 选档。
+	 *
+	 * ⚠️ **别用 `decorators/door.glb`（本仓库的 `door` 资产）**：它只有 36 顶点、120×250×75、
+	 * 没有 UV —— 是**交互/碰撞代理盒**，不是可见门扇。2026-09-04 第一版错用了它，
+	 * 画面上是一块纯色板子。同族的 `*_collision` / `*_interaction` / `*_outline` 同理。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Door Leaf")
+	TArray<TObjectPtr<UStaticMesh>> DoorLeafMeshes;
+
+	/** 留空 = 用网格自带材质槽。门扇走普通 `UStaticMeshComponent`，不吃实例化路径。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Door Leaf")
+	TObjectPtr<UMaterialInterface> DoorLeafMaterial;
+
+	/** 关掉即所有门扇不出。出图脚本靠它拍"同机位只切开关"的对照图。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Door Leaf")
+	bool bDoorLeafEnabled = true;
+
+	/**
+	 * 门扇占洞宽的比例。**1 = 与洞同宽**；> 1 会被墙裁掉溢出的部分（见 `DoorLeafRise` 那段）。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Door Leaf", meta = (ClampMin = "0.1", ClampMax = "1.5"))
+	float DoorLeafWidthRatio = 1.0f;
+
+	/**
+	 * 门扇顶边相对**起拱线**的位置：0 = 齐起拱线，1 = 齐拱顶，> 1 = 越过拱顶。
+	 *
+	 * ⚠️ **默认 1.05，即门扇故意比洞高一点** —— 这是 TG 的做法，2026-09-04 从实拍
+	 * `img/tiny-glade-ref-door-in-arch.png` 反推出来的：那张图里门的轮廓**严丝合缝地贴着
+	 * 拱圈石内缘**，一条缝都没有，而 TG 的拱形状随洞宽/拱高连续变化 ——
+	 * **一张固定网格不可能每次都对上那条曲线**。所以门扇不是建成拱顶的，它是一块
+	 * **比洞更大的矩形**，退在墙面之后，由墙自己的 `OpacityMask` 切出拱形剪影
+	 * （实拍里拱圈石还在门上投了一道软阴影，正是"门是凹进去的"的证据）。
+	 *
+	 * ⇒ 我们**不需要拱形门扇网格**，只要让门扇越过拱顶、并保证它整体退在墙的外表面之后。
+	 * 早先默认 0（门顶停在起拱线、拱顶那半圆空着）是反的，画面上是"方门塞在拱下面"。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Door Leaf", meta = (ClampMin = "0.0", ClampMax = "1.5"))
+	float DoorLeafRise = 1.05f;
+
+	/**
+	 * 竖直/水平缩放比的上限。窄洞配宽网格时纵横比会被拉扁，超过这个倍数就**只缩不拉**
+	 * （宁可门扇比洞窄一点，也不要把板条拉成面条）。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Door Leaf", meta = (ClampMin = "1.0", ClampMax = "8.0"))
+	float DoorLeafMaxStretch = 2.0f;
+
+	/** 门扇相对墙心沿外法线的偏移 cm（正值朝外）。0 = 门扇中面与墙中面重合。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Door Leaf", meta = (ClampMin = "-100.0", ClampMax = "100.0"))
+	float DoorLeafInset = 0.0f;
+
+	/** 沿坡向排距 cm。**0 = 由网格自身尺寸与 RowOverlap 反解**（瓦按原尺寸画，排距把它压出重叠）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Roof Tile", meta = (ClampMin = "0.0"))
+	float RoofTileRowPitch = 16.9f;
+
+	/** 排内列距 cm。0 = 同上由网格尺寸反解。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Roof Tile", meta = (ClampMin = "0.0"))
+	float RoofTileColumnPitch = 27.75f;
+
+	/** 瓦画多大 = 实际排距 × 这个系数。> 1 = 上下两排**故意互相压住**（正缝会露出天空）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Roof Tile", meta = (ClampMin = "1.0", ClampMax = "4.0"))
+	float RoofTileRowOverlap = 1.6f;
+
+	/** 同上，排内左右方向。左右压叠远比上下浅。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Roof Tile", meta = (ClampMin = "1.0", ClampMax = "2.0"))
+	float RoofTileColumnOverlap = 1.06f;
+
+	/** 沿屋面法线抬起 cm。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Roof Tile", meta = (ClampMin = "0.0"))
+	float RoofTileStandOff = 0.5f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Roof Tile", meta = (ClampMin = "0.0", ClampMax = "0.5"))
+	float RoofTileScaleJitter = 0.05f;
+
+	/**
+	 * 绕屋面法线的朝向抖动（弧度）。
+	 *
+	 * ⚠️ **默认 0（2026-08-31 用户裁决「每一个元素都有点歪，修复它」）。** 原默认 0.04 rad ≈ 2.3°，
+	 * 在密铺（RowPitch 16.9 / ColumnPitch 27.75）下每片瓦都看得出转了一点，整片屋面读成"歪的"
+	 * 而不是"自然的"。想要一点随机感优先用 `RoofTileScaleJitter` / `LiftJitter`，它们不破坏排列。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Roof Tile", meta = (ClampMin = "0.0", ClampMax = "0.5"))
+	float RoofTileYawJitter = 0.0f;
+
+	/** 沿屋面法线的高度抖动 cm —— TG 的瓦是一片起伏的鳞，不是一张平面。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Roof Tile", meta = (ClampMin = "0.0"))
+	float RoofTileLiftJitter = 0.6f;
+
+	/** 逐实例随机的用户种子。随机**只由 (面号, 排号, 列号, 种子) 决定**，不取 GPU 槽位。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Roof Tile")
+	int32 RoofTileSeed = 1;
+
+	/** 自动判定把上坡向与沿排向弄反了就勾上（判定结果每次重建都打在日志里）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Roof Tile")
+	bool bRoofTileSwapAxes = false;
+
+	/** 单边推拉的尺寸下限 cm（`PushEdge` 的硬下界）。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House", meta = (ClampMin = "100.0"))
 	float MinFootprint = 200.0f;
+
+	/**
+	 * 调高度的下限 cm（`PushHeight` 的硬下界）。
+	 *
+	 * 200 不是随手写的：洞顶被 `墙高 − LintelBand`（默认 40）夹着，再低下去门和窗会被谓词
+	 * 全部拒掉 —— 画面上是"房子越压越矮，然后门窗突然一起消失"，而那看起来像是开洞坏了。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House", meta = (ClampMin = "50.0"))
+	float MinWallHeight = 200.0f;
 
 	/** 相对地面参考高度的抬升；落座公式 = max(footprint 地面高度) + HeightOffset。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House")
@@ -262,12 +511,12 @@ public:
 	TObjectPtr<UMaterialInterface> PillarMaterial;
 
 	// -------------------------------------------------------------------------
-	// Door（边缘线段分割制，D6）
+	// Door（**道路区间制**，D6；2026-09-04 从"等分槽 + 覆盖率二值投票"重做）
+	//
+	// 门宽 = 路在这面墙上截出的弦长，门心 = 那段的中心 —— 逐条依据与 TG 对位见
+	// `CSHouseDoorRuns.h` 文件头。等分槽那一套（`DoorPitchTarget` / `SplitEdgeIntoSlots`）
+	// **已随之删干净**，别再找它。
 	// -------------------------------------------------------------------------
-
-	/** 子段目标间距 cm：N = round(可用长 / 此值)，实际段长 = 可用长 / N（等分，拱宽随之微伸缩）。 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Door", meta = (ClampMin = "60.0"))
-	float DoorPitchTarget = 150.0f;
 
 	/**
 	 * 相邻拱之间保留的墩宽 cm（拱宽 = 段长 − 墩宽，再乘离地收窄）。
@@ -279,6 +528,18 @@ public:
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Door", meta = (ClampMin = "10.0"))
 	float PierWidth = 20.0f;
+
+	/**
+	 * 拱间墩的柱头 / 柱础（2026-09-04，实拍 `img/tiny-glade-ref-twin-arch-pier.jpg`：
+	 * 两道拱之间那根小石柱是柱础 + 柱身 + **更宽的柱头**，两道拱圈收在柱头上）。
+	 * 横截面放大倍数；≤ 1 = 不出。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Door", meta = (ClampMin = "1.0", ClampMax = "3.0"))
+	float PierCapitalScale = 1.5f;
+
+	/** 柱头与柱础各自的高度 cm。0 = 不出。代码里会再夹在墩高的 40% 内。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Door", meta = (ClampMin = "0.0", ClampMax = "60.0"))
+	float PierCapitalHeight = 14.0f;
 
 	/**
 	 * 连续拱之间的窄残料按**墩**处理：起拱线以下那片灰泥被裁掉，只剩门框砖站着。
@@ -320,7 +581,7 @@ public:
 
 	/** 拱顶目标高 cm（受 墙高 − 过梁带 约束）。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Door", meta = (ClampMin = "80.0"))
-	float DoorHeight = 220.0f;
+	float DoorHeight = 165.0f;
 
 	/** 拱上方保留的过梁带 cm（保证墙顶连续）。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Door", meta = (ClampMin = "10.0"))
@@ -338,13 +599,47 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Door", meta = (ClampMin = "0.05", ClampMax = "1.0"))
 	float DoorOnWeight = 0.5f;
 
-	/** 子段点亮的覆盖率阈值（滞回高阈）。 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Door", meta = (ClampMin = "0.05", ClampMax = "1.0"))
-	float SlotOnCoverage = 0.6f;
+	/**
+	 * 单个洞的宽度上限 cm：一条比它更宽的路会被切成一排拱（相邻之间留 `PierWidth`），
+	 * 而不是截断成一个巨拱。切分逻辑在 `CSHouse_SolveRoadRuns`，理由见那个文件的要点 ③。
+	 *
+	 * ⚠️ 上界另有一条**硬**约束：拱是半径 = 半宽的正半圆，`半宽 ≤ 门高 − 15 cm 起拱段`
+	 * ⇒ 默认门高 165 时任何拱都不会超过 300 cm。这个参数是**风格**上限，不是安全阀。
+	 *
+	 * ⚠️ **默认值必须比一面墙的可用跨度小，否则这条路永远走不到。** 260 那一版
+	 * （2026-09-04 上午）比演示房 400 深那面墙的可用长 232 还大，宽路只会得到一个顶满整墙的
+	 * 巨拱，"连续石拱门"那档从没出现过。160 ⇒ 232 的跨度切成两拱各 106 + 一道 20 的墩，
+	 * 与 `img/tiny-glade-ref-arcade-piers.jpg` 里"两拱夹一道窄墩"的比例同档。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Door", meta = (ClampMin = "40.0"))
+	float DoorMaxWidth = 160.0f;
 
-	/** 已点亮子段熄灭的覆盖率阈值（滞回低阈）。 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Door", meta = (ClampMin = "0.0", ClampMax = "1.0"))
-	float SlotOffCoverage = 0.4f;
+	/**
+	 * 滞回的保活宽度系数：**已经开着**的洞窄到 `DoorMinWidth × 此值` 以下才关。
+	 *
+	 * 旧口径的滞回是"覆盖率双阈 + key 里带段数 N"，拉尺寸跨过 `round()` 边界那一帧整条边的
+	 * key 全部失配、滞回集体失效（合卷卷一记过）。区间没有编号，继承靠**与上一帧区间交叠**，
+	 * 那个断点随之消失，所以这里只需要一个系数而不是两条覆盖率阈值。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Door", meta = (ClampMin = "0.1", ClampMax = "1.0"))
+	float DoorKeepWidthRatio = 0.8f;
+
+	/**
+	 * 洞心进哈希前的量化步长 cm。宽度那份是 `DoorWidthQuantum`，位置这份单列 ——
+	 * 路是连续场，端点每帧都在亚厘米地抖，不量化的话哈希永远不等、房体每帧全量重建。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Door", meta = (ClampMin = "0.5"))
+	float DoorCenterQuantum = 2.0f;
+
+	/**
+	 * 离地收窄这一项还要不要参与门宽。
+	 *
+	 * ⚠️ 2026-09-04 之前它是**唯一**的宽度源（门宽 = 槽宽 × 离地收窄，与路无关），
+	 * 现在门宽来自路在墙上截出的弦长，它降级成一个附加乘数。平地上 `GapMax ≈ 0` ⇒ 系数恒 1，
+	 * 关掉与开着看不出区别；只有房子悬在坎上时才有效。保留是因为悬空的门确实该收窄。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Door")
+	bool bDoorGroundNarrowing = true;
 
 	/** 离地收窄：落差 ≤ 此值门全宽 cm。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Door", meta = (ClampMin = "0.0"))
@@ -354,9 +649,32 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Door", meta = (ClampMin = "10.0"))
 	float DoorGapZero = 120.0f;
 
+	/**
+	 * 拱顶相对**起拱线**能升多高 cm。**0 = 半宽**（正半圆，2026-09-04 之前的唯一行为）。
+	 *
+	 * 半圆下"拱高 ≡ 半宽"，洞一宽拱就顶得很高（用户 2026-09-04：*门上升过高*）。
+	 * 给它一个上限之后拱变**扁**（椭圆拱），与 `img/tiny-glade-ref-twin-arch-pier.jpg`
+	 * 里"跨约 200 cm、起拱线以上只升约 80 cm"那一档对上。
+	 *
+	 * ⚠️ 这条只管**拱那一段**。整个洞的顶高另有一条 `DoorHeight`（并被
+	 * `墙高 − LintelBand` 夹住）—— 想让门整体矮下去改那一条，想让拱扁下去改这一条。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Door", meta = (ClampMin = "0.0"))
+	float DoorMaxArchRise = 70.0f;
+
 	/** 拱宽下限 cm，低于即不点亮。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Door", meta = (ClampMin = "10.0"))
 	float DoorMinWidth = 40.0f;
+
+	/**
+	 * 两个洞之间**剩下的采样环段**短于此值 cm 就并掉（两个洞合成一个）。0 = 不并。
+	 *
+	 * 路是在底部那条环线上切口子，切剩下的才是墙；碎到几厘米的环段既砌不成墙也挡不住路。
+	 * 最刺眼的是转角：两边都有路时角上常留一点点，于是两道拱之间夹一片没意义的灰泥薄片。
+	 * 详见 `FCSDoorRunParams::MinWallSegment`（它也解释了为什么这条不会把拱廊的墩并掉）。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Door", meta = (ClampMin = "0.0"))
+	float DoorMinWallSegment = 30.0f;
 
 	/** 拱宽进哈希前的量化步长 cm——地形微抖不触发全量重建。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Door", meta = (ClampMin = "0.5"))
@@ -421,7 +739,7 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Frame")
 	bool bFrameEnabled = true;
 
-	/** 门框砖的字典网格（TG 的 /Game/TinyGlade/Meshes/brick）。留空则不砌。 */
+	/** 门框砖的字典网格（TG 的 /PCGPlugins/HouseTest/TinyGladeAsset/Meshes/brick）。留空则不砌。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Frame")
 	TObjectPtr<UStaticMesh> FrameBrickMesh;
 
@@ -440,6 +758,20 @@ public:
 	/** 砖穿过墙厚的尺寸 cm。留 0 = 用墙厚（砖正好填满断口，两侧各露一个面）。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Frame", meta = (ClampMin = "0.0"))
 	float FrameBrickThickness = 0.0f;
+
+	/**
+	 * 砖相对墙面的**外凸** cm（两面各凸这么多；只在 `FrameBrickThickness = 0` 的自动档生效）。
+	 *
+	 * 2026-09-04 用户："很多结构离墙太近了，应该是它们的中心在墙 mesh 上，而不是它们的最远端。"
+	 * 之前砖的穿墙厚度 = 墙厚、路走墙厚正中 ⇒ 砖的外表面与墙面**共面**，拱圈石 / 墩 / 勒脚
+	 * 全贴在灰泥里一点都不凸；而角石（`QuoinInset = 0`：一半在实体里一半探出去）反倒是对的。
+	 * TG 的砖本来就是墙本身、灰泥是盖在外面的一层，拱圈石天然凸出灰泥面并在门上投影
+	 * （实拍 `img/tiny-glade-ref-door-in-arch.png`）。
+	 * 中心仍在墙厚正中（"中心在墙 mesh 上"），厚度加 2×此值 ⇒ 两面各凸一截，
+	 * 洞口断口两侧照旧被砖封住。门框砖 / 勒脚 / 角石共用一份 `BlockSize`，三家一起凸。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Frame", meta = (ClampMin = "0.0", ClampMax = "30.0"))
+	float FrameBrickProtrude = 6.0f;
 
 	/**
 	 * 相邻砖之间的**排布缝** cm（随铺装缩放一起缩）。默认 0：净缝整个交给 FrameBrickBloat 出。
@@ -484,10 +816,30 @@ public:
 	 * the allocation has to happen on the render thread, so growing always blocks, and which
 	 * brush dab it lands on depends entirely on where the user happens to paint — a stall that
 	 * is both hard to reproduce and hard to attribute. One brick is 5 float4 = 80 bytes, so 512
-	 * bricks cost 40 KB. Growth still happens if a house genuinely lays more than this.
+	 * bricks cost 40 KB.
+	 *
+	 * ⚠️ **订正（2026-09-06）**：原注释末句"Growth still happens if a house genuinely lays more
+	 * than this"**是错的** —— `FBrickParams::MaxBricks` 走的是 `AppendFlatRun` 里那句
+	 * `Count = Min(Count, MaxBricks - Cursor)`，**只截断，从不扩容**。撞上限的画面是"洞缘没砌完"，
+	 * 而砖数 / 三角数 / 零阻塞断言全绿，只有那条 Warning 说得出来。
+	 *
+	 * ⚠️ **这不是砖层实际用的那个数**：开了 `bBrickWallEnabled` 之后走
+	 * `EffectiveFrameCapacity()` —— 砖层的量级由 footprint 决定（6 × 4 m、檐高 3 m 就要 1110 块），
+	 * 不该让用户手算，所以它自己按上界加够，**本属性那份留给门框 / 接缝 / 角石 / 包边四家当余量**。
+	 * 上限 65536（用户 2026-09-06 定，≈ 5.2 MB/房）。
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Frame", meta = (ClampMin = "64"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Frame", meta = (ClampMin = "64", ClampMax = "65536"))
 	int32 FrameReserveCapacity = 512;
+
+	/**
+	 * 这栋房**真正**预留的砖容量：`FrameReserveCapacity`，开了砖层就再加上砖层自己的上界。
+	 *
+	 * 注册期一次付清、之后只截断不扩容（扩容要在渲染线程分配，一定阻塞，且落在用户恰好画到的
+	 * 那一笔上）。⚠️ 因此**把房子拉大到超出注册时算出的量，砖层会被截断而不是扩容** ——
+	 * 那条 Warning 是唯一的提示。
+	 */
+	UFUNCTION(BlueprintPure, Category = "CS House|Frame")
+	int32 EffectiveFrameCapacity() const;
 
 	// -------------------------------------------------------------------------
 	// Seam（D7 接缝，2026-08-30 裁决二）—— 纯函数，零共享状态
@@ -512,6 +864,114 @@ public:
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Seam")
 	bool bSeamEnabled = true;
+
+	// -------------------------------------------------------------------------
+	// Quoin（D7 的**墙自身转角**那一半，合卷卷一 A7 / 卷五 A11）
+	//
+	// 四面墙是精确 butt joint，**没有穿模要遮**；角石盖的是外角那条竖直棱上的 UV 岛断裂
+	// （三块 quad 各自从局部 (0,0) 起算 UV，砖纹到角就断）与 90° 硬棱。判据因此是"棱被遮住"，
+	// 不是"不穿模"。算法与"为什么不另起一套排布"见 CSHouseQuoin.h。
+	//
+	// 角石与接缝砖、门框砖**共用一个组件与一份容量**（`FrameReserveCapacity`）——
+	// TG 全库也只有一块 `brick`，且它的每砖记录里根本没有 mesh 索引字段（合卷卷五 §1）。
+	// -------------------------------------------------------------------------
+
+	/** 关掉即这栋房不出角石。出图脚本靠它拍"同机位只切开关"的对照图。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Quoin")
+	bool bQuoinEnabled = true;
+
+	/**
+	 * 柱心沿角平分线**向内**缩的距离 cm。
+	 *
+	 * 0 = 柱心正落在外角点上：砖一半埋在墙角实体里、一半探出去，正是角石该有的样子，
+	 * 也是"遮住那条竖直棱"最省的摆法。调大则整根往房里坐（棱会重新露出来），
+	 * 调负数则整根飘出墙外。**改它会改砖的位置 ⇒ 已进砖路哈希**。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Quoin", meta = (ClampMin = "-50.0", ClampMax = "100.0"))
+	float QuoinInset = 0.0f;
+
+	// -------------------------------------------------------------------------
+	// Trim（包边石，D7 的第三样；合卷卷一 A8 / 卷五 A11）
+	//
+	// 墙顶压顶石与墙脚勒脚石：同一套机制、只差一个高度。与角石共用 `SolveRun`、负缝、容量、
+	// 随机数基；与门框砖共用组件与那条"母材质勾没勾 bUsedWithInstancedStaticMeshes"的执行面判据。
+	// ⚠️ 必须避开洞，否则勒脚会从门口横穿过去 —— 而且所有数值断言都不会红。算法见 CSHouseTrim.h。
+	// -------------------------------------------------------------------------
+
+	/** 关掉即两条包边带都不出。出图脚本靠它拍"同机位只切开关"的对照图。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Trim")
+	bool bTrimEnabled = true;
+
+	/**
+	 * 墙顶压顶石。
+	 *
+	 * ⚠️ **默认 false（2026-08-31 用户裁决「墙的上沿我看过 TG 中是没有的，可以去掉」）。**
+	 * 与合卷卷五 §4.1 的实测一致：TG 的 `wall-constructor` 53 个源文件里没有任何
+	 * coping / capping / parapet 产出物，墙顶就是最后一层墙砖本身，上沿看着不同只是因为
+	 * 那一圈砖露出了顶面、又吃到 `flags&4` 的水平胀大。机制留着，默认不出。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Trim")
+	bool bTrimTop = false;
+
+	/** 墙脚勒脚石。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Trim")
+	bool bTrimBase = true;
+
+	/**
+	 * 压顶石课程中心相对**墙顶**的偏移 cm。
+	 *
+	 * 0 = 骑在墙顶（一半埋进墙、一半探出去）—— 与 `QuoinInset` 同一条口径，也是 TG 那种
+	 * "砖互相穿插、看不出接缝"的做法。正值整课往上抬（会在墙顶露出一条缝），负值往下沉。
+	 * 课程本身的高度是 `FrameBrickDepth`（三家共用一份 `BlockSize`，见 CSHouseTrim.h）。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Trim", meta = (ClampMin = "-100.0", ClampMax = "100.0"))
+	float TrimTopOffset = 0.0f;
+
+	/** 勒脚石课程中心相对**房底**的偏移 cm。0 = 骑在房底（一半埋进地）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Trim", meta = (ClampMin = "-100.0", ClampMax = "100.0"))
+	float TrimBaseOffset = 0.0f;
+
+	/**
+	 * 包边在洞两侧额外让开的距离 cm。给门樘砖留位置，别和包边挤在一起。
+	 *
+	 * ⚠️ 太大会让短墙上的包边整段消失（剩余段短于半块砖就不出）—— 那是有意的下限，
+	 * 不是 bug；症状是"某面墙没有勒脚"，先查这个值再查别的。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Trim", meta = (ClampMin = "0.0", ClampMax = "200.0"))
+	float TrimOpeningClearance = 6.0f;
+
+	// -------------------------------------------------------------------------
+	// 砖层（两层墙之 A，2026-09-06 用户裁决「挖洞策略改成 TG 的真两层」）
+	// -------------------------------------------------------------------------
+	//
+	// 砖层 = **一摞包边带**：`CSHouseTrim::BuildBand` 本来就是"沿四条边铺一行、按洞切断"，
+	// 从房底摞到檐口就是整面砖墙。洞缘四级里的①删实例、②水平贴合由它现成做掉，
+	// ③逐顶点垂直贴合与④逐像素兜底在 GPU 侧、还没做。
+
+	/**
+	 * ⚠️ **默认关**。开着它并**不会**把现在的灰泥墙板换掉 —— 两层是"砖底 + 灰泥面"，
+	 * 而灰泥那半还没有独立网格（仍是墙板 + 材质假面）。所以现在开 = 在墙板外面再糊一层砖，
+	 * 只用来对观感与量预算，**不是**终局形态。
+	 *
+	 * 计划 D4 的验收门要求"洞缘与改动前**逐像素相同**"，那本来就得两条路并存才比得了 ——
+	 * 所以这个开关不是临时脚手架，是验收门的一部分。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Brick Wall")
+	bool bBrickWallEnabled = false;
+
+	/**
+	 * 请求的层高 cm。实际层高会向下微调，让最后一层的顶正好对齐檐口（`PlanCourses`）。
+	 *
+	 * 默认钉在 `FrameBrickDepth` 上：`AppendFlatRun` 里砖的**进深轴朝上**，所以一层的竖向
+	 * 占位就是进深。调得比进深小 ⇒ 层间穿插（TG 就是靠 `FrameBrickBloat` 的负缝咬住的）；
+	 * 调得比进深大 ⇒ 层间露缝。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Brick Wall", meta = (ClampMin = "1.0"))
+	float BrickWallCourseHeight = 20.0f;
+
+	/** 砖层在洞两侧额外让开的距离 cm。与包边同义，但砖层要贴得更紧，所以默认小一半。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Brick Wall", meta = (ClampMin = "0.0"))
+	float BrickWallOpeningClearance = 3.0f;
 
 	// -------------------------------------------------------------------------
 	// Pillar（承重柱，D9——独立组件，不进房体网格）
@@ -626,14 +1086,85 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Vine", meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float VineJumpChance = 0.5f;
 
-	/** 让藤爬上山墙三角（墙顶随屋面斜边升高）。关掉就一律停在檐口高度（第一档行为）。
-	 *  ⚠️ 只有**山墙**那两面会因此变高；檐墙的墙顶本来就是平的，它上面是屋面板不是墙。 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Vine")
-	bool bVineClimbGable = true;
-
 	/** 逐实例随机的用户种子。⚠️ 随机**只由 (墙号, 藤号, 段号, 种子) 决定**，不取
 	 *  `InterlockedAdd` 的槽位 —— 槽位每次重扫都重掷，症状是"重建一次全场变色"，
 	 *  而且不会有任何断言报红（S1 已经栽过一次）。 */
+	/** 藤脚允许的最大地面空隙（cm）。超过它那一根不长 —— 房子悬空则一根藤都没有。
+	 *  与 `PillarMinGap` 共用同一个 Gap 量，取值应当略大于它（理由见 `CSHouseVine::FParams::MaxGroundGap`）。 */
+	/**
+	 * 枝走**扫掠管子**（2026-09-06 裁决 1/2）而不是一段一实例。
+	 *
+	 * 留这个开关只为一件事：**新旧两条路的同机位对照**。管子那条定型后它连同 `VineBranchMesh`
+	 * 一起删 —— 别把它当成一个长期的表现选项，两条路的观感差异（接缝 / 粗细阶梯）正是换路的理由。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Vine")
+	bool bVineUseTube = true;
+
+	/** 管子截面环的周向段数。3 = 三棱柱（TG 原始形态），6–8 接近圆。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Vine", meta = (ClampMin = "3", ClampMax = "24"))
+	int32 VineTubeSegments = 8;
+
+	/** 折线的 Catmull-Rom 细分次数。0 = 不细分（管子跟着原始折线的折点走）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Vine", meta = (ClampMin = "0", ClampMax = "6"))
+	int32 VineTubeSubdivide = 2;
+
+	/**
+	 * 生长前沿的速度（cm/s）。
+	 *
+	 * ⚠️ **房子是唯一真源**：它同时被 CPU 与材质用 —— CPU 拿它判断"前沿有没有越过变化点"
+	 * （见 `ResolveVineSpawnTimes`），材质拿它推前沿。所以它由 `EnsureVineComponents`
+	 * 下推进三张藤材质的 MID（同 `Season` 那条），**别去材质实例上直接改**：
+	 * 改了那边 CPU 不知道，症状是改门之后藤要么跳一段要么倒退一段。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Vine", meta = (ClampMin = "1.0"))
+	float VineGrowSpeed = 60.0f;
+
+	/**
+	 * 叶子比**枝的生长前沿**迟多少**秒**才开始张开（用户裁决 2026-09-06）。
+	 *
+	 * ⚠️ 材质里的量是**弧长 cm**（前沿是按弧长推的），这里给秒、由 `EnsureVineComponents`
+	 * 按 `延迟 × VineGrowSpeed` 换算后下推。所以**改速度时延迟的秒数不变、光杆那一截的长度会变** ——
+	 * 反过来（材质里直接写 cm）则是长度不变、秒数随速度伸缩。给秒是因为"延迟"本来问的就是时间。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Vine", meta = (ClampMin = "0.0", ClampMax = "30.0"))
+	float VineLeafGrowDelay = 0.75f;
+
+	/** 花比枝的前沿迟多少**秒**才开。**比叶子更迟** —— 花是长成之后才开的。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Vine", meta = (ClampMin = "0.0", ClampMax = "30.0"))
+	float VineFlowerGrowDelay = 1.8f;
+
+	/**
+	 * 一个点从"没长"到"长成"花多少**秒** —— 也就是"张开"这个动作本身的时长。
+	 *
+	 * 枝与叶花共用它：三者的前沿是同一条，各写各的会让叶子在枝还没长实的地方就张开。
+	 * ⚠️ **它太小的话延迟看不出来**：原来固定 12 cm（默认速度下 0.2 s），快到读不出动作，
+	 * 于是"叶子比枝迟"这件事也无从分辨。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Vine", meta = (ClampMin = "0.01", ClampMax = "10.0"))
+	float VineGrowFadeSeconds = 0.5f;
+
+	/**
+	 * 加载 / PIE 开始时是否把全部藤当成"首次出现"（= 整栋房子从零长一遍）。
+	 * 假则写一个很早的哨兵时刻，藤在第一帧就是长成的。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Vine")
+	bool bVineGrowOnLoad = true;
+
+	/** 梢部收紧的辐射长度（cm）。从梢往回这么长的一段里管径平滑压到 `VineTipTaperMin`。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Vine", meta = (ClampMin = "0.0"))
+	float VineTipTaperLength = 60.0f;
+
+	/** 梢尖处相对主锥度的残留比例。**不能取 0**（零面积三角形 + NaN 法线）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Vine", meta = (ClampMin = "0.01", ClampMax = "1.0"))
+	float VineTipTaperMin = 0.06f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Vine", meta = (ClampMin = "0.0"))
+	float VineMaxGroundGap = 25.0f;
+
+	/** 沿墙采样地面空隙的间距（cm）。只影响"悬空判据"的分辨率，不影响藤的形态。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Vine", meta = (ClampMin = "10.0"))
+	float VineGroundSampleSpacing = 100.0f;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Vine")
 	int32 VineSeed = 1;
 
@@ -722,6 +1253,37 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Pillar", meta = (ClampMin = "5.0"))
 	float PillarSize = 30.0f;
 
+	/**
+	 * 柱子用**砖砌**而不是摞方盒（2026-09-06 用户裁决，B 档：石柱 + 托架）。
+	 *
+	 * 留这个开关只为新旧同机位对照。砖那条定型后它连同 `PillarMesh` / `SubmitPillarMesh`
+	 * 一起删 —— 方盒本来就是占位。
+	 * ⚠️ 切换时**另一条必须显式清掉**（`PillarMeshComponent->SetGpuMesh(nullptr)` /
+	 * 砖的空表走 counter 清零）：藤蔓换管子时正是漏了这一条，画面上两套同时存在。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Pillar")
+	bool bPillarUseBricks = true;
+
+	/** 柱砖的网格。留空则退回方盒。与墙砖 / 门框砖是**同一块** `brick`（TG 没有柱子网格）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Pillar")
+	TObjectPtr<UStaticMesh> PillarBrickMesh;
+
+	/** 一层砖的高度（cm）。层数按柱长取整后层高会被摊匀，所以这只是目标值。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Pillar", meta = (ClampMin = "4.0"))
+	float PillarCourseHeight = 20.0f;
+
+	/** 逐层绕竖轴的随机偏转（弧度）。TG 的石柱不是笔直码齐的。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Pillar", meta = (ClampMin = "0.0", ClampMax = "0.8"))
+	float PillarYawJitter = 0.14f;
+
+	/** 顶部出挑的层数（TG 的 brackets / small_brackets）。0 = 不做托架。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Pillar", meta = (ClampMin = "0", ClampMax = "8"))
+	int32 PillarBracketCourses = 3;
+
+	/** 顶层相对砖宽的出挑比例。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Pillar", meta = (ClampMin = "0.0", ClampMax = "1.5"))
+	float PillarBracketOverhang = 0.55f;
+
 	/** 柱脚扎入地面的深度 cm。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Pillar", meta = (ClampMin = "0.0"))
 	float PillarEmbed = 5.0f;
@@ -771,7 +1333,8 @@ public:
 	 * 派生物跟得住"的那套机制的唯一入口，将来的 handle actor 也只是往这里喂 Offset。
 	 *
 	 * 三件事都在这条路上一次做完，分开做就会各漏一样：
-	 *  ① 禁带 + `MinFootprint`（`CSHouse_ApplyEdgePush`，纯函数、可单测）；
+	 *  ① `MinFootprint` 下限（`CSHouse_ApplyEdgePush`，纯函数、可单测）——⚠️ 早先这里还写着
+	 *     "禁带"，那一套已随四坡屋顶于 2026-08-31 删除，`ApplyEdgePush` 只剩硬下界这一条 clamp；
 	 *  ② `UCSHouseSubsystem::MarkHouseDirty` —— 拖动期不必等 0.25 s 的兜底快扫；
 	 *  ③ `ReevaluateSite()` —— 走的是与平移完全相同的那条零阻塞路径，不另开快路。
 	 *
@@ -798,9 +1361,85 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "CS House")
 	float PushEdge(int32 EdgeIndex, float Offset, bool bFinished = false);
 
-	/** 当前禁带在给定边上的合法区间（出图 / 断言用；X 是下沿、Y 是上沿）。带关掉时两者相等。 */
-	UFUNCTION(BlueprintPure, Category = "CS House")
-	FVector2D GetFootprintBandRange(int32 EdgeIndex) const;
+	/**
+	 * 改墙高（D5 的第二个自由度）：`WallHeight += Offset`，夹在 `MinWallHeight` 上，然后立刻
+	 * 重求值。返回**实际**生效的高度变化。
+	 *
+	 * 与 `PushEdge` 的两点不同：
+	 *  ① **不动 actor 变换** —— 只改一个标量，所以没有那边"父级移动 Applied/2 把抓手一起带走"
+	 *     的 2× 回路。抓手侧的记账量法照旧保留，它还管着"顶在下限上不许攒残差"。
+	 *  ② 波及面更广：檐口高、屋面、门洞的离地收窄、窗的 `AboveEave` 谓词、藤蔓与摆件的锚点
+	 *     全都读 `WallHeight`，所以这条路必须走完整的 `ReevaluateSite()`，不能只重建墙板。
+	 *
+	 * ⚠️ 调用方必须用**返回值**记账，不是传入的 `Offset`（同 `CSHouseResize.h` 的返回值契约）：
+	 * 顶在 `MinWallHeight` 上时两者不等，记请求值会让残差一路累积，松手瞬间房子跳一大截。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "CS House")
+	float PushHeight(float Offset, bool bFinished = false);
+
+	// -------------------------------------------------------------------------
+	// 拉尺寸模式（计划 D5 的交互层）
+	// -------------------------------------------------------------------------
+
+	/**
+	 * 进入 / 退出拉尺寸模式的静态广播。编辑器模块据此维护"处于编辑态的房屋集"并接管
+	 * 失选监听（`FCSHouseResizeSelectionWatcher`）。**静态**是因为监听方是模块而不是实例。
+	 */
+	static FCSHouseResizeModeChanged OnResizeModeChanged;
+
+	/**
+	 * 生成五个抓手 actor：四面墙各一个**锥子**（水平推拉那面墙），外加一个套在房子外面的
+	 * **矩形框**（`ACSHouseHeightHandleActor`，上下拖它改墙高）。选中任一个用编辑器原生
+	 * gizmo 拖即可。
+	 *
+	 * 这就是"点一个蓝图函数，冒出几个能拖的把手"的那个函数：`CallInEditor` 让它直接出现在
+	 * 房子详情面板上，`BlueprintCallable` 让蓝图 / Python 也能调。**幂等** —— 已经在模式里
+	 * 再调一次只把抓手摆回规范位置，不会生出第二组。
+	 *
+	 * 抓手是 `RF_Transient` 的，不存盘、不进 outliner 的保存路径；房子被删或调
+	 * `ExitResizeMode()` 即销毁。
+	 */
+	UFUNCTION(BlueprintCallable, CallInEditor, Category = "CS House|Resize")
+	void EnterResizeMode();
+
+	/** 销毁全部抓手并广播退出。幂等：不在模式里调它什么都不做。 */
+	UFUNCTION(BlueprintCallable, CallInEditor, Category = "CS House|Resize")
+	void ExitResizeMode();
+
+	UFUNCTION(BlueprintPure, Category = "CS House|Resize")
+	bool IsInResizeMode() const { return ResizeHandles.Num() > 0; }
+
+	/**
+	 * 当前抓手（失效的已剔除）：四个水平锥子 + 一个高度框，**混在同一个数组里**。
+	 * 类型是共同基类 `ACSHouseHandleActor` —— 房子对它们只做三件无差别的事
+	 * （摆位、注销、销毁），没有一处需要区分是哪一种。
+	 */
+	UFUNCTION(BlueprintPure, Category = "CS House|Resize")
+	TArray<ACSHouseHandleActor*> GetResizeHandles() const;
+
+	/** 只要那四个水平推拉锥子（无头测试按边号取用）。 */
+	UFUNCTION(BlueprintPure, Category = "CS House|Resize")
+	TArray<ACSHouseResizeHandleActor*> GetEdgeHandles() const;
+
+	/** 那个调高度的框；不在模式里返回 nullptr。 */
+	UFUNCTION(BlueprintPure, Category = "CS House|Resize")
+	ACSHouseHeightHandleActor* GetHeightHandle() const;
+
+	/**
+	 * 把**全部**抓手摆回各自的规范位置，并按当前 footprint 重算"窗框"四条边的长度。
+	 *
+	 * 单边推拉会改 footprint 与房心，而 attach 只保相对位置不变 —— 不重摆的话四根条子会
+	 * 各自漂出框外（被拖的那根漂得最快，画面上是框裂开）。
+	 *
+	 * ⚠️ **早先这里有个 `Except` 参数，用来"拖拽期不回写正在被拖的那一个"（怕与 gizmo 抢写）。
+	 * 2026-09-06 连同那条纪律一起删掉** —— 那是设计期的预判，实际代价是被拖的条子会跑到
+	 * 光标前面去。重摆之后抓手的记账量恰好等于规范位置，"拖 1 m 墙走 1 m"不受影响，
+	 * 判据见 `House.ResizeHandle` 的第 ②③ 段。
+	 */
+	void SnapResizeHandles();
+
+	/** 抓手自毁时回调，把它从表里摘掉；表空了即广播退出。 */
+	void NotifyResizeHandleDestroyed(ACSHouseHandleActor* Handle);
 
 	UFUNCTION(BlueprintPure, Category = "CS House")
 	int32 GetOpenDoorCount() const;
@@ -843,6 +1482,75 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "CS House")
 	ECSFeatureReject QueryFeatureReject(const FCSWallOpening& Candidate) const;
 
+	/**
+	 * 射线打在本房哪面外墙上（D8 宿主解析）。世界空间入、**本房局部**命中出。
+	 *
+	 * ⚠️ **解析求交，不是引擎 trace** —— 房子的 gpumesh 全线 `NoCollision`，`LineTraceSingle`
+	 * 一栋都打不到（计划 D8 明写这条）。判据本体在纯函数 `CSHouse_RayHitWall` 里，本方法
+	 * 只负责一件别处做不了的事：拿**烘常驻流用的那个变换**（`GetBuildTransform`，只取 yaw +
+	 * 位置）去解世界坐标。拿 `GetActorTransform` 解会在有 pitch/roll 的房子上把命中点算到墙外。
+	 */
+	FCSWallHit RayHitWall(const FVector& WorldOrigin, const FVector& WorldDir, float MaxDistance) const;
+
+	/** 就近找墙（射线落空时的退路）。同样是世界入、局部出，见 `CSHouse_NearestWall`。 */
+	FCSWallHit NearestWall(const FVector& WorldPoint, float MaxDistance) const;
+
+	/**
+	 * 锚点 → **世界**变换（D8，2026-09-06）。附属物按锚点吸附时调它 ——
+	 * 对位 TG 的 `CachedDecoratorTransforms`：变换是从锚点算出来的派生量，不是存下来的。
+	 *
+	 * 放在房子上而不是让标记自己拼，是因为"构建空间"（`GetBuildTransform`，只取 yaw）
+	 * 是房子的私事：烘常驻流、`RayHitWall`、这里，三处必须用同一个变换，各拼一遍就会出现
+	 * "房子一转，窗贴到旁边去了"。顺带它也能给 Blueprint / 无头脚本直接用。
+	 */
+	UFUNCTION(BlueprintPure, Category = "CS House|Window")
+	FTransform AnchorToWorld(const FCSWallAnchor& InAnchor, float HalfHeight, float Standoff) const;
+
+	// -------------------------------------------------------------------------
+	// 特征标记登记（D8）—— 标记提诉求，房子照旧只认谓词
+	//
+	// ⚠️ **这份表是 transient 的，故意不序列化**：权威在标记 actor 自己身上（它序列化了自己的
+	// 摆位），加载后由标记在 `PostRegisterAllComponents` 重新登记。序列化它就会出现"标记删了
+	// 但房子里还留着一扇窗"这类只有重开关卡才显形的幽灵 —— 与「派生物纯函数、不序列化」
+	// 是同一条纪律。
+	//
+	// 与属性面板那份 `Windows` 并存、互不覆盖：两者都只是"诉求"，一起喂给同一条谓词。
+	// -------------------------------------------------------------------------
+
+	/** 幂等：同一个 `MarkerId` 再登记就是改诉求。会标脏（下一次重求值生效）。 */
+	void RegisterFeatureMarker(const FGuid& MarkerId, const FCSHouseWindow& Demand,
+		class ACSHouseFeatureMarker* Marker = nullptr);
+
+	/** 注销。找不到就什么都不做（标记自毁 / 换宿主时两边都会调，允许空打）。 */
+	void UnregisterFeatureMarker(const FGuid& MarkerId);
+
+	/** 当前登记的标记数（无头断言用 —— 只看窗洞数分不清"没登记"与"登记了被拒"）。 */
+	UFUNCTION(BlueprintPure, Category = "CS House|Window")
+	int32 GetFeatureMarkerCount() const { return MarkerWindows.Num(); }
+
+	/** 见 `StartWindowBrush()`。编辑器模块在启动时订阅。 */
+	static FCSHouseWindowBrushRequest OnWindowBrushRequest;
+
+	/**
+	 * 窗笔刷这一笔要放的窗（子蓝图那一档，如 `BP_Window_Cottage_1x1`）。
+	 * 空 = 退回 `ACSWindowMarker` 本身（C++ 默认那块 cottage 框板）。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS House|Window")
+	TSubclassOf<ACSHouseFeatureMarker> WindowBrushClass;
+
+	/**
+	 * **点一下加一扇窗**（2026-09-06 用户裁决）：进笔刷模式 → 在墙上点一下 → 立刻退出。
+	 *
+	 * 为什么是笔刷而不是"把窗蓝图拖进视口"：拖放那条路要靠 actor 自己的 forward 去解析宿主，
+	 * 而**朝向什么时候被应用**在两条 spawn 路径上不一样（`UEditorEngine::AddActor` 把 Rotation
+	 * 一起传给 `SpawnActor`，`EditorActorSubsystem` 那条却是先放置、回调之后才设朝向）。点击给的
+	 * 是相机射线 + 精确命中点，不依赖 actor 自身朝向 —— 从根上没有那个问题。
+	 *
+	 * 落地全在 `UCSHouseSubsystem::PlaceMarkerAlongRay`，本函数只发一个请求。
+	 */
+	UFUNCTION(BlueprintCallable, CallInEditor, Category = "CS House|Window", meta = (DevelopmentOnly))
+	void StartWindowBrush();
+
 	/** 这一轮真正砌出来的窗洞数（`Windows` 里过了谓词的那些）。 */
 	UFUNCTION(BlueprintPure, Category = "CS House|Window")
 	int32 GetWindowCount() const { return CurrentWindowCount; }
@@ -877,6 +1585,41 @@ public:
 	/** 这一轮被接缝抹掉的墙段数（clip，不是几何洞）。 */
 	UFUNCTION(BlueprintPure, Category = "CS House|Seam")
 	int32 GetSeamCutCount() const { return CurrentSeamCuts.Num(); }
+
+	/** 角石砖数（同样含在 `GetFrameBrickCount()` 里 —— 三者共用一个组件与一份容量）。 */
+	UFUNCTION(BlueprintPure, Category = "CS House|Quoin")
+	int32 GetQuoinBrickCount() const { return CurrentQuoinBrickCount; }
+
+	/** 本轮实际出砖的角石柱数（正常恒 4；退化 footprint 或容量耗尽时会少）。 */
+	UFUNCTION(BlueprintPure, Category = "CS House|Quoin")
+	int32 GetQuoinColumnCount() const { return CurrentQuoinColumnCount; }
+
+	/** 包边砖数（同样含在 `GetFrameBrickCount()` 里 —— 四者共用一个组件与一份容量）。 */
+	UFUNCTION(BlueprintPure, Category = "CS House|Trim")
+	int32 GetTrimBrickCount() const { return CurrentTrimBrickCount; }
+
+	/** 砖层这一轮实际发出的砖数（**已被容量截断之后**的数）。 */
+	UFUNCTION(BlueprintPure, Category = "CS House|Brick Wall")
+	int32 GetBrickWallBrickCount() const { return CurrentBrickWallBrickCount; }
+
+	/** 砖层的层数（`PlanCourses` 的结果）。0 = 整层没开或墙高为零。 */
+	UFUNCTION(BlueprintPure, Category = "CS House|Brick Wall")
+	int32 GetBrickWallCourseCount() const { return CurrentBrickWallCourseCount; }
+
+	/**
+	 * 砖层**不减洞**的砖数上界（`CSHouseBrickWall::EstimateBricks`）。
+	 * 与 `FrameReserveCapacity` 一起看才有意义：上界超容量 = 这栋房的砖层一定会被截断。
+	 */
+	UFUNCTION(BlueprintPure, Category = "CS House|Brick Wall")
+	int32 GetBrickWallBrickBudget() const;
+
+	/** 墙顶包边被洞切成了几段（无洞的矩形房恒 4）。 */
+	UFUNCTION(BlueprintPure, Category = "CS House|Trim")
+	int32 GetTrimTopRunCount() const { return CurrentTrimTopRunCount; }
+
+	/** 墙脚包边被洞切成了几段。**开一扇门就会多一段**——这正是"包边避开了洞"的可断言证据。 */
+	UFUNCTION(BlueprintPure, Category = "CS House|Trim")
+	int32 GetTrimBaseRunCount() const { return CurrentTrimBaseRunCount; }
 
 	/**
 	 * 接缝画得出来吗（**执行面**判据，不是数值判据）。
@@ -1043,6 +1786,45 @@ public:
 	UFUNCTION(BlueprintPure, Category = "CS House|Vine", meta = (DevelopmentOnly))
 	FString GetVineUndrawableReason() const;
 
+	/** 四面墙**处处**悬空（空隙全部超 `VineMaxGroundGap`）？是则"零藤"是合法状态而非缺陷。
+	 *  ⚠️ 纯 C++，**不要**在它和上面那个 `UFUNCTION` 之间插东西 —— 宏只作用于紧随其后的
+	 *  那一个声明，插进去就是把 `GetVineUndrawableReason` 的暴露悄悄抢走（脚本侧报
+	 *  `AttributeError`，而 C++ 一切正常）。 */
+	bool IsVineSuppressedByGroundGap() const;
+
+	/** 这一轮铺出来的瓦片数。CPU 侧本来就排好了记录，不需要回读 GPU。 */
+	UFUNCTION(BlueprintPure, Category = "CS House|Roof Tile")
+	int32 GetRoofTileCount() const { return CurrentRoofTileCount; }
+
+	/** 画不出来的原因（空串 = 画得出来）。理由逐字见 `GetVineUndrawableReason`。 */
+	UFUNCTION(BlueprintPure, Category = "CS House|Roof Tile", meta = (DevelopmentOnly))
+	FString GetRoofTileUndrawableReason() const;
+
+	/** 这一轮立起来的尖顶数（矩形 2 根、正方形退化成 1 根、没网格 0 根）。 */
+	UFUNCTION(BlueprintPure, Category = "CS House|Roof Finial")
+	int32 GetRoofFinialCount() const { return CurrentRoofFinialCount; }
+
+	/**
+	 * 当前生效的洞表（门 + 窗 + 第三方注入）。
+	 *
+	 * `CurrentOpenings` 本身是 protected，**Python / 出图脚本读不到**（`get_editor_property`
+	 * 会报 "protected and cannot be read"）。门宽验收要逐洞量宽度与洞心，所以开这个只读口。
+	 */
+	UFUNCTION(BlueprintPure, Category = "CS House")
+	TArray<FCSWallOpening> GetCurrentOpenings() const { return CurrentOpenings; }
+
+	/** 当前立着的门扇数（= 有门扇的洞数）。 */
+	UFUNCTION(BlueprintPure, Category = "CS House|Door Leaf")
+	int32 GetDoorLeafCount() const { return CurrentDoorLeafCount; }
+
+	/** 空串 = 画得出来。⚠️ 一律调它，不要调 is_*_drawable（见出图脚本坑 ⑩）。 */
+	UFUNCTION(BlueprintPure, Category = "CS House|Door Leaf", meta = (DevelopmentOnly))
+	FString GetDoorLeafUndrawableReason() const;
+
+	/** 画不出来的原因（空串 = 画得出来）。理由逐字见 `GetVineUndrawableReason`。 */
+	UFUNCTION(BlueprintPure, Category = "CS House|Roof Finial", meta = (DevelopmentOnly))
+	FString GetRoofFinialUndrawableReason() const;
+
 	/** 当前摆出来的装饰件总数（所有 palette 合计）。CPU 侧本来就排好了记录，不需要回读 GPU。 */
 	UFUNCTION(BlueprintPure, Category = "CS House|Decor")
 	int32 GetDecorInstanceCount() const { return CurrentDecorInstanceCount; }
@@ -1080,13 +1862,10 @@ public:
 	UCSMesh* GetPillarMesh() const { return PillarMesh; }
 
 	/**
-	 * 当前屋面描述。屋顶坡板、山墙、以及将来的瓦/梁/尖顶/雪与 D8「落屋顶 → 不生成」谓词
-	 * 全部从这一份组装 —— 屋面方程只有 CSHouseRoof.h 一个真源。
+	 * 当前屋面描述（四坡）。瓦 / 梁 / 尖顶 / 雪、摆件的檐口与屋脊锚点、以及 D8「落屋顶 →
+	 * 不生成」谓词全部从这一份组装 —— 屋面方程只有 CSHouseRoof.h 一个真源。
 	 */
 	FCSRoofDesc GetRoofDesc() const;
-
-	/** 属性 → 禁带参数。只有这一处组装，别在各调用点各写一份（带宽下界由滞回比反解）。 */
-	FCSHouseResizeBand MakeResizeBand() const;
 
 	// -------------------------------------------------------------------------
 	// 判定纯函数（无 GPU、无 world 依赖 —— 直接进 CSHouseLogicTests）
@@ -1094,17 +1873,6 @@ public:
 	// 计划纪律：门洞区间、接触段、柱布点、openings 排布这类"能不能 / 在哪 / 多大"的判定
 	// 全部做成纯函数并单测，几何生成只负责照着摆。
 	// -------------------------------------------------------------------------
-
-	/**
-	 * 边缘线段分割（D6）：可用长 = 线段长 − 2×CornerMargin，**等分**成
-	 * N = clamp(round(可用长 / PitchTarget), 1, 32) 段。
-	 *
-	 * 等分而非定模数槽位：拱阵天然对称、没有余量与护角的特判，段长只在目标值附近浮动 ⇒
-	 * 拱宽随之微伸缩，正是 Tiny Glade 那种"拱会呼吸"的观感。可用长装不下一个最小拱时返回 0
-	 * （这条边不开门）。OutFirstS = 第一段起点沿边弧长，OutPitch = 段长。
-	 */
-	static int32 SplitEdgeIntoSlots(float EdgeLength, float CornerMargin, float PitchTarget, float MinWidth,
-		float& OutFirstS, float& OutPitch);
 
 	/**
 	 * 离地收窄系数（D6，用户裁决"离地越高门越窄，直至消失"）：落差 ≤ GapFull 全宽，
@@ -1116,6 +1884,8 @@ public:
 	//~ AActor interface
 	virtual void OnConstruction(const FTransform& Transform) override;
 	virtual void PostRegisterAllComponents() override;
+	/** 编辑器 world 里删房子只走这一条（那个 world 没有 begun play）—— 拉尺寸抓手在这里收。 */
+	virtual void Destroyed() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	virtual void BeginDestroy() override;
 #if WITH_EDITOR
@@ -1125,6 +1895,15 @@ public:
 #endif
 
 private:
+	/**
+	 * 当前的四个拉尺寸抓手（计划 D5）。
+	 *
+	 * `Transient` 且刻意**不进任何 desc 哈希**：抓手是纯编辑设施，房子的几何与它无关 ——
+	 * 混进哈希的症状是"一进拉尺寸模式整栋房子重建一次"，而那正是零阻塞纪律要挡的东西。
+	 */
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<ACSHouseHandleActor>> ResizeHandles;
+
 	/** 材质三槽重绑（房体墙/顶 + 柱），不碰几何 —— 计划 D14「纯外观量绝不进 desc 哈希」。 */
 	void BindHouseMaterials();
 
@@ -1139,8 +1918,66 @@ private:
 	/** 边缘线段分割 + 采样点亮（滞回），产出 CurrentDoors。返回房体**形状**哈希（不含世界变换）。 */
 	uint32 ComputeDoors();
 
-	/** `Windows` 列表 → 候选洞（尚未过谓词）。身份从列表槽位派生，见实现里那段。 */
+	/** `Windows` 列表 + 标记登记表 → 候选洞（尚未过谓词）。身份派生见实现里那两段。 */
 	void BuildWindowOpenings(TArray<FCSWallOpening>& OutCandidates) const;
+
+	/** 一条标记登记的窗诉求。**不是 UPROPERTY**：整张表 transient，理由见公开区那段。 */
+	struct FCSMarkerWindow
+	{
+		FGuid MarkerId;
+		FCSHouseWindow Window;
+		/**
+		 * 登记时那一刻的锚点（2026-09-06）。**洞的弧长从它现算，不用 `Window.CenterS`。**
+		 *
+		 * ⚠️ `CenterS` 是 footprint 的函数：`S = bFromEndCorner ? Len − Dist : Dist`。把它缓存下来，
+		 * 房子一改尺寸缓存就过期，而**没有任何东西会去刷新它** —— `NotifyMarkersRebuilt` 只调
+		 * `SnapToAnchor()`（挪 actor），不重新登记。症状是**框跑到新位置、洞留在原地，且永不自愈**
+		 * （实测：墙 600→1000，锚 `fromEnd=True dist=100`，洞恒在 S=500 而框走到了 S=900）。
+		 * 锚点本身与 footprint 无关，存它才是稳的。
+		 */
+		FCSWallAnchor Anchor;
+		/**
+		 * 反引标记本人（2026-09-06）。**弱引用**：标记的生命周期归它自己，房子只是借来
+		 * 回推裁决与吸附（`NotifyMarkersRebuilt`）。强引用会让删掉的标记活到房子销毁。
+		 */
+		TWeakObjectPtr<class ACSHouseFeatureMarker> Marker;
+	};
+
+	/** 标记登记表。按 `MarkerId` 升序保存 —— 与花名册同一条理由：次序进哈希，不定序就会抖。 */
+	TArray<FCSMarkerWindow> MarkerWindows;
+
+	/**
+	 * 上一次调和锚点时的墙几何 + 构建变换。**世界位置守恒就是拿它当参照系**
+	 * （2026-09-06 用户裁决：拉尺寸时窗不许沿墙滑）。
+	 *
+	 * ⚠️ 为什么必须存参照系而不能只靠锚点：`PushEdge(e, d)` 动的是**哪一个角**取决于推的是哪条边，
+	 * 而锚点自己不知道这件事。不存在一种静态编码能在所有推法下都保持世界位置不变 —— 只能拿
+	 * 「上一次的墙」把同一个物理点重新表达一次。
+	 */
+	FVector2D MarkerRefFootprint = FVector2D::ZeroVector;
+	float MarkerRefThickness = 0.0f;
+	FTransform MarkerRefBuild = FTransform::Identity;
+	bool bMarkerRefValid = false;
+
+	/** 见 `MarkerRefFootprint`。排在算门之前 —— 洞的弧长就是从这些锚点现解出来的。 */
+	void ReanchorMarkersToPreserveWorld();
+
+	/**
+	 * 这一轮每个洞的裁决（key = `FCSWallOpening::SourceId`）。**在真正的落位循环里记下来**，
+	 * 不是事后再问一遍谓词 —— 事后问会拿"已经把自己放进去了"的那份 openings 去判自己。
+	 * 只给 `NotifyMarkersRebuilt` 回推用。
+	 */
+	TMap<FGuid, ECSFeatureReject> CurrentFeatureVerdicts;
+
+	/**
+	 * 重建之后把结果推回每个标记：① 裁决回执（否则拉尺寸把窗挤掉了、标记还在说"我切出洞了"，
+	 * 2026-09-05 核出的过期回执）；② **按锚点吸附**（TG `move_decorators_following_anchors`
+	 * 的对位物 —— 锚点是权威，标记的世界变换是派生量）。
+	 *
+	 * ⚠️ **正在被 gizmo 拖的那一个跳过不写**：标记不 attach 在房子下，写它纯粹是和 gizmo
+	 * 抢方向盘。（拉尺寸抓手是另一回事 —— 那边 attach 着，2026-09-06 改成每次都重摆。）
+	 */
+	void NotifyMarkersRebuilt();
 
 	/** 谓词的输入打包成一份 `FCSOpeningSite`。**唯一**的一处 —— 别在调用点各填一遍。 */
 	FCSOpeningSite MakeOpeningSite() const;
@@ -1205,6 +2042,28 @@ private:
 	 */
 	uint32 BuildSeamBricks(TArray<CSHouseFrame::FElement>& InOutElements, int32& InOutBrickCount);
 
+	/**
+	 * 角石：同样**追加**进门框砖那份元素表，返回它的哈希贡献。
+	 *
+	 * 排在接缝砖之后：门框 → 接缝 → 角石。**次序是承重的** —— 前面任何一段的砖数一变就会
+	 * 把后面所有砖的槽位推走。门框砖的逐实例随机数今天还是槽位派生的，所以它必须排第一；
+	 * 接缝与角石的随机数都已从各自身份派生，彼此换序无害，但固定下来省得将来有人来回改。
+	 */
+	uint32 BuildQuoinBricks(TArray<CSHouseFrame::FElement>& InOutElements, int32& InOutBrickCount);
+
+	/**
+	 * 转角墩：转角配成墩的角上那根柱础 / 柱身 / 柱头（2026-09-06 用户裁决"转角就是一个墩"）。
+	 * 立在角点沿角平分线内缩 T/√2 处 —— 两面墙墙厚中线的交点，门樘砖与拱廊的墩都在那条中线上。
+	 * 高度读 `ResolvePierSpans` 写的 `CornerPierTopZ`，角石在同一高度以下让路。追加进同一份元素表。
+	 */
+	uint32 BuildCornerPierBricks(TArray<CSHouseFrame::FElement>& InOutElements, int32& InOutBrickCount);
+
+	/** 包边石：两条带（墙顶 / 墙脚），同样追加进那份元素表，返回哈希贡献。排在砖序最后。 */
+	uint32 BuildTrimBricks(TArray<CSHouseFrame::FElement>& InOutElements, int32& InOutBrickCount);
+
+	/** 砖层：逐层调 `CSHouseTrim::BuildBand`。排在所有砖家族**最后**，理由同包边。 */
+	uint32 BuildBrickWallBricks(TArray<CSHouseFrame::FElement>& InOutElements, int32& InOutBrickCount);
+
 	void RebuildFrame();
 
 	/** 藤蔓：组件/容量/交接一次付清（同 EnsureFrameComponent），交互期只剩录 pass。 */
@@ -1215,6 +2074,20 @@ private:
 
 	/** 规划 + 录一趟打包 pass；返回这次的形态哈希（喂幂等短路）。 */
 	void RebuildVine();
+
+	/** 屋面瓦：组件/容量/交接一次付清（同 EnsureVineComponents），交互期只剩录 pass。 */
+	void EnsureRoofTileComponent();
+
+	/** 参数打包，顺带从网格包围盒判定三条轴。**只有这一处**组装，别在调用点各写一份。 */
+	CSHouseTile::FParams MakeRoofTileParams() const;
+
+	/** 排布 + 录一趟打包 pass（幂等哈希短路无效唤醒）。 */
+	void RebuildRoofTiles();
+
+	/** 尖顶：脊端点各立一根。走**普通** `UStaticMeshComponent`（一两根而已，不值得再复制一套
+	 *  palette / 容量 / 交接机器）。 */
+	void RebuildRoofFinials();
+	void RebuildDoorLeaves();
 
 	/** 摆件：组件/容量/交接一次付清（同 EnsureVineComponents），交互期只剩录 pass。 */
 	void EnsureDecorComponents();
@@ -1245,6 +2118,21 @@ private:
 	void SubmitBodyMesh(TSharedPtr<FCSGpuMeshCPUData, ESPMode::ThreadSafe> Snapshot);
 	void SubmitPillarMesh(TSharedPtr<FCSGpuMeshCPUData, ESPMode::ThreadSafe> Snapshot);
 
+	/** 折线 → 管子，递交给 `CSVineTube::BuildTubeIntoMesh`。在途被拒时入 `PendingVineTubePath`。 */
+	/**
+	 * 逐藤解出这一轮的 `SpawnTime`，并把历史刷新成本轮形状。
+	 *
+	 * 三种情形：**没见过**这根 → 记当前时刻（从零长）；**形状没变** → 沿用旧相位；
+	 * **形状变了** → 若生长前沿**已经越过**变化点，把前沿拉回变化点、从那里继续长
+	 * （等价于把 SpawnTime 往后挪），否则不动（前沿还没长到那儿，变化对它不可见）。
+	 */
+	void ResolveVineSpawnTimes(const CSHouseVine::FPlan& Plan, TArray<float>& OutSpawnTimes);
+
+	void SubmitVineTube(TSharedPtr<CSHouseVine::FTubePath, ESPMode::ThreadSafe> Path);
+
+	/** 管子构建完成：有挂起的折线就补发一次。 */
+	void OnVineTubeEditComplete();
+
 	/** 异步编辑的游戏线程尾巴：发布分段表 + 补发 pending。 */
 	void OnBodyEditComplete(bool bSorted);
 	void OnPillarEditComplete();
@@ -1270,6 +2158,30 @@ private:
 	UPROPERTY(Transient)
 	TObjectPtr<UCSMesh> PillarMesh;
 
+	/** 柱砖的实例宿主。几百块砖走实例而不是 CPU 三角汤 —— `brick` 是 600 顶点的倒角石块，
+	 *  三角汤那条路 300 块砖就是 18 万顶点，且每次重建都要 CPU 变换一遍。 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS House", meta = (AllowPrivateAccess = "true"))
+	TObjectPtr<UCSGpuInstancedMeshComponent> PillarBrickComponent;
+
+	TArray<CSShaperSteps::FPaletteBuffers> PillarGpuBuffers;
+	TArray<uint32> PillarHandedCapacities;
+	FBox PillarHandedLocalBounds = FBox(ForceInit);
+
+	/** 砖石柱：备容量 / 交接实例源（与 `EnsureFrameComponent` 同型，阻塞的活都在这里一次付清）。 */
+	void EnsurePillarBrickComponent();
+
+	/**
+	 * 藤蔓管子（枝）的网格宿主。**与 `PillarMeshComponent` 同型**：几何在世界空间产出，
+	 * 组件钉在恒等世界变换上（`UCSMeshRenderComponent` 的构造函数已把变换标成绝对）。
+	 * 叶与花**不走这里** —— 它们仍是实例，挂在那三个 `UCSGpuInstancedMeshComponent` 上。
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS House", meta = (AllowPrivateAccess = "true"))
+	TObjectPtr<UCSMeshRenderComponent> VineTubeComponent;
+
+	/** 藤蔓管子的网格对象。Transient：派生物，加载后由 ReevaluateSite 重建。 */
+	UPROPERTY(Transient)
+	TObjectPtr<UCSMesh> VineTubeMesh;
+
 	/**
 	 * 当前生效的洞（房体形状 desc 的一部分）。门由道路推导、窗由特征标记注册，两者同表 ——
 	 * 墙板生成只认剖面 + 摆位，不关心洞是谁提的。
@@ -1278,26 +2190,37 @@ private:
 	TArray<FCSWallOpening> CurrentOpenings;
 
 	/**
-	 * 子段滞回状态：key = (Edge<<24) | (N<<16) | SlotIndex。N 进 key，墙长变化重排时不误继承。
+	 * 门洞的滞回状态：**上一帧每条边上的洞区间**（`FCSDoorRunMemory`，沿边弧长）。
 	 *
-	 * **必须序列化，且必须 NonTransactional**（计划 D6）：滞回让 ReevaluateSite() 成为路径依赖
-	 * 函数，承载路径的表冷加载时为空 ⇒ 覆盖率落在 [SlotOff, SlotOn) 的已开拱重开关卡直接消失。
+	 * 继承判据是"与上一帧区间交叠"，不是编号 —— 旧口径 key 里带段数 N，拉尺寸跨过 `round()`
+	 * 边界那一帧整条边 key 全失配、滞回集体失效，那条坑随这次重做一起消失。
+	 *
+	 * **必须序列化，且必须 NonTransactional**（计划 D6，理由逐字照旧）：滞回让 ReevaluateSite()
+	 * 成为路径依赖函数，表冷加载时为空 ⇒ 宽度落在保活区间里的已开拱重开关卡直接消失。
 	 * NonTransactional 不能省 —— 普通 UPROPERTY 会被事务缓冲整份捕获，一次无关的 details 改参
-	 * + Ctrl+Z 就把滞回表回滚到旧代（与"笔刷家族无 Undo"的既定裁决同向，把口头约定变成类型级
-	 * 保证）。凡双阈滞回的开关表都照此办理。
+	 * + Ctrl+Z 就把滞回表回滚到旧代。凡滞回状态都照此办理。
 	 */
 	UPROPERTY(NonTransactional)
-	TMap<uint32, bool> DoorSlotOpen;
+	TArray<FCSDoorRunMemory> DoorRunMemory;
 
 	/**
 	 * 拱间墩的迟回状态：key = (Edge<<24) | (该边洞数<<16) | 跨度序号。
 	 *
-	 * 洞数进 key 与 `DoorSlotOpen` 把 N 进 key 同一个理由：多开/少开一个拱会把整条边的跨度
+	 * 洞数进 key：多开/少开一个拱会把整条边的跨度
 	 * 重新编号，不把编号基准放进 key 就会把旧跨度的样式误继承给完全不同的一段墙。
 	 * 序列化与 NonTransactional 的理由同上一条，逐字适用（迟回让重求值成为路径依赖函数）。
 	 */
 	UPROPERTY(NonTransactional)
 	TMap<uint32, bool> PierSpanIsPier;
+
+	/**
+	 * 四个角各自的转角墩顶（墙空间高度；0 = 这个角没配成墩）。`ResolvePierSpans` 每轮整份重写，
+	 * `BuildCornerPierBricks` 按它立柱、`BuildQuoinBricks` 按它让角石在墩顶以下让路 ——
+	 * 两个消费者读同一份数，才不会出现"墩砌到 A、角石剔到 B"。序号与 `CSHouseQuoin::CornerSign` 同序。
+	 */
+	float CornerPierTopZ[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	/** 这一轮立起来的转角墩数（0..4）。 */
+	int32 CurrentCornerPierCount = 0;
 
 	// 两级哈希（形状 / 摆位）各自守卫房体与柱：形状变 → 全量重建；只有摆位变 → TransformMesh 一刀。
 	uint32 BodyShapeHash = 0;
@@ -1340,6 +2263,17 @@ private:
 	int32 CurrentSeamCornerCount = 0;
 	int32 CurrentSeamBrickCount = 0;
 
+	/** 这一轮的角石（D7 墙自身转角）。同样是派生物，每轮从 footprint 重算。 */
+	int32 CurrentQuoinColumnCount = 0;
+	int32 CurrentQuoinBrickCount = 0;
+
+	/** 这一轮的包边（D7 第三样）。同样是派生物，每轮从 footprint + 洞表重算。 */
+	int32 CurrentTrimTopRunCount = 0;
+	int32 CurrentTrimBaseRunCount = 0;
+	int32 CurrentTrimBrickCount = 0;
+	int32 CurrentBrickWallBrickCount = 0;
+	int32 CurrentBrickWallCourseCount = 0;
+
 	/** 藤蔓的两个 GPU 实例宿主：0 = 枝、1 = 叶。分两个组件是因为它们是两张网格、两份材质。 */
 	UPROPERTY(Transient)
 	TObjectPtr<UCSGpuInstancedMeshComponent> VineBranchComponent;
@@ -1354,6 +2288,18 @@ private:
 	 *  蓝图重跑构造脚本会销毁组件，MID 活在 actor 上才不会跟着一起没。 */
 	UPROPERTY(Transient)
 	TObjectPtr<class UMaterialInstanceDynamic> VineLeafSeasonMID;
+
+	/**
+	 * 枝（管子）与花的生长参数 MID。存在的唯一理由是 `VineGrowSpeed` 必须**只有一个真源** ——
+	 * CPU 拿它判断"前沿有没有越过变化点"（`ResolveVineSpawnTimes`），材质拿它推前沿。
+	 * 两边取不同值的症状是：改门之后藤跳一段或倒退一段，而两边各自都自洽。
+	 * 叶子那张复用 `VineLeafSeasonMID`（它本来就为季节存在），不必多建一个。
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<class UMaterialInstanceDynamic> VineBranchGrowMID;
+
+	UPROPERTY(Transient)
+	TObjectPtr<class UMaterialInstanceDynamic> VineFlowerGrowMID;
 
 	/** 实例行与计数的 pooled buffer（[0] = 枝、[1] = 叶）。容量按**配置上限**一次预留，
 	 *  规划结果再多也只截断不扩容 —— 交互期一次设备同步都不许有。 */
@@ -1382,6 +2328,55 @@ private:
 
 	UPROPERTY(Transient)
 	TObjectPtr<UStaticMesh> VineFlowerMeshBuiltFrom;
+
+	// ---- 屋面瓦 ----
+
+	/** 屋面瓦的 GPU 实例宿主（一张网格 ⇒ 一个组件）。 */
+	UPROPERTY(Transient)
+	TObjectPtr<UCSGpuInstancedMeshComponent> RoofTileComponent;
+
+	/** 实例行与计数的 pooled buffer。**恒 1 条**，用数组只是为了直接吃 `CSShaperSteps` 那几个
+	 *  批量接口（ReserveCapacity / ZeroCounters / ReleaseOnRenderThread）。 */
+	TArray<CSShaperSteps::FPaletteBuffers> RoofTileGpuBuffers;
+
+	/** 基础网格快照建成过没有（同 `bVineBaseMeshReady`：没建成时组件画的是**上一次**的网格）。 */
+	bool bRoofTileBaseMeshReady = false;
+
+	/** 快照是从哪张网格建的（同 `VineBranchMeshBuiltFrom`：只靠一个 bool 会"换了资产什么都没发生"）。 */
+	UPROPERTY(Transient)
+	TObjectPtr<UStaticMesh> RoofTileMeshBuiltFrom;
+
+	/** 从包围盒判出来的三条轴与网格自身尺寸。`EnsureRoofTileComponent` 建快照时一并算好。 */
+	CSHouseTile::FMeshAxes RoofTileAxes;
+
+	uint32 RoofTileHandedCapacity = 0;
+	FBox RoofTileHandedLocalBounds = FBox(ForceInit);
+	uint32 RoofTileDescHash = 0;
+	int32 CurrentRoofTileCount = 0;
+
+	// ---- 尖顶 ----
+
+	/**
+	 * 脊端点上的尖顶。**恒 ≤ 2 个**（正方形退化成 1 个）。
+	 *
+	 * ⚠️ 这是本 actor 身上**唯一**的 `UStaticMeshComponent`，而 `CSVineScatter` 的
+	 * `CollectSurfaceTriangles`（`CSVineScatter.cpp:38`）恰好按这个类型遍历 —— 旧的
+	 * `VineScatter` 三个入口对房子本来**恒返回空三角集**（房体挂在 `UCSMeshRenderComponent`
+	 * 上），加了尖顶之后就变成"只有尖顶那点面"。房子自己的藤蔓走的是另一条通路（`RebuildVine`），
+	 * 不受影响；但如果将来有人把房子喂给旧入口，长出来的藤蔓会全爬在尖顶上。
+	 */
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UStaticMeshComponent>> RoofFinialComponents;
+
+	/** 门扇：一洞一个组件。与尖顶同一档设施（普通静态网格组件 + 形态哈希短路）。 */
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UStaticMeshComponent>> DoorLeafComponents;
+
+	uint32 DoorLeafDescHash = 0;
+	int32 CurrentDoorLeafCount = 0;
+
+	uint32 RoofFinialDescHash = 0;
+	int32 CurrentRoofFinialCount = 0;
 
 	/** 摆件的 GPU 实例宿主：**一张网格一个**（一个 palette 条目 = 一个组件）。
 	 *  顺序恒为「门 → 墙脚 → 屋顶」，`DecorPaletteRanges` 记的就是这三段的起止。 */
@@ -1415,22 +2410,42 @@ private:
 	/** 下一次重求值强制全量重建：手动强刷，以及拖动松手时清掉增量变换攒下的浮点误差。 */
 	bool bForceFullRebuild = false;
 
-	/**
-	 * 拖动期的**原始诉求**尺寸（未经禁带修正）。`PushEdge` 的累加器，**不序列化**。
-	 *
-	 * 为什么必须有（禁带的实现前提）：带把墙吸在外沿上时 `Applied` 恒 0，而生效尺寸又是
-	 * 下一帧的起点 ⇒ 只看生效尺寸的话墙永远跨不过带。这里记的是"手往外走了多远"，
-	 * 跨带因此要攒够半个带宽的拖动量 —— 裁决四那句"尺寸更换有最小距离"的字面执行面。
-	 *
-	 * 不进任何哈希、不进事务缓冲：它是交互中间量，被 Ctrl+Z 回滚或跟着尺寸存盘都只会
-	 * 让下一次拖动第一帧自己跳（与 `DoorSlotOpen` 的 NonTransactional 同一条纪律，
-	 * 只是这一条连序列化都不需要 —— 拖动一结束它就该等于 FootprintSize）。
-	 */
-	FVector2D RawFootprintSize = FVector2D::ZeroVector;
-
 	/** 异步编辑在途时到达的最新目标快照（被拒即入槽，OnComplete 里补发）。 */
 	TSharedPtr<FCSGpuMeshCPUData, ESPMode::ThreadSafe> PendingBodySnapshot;
 	TSharedPtr<FCSGpuMeshCPUData, ESPMode::ThreadSafe> PendingPillarSnapshot;
+	/** 藤蔓管子在途时挂起的最新折线。与上面两个同一条纪律：被拒即入槽，完成回调里补发。 */
+	TSharedPtr<CSHouseVine::FTubePath, ESPMode::ThreadSafe> PendingVineTubePath;
+
+	/**
+	 * 每根藤**首次出现**时的 `GameTime`，键 = `FStrand::RootKey`（身份哈希，不含位置也不含长宽）。
+	 *
+	 * 它是 **memo 而不是模拟状态**：只决定生长动画的相位，不进 `VineDescHash`、不影响任何几何。
+	 * 所以"声明式重求值 + 哈希守卫"那条架构不受影响 —— 同一份世界状态重求值多少次，
+	 * 几何逐位相同，只是藤不会重新长一遍。
+	 *
+	 * ⚠️ 键里**没有位置** ⇒ 拖房子 / 拉尺寸期间键不变 ⇒ **不重播生长**。跨过一个藤位间距
+	 * 新增的那一根从 0 长、其余不动，正是想要的。
+	 */
+	/**
+	 * 一根藤的生长历史：相位 + 上一轮的折线形状。
+	 *
+	 * 存形状是为了回答"这一轮它从哪儿开始变了" —— 门一开，藤要绕开新洞，整条重解，
+	 * 而**变化点之前那一截和上一轮逐点相同**。没有形状就只能二选一：整根重新长（一开门
+	 * 满墙的藤全缩回去重来），或者整根沿用旧相位（变化的那段直接以长成状态弹出来）。
+	 * 两个都不对，所以必须记形状。
+	 *
+	 * ⚠️ 存的是**墙面参数坐标**而不是世界坐标：拖房子时世界坐标整体在动，逐点比较会
+	 * 判成"处处都变了"，于是每拖一帧整根藤重新长一遍。
+	 */
+	struct FVineStrandHistory
+	{
+		float SpawnTime = 0.0f;
+		TArray<FVector2f> PointsSZ;
+		TArray<int32> Edges;
+	};
+
+	/** 逐藤的生长历史，键 = `FStrand::RootKey`。transient：相位不该跨关卡保留。 */
+	TMap<uint32, FVineStrandHistory> VineStrandHistory;
 
 	/** 稳定身份，随关卡序列化；首次注册时生成。 */
 	UPROPERTY()

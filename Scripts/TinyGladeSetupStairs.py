@@ -16,7 +16,7 @@
 import unreal
 
 PKG = "/PCGPlugins/HouseTest"
-STAIR_MESH = "/Game/TinyGlade/Meshes/stairs_step/StaticMeshes/stairs_step"      # 实测 100×100×100 cm 居中立方体
+STAIR_MESH = "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/stairs_step"      # 实测 100×100×100 cm 居中立方体
 # ⚠️ 顺序陷阱：`TinyGladeMakeStoneMaterial.py` 会把石阶换成三平面石材 `M_TinyGladeStone`，
 #    而本脚本一跑就会把材质覆盖回去。所以这里**优先取石材**，取不到才退回门框砖那份常数灰 ——
 #    否则两个脚本谁后跑谁说了算，画面会随执行顺序变，而且两次都"跑成功了"。

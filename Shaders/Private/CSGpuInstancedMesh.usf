@@ -18,11 +18,16 @@
 #include "/Engine/Public/Platform.ush"
 
 #define CS_INSTANCED_MAX_LODS 4
+// ⚠️ 与 C++ 的 `CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS` 是**同一个数的两份**（同 MAX_LODS 的
+// 写法）。两边不一致的症状是 custom data 整体错位读，画面上只是"数值不对"，不报错。
+#define CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS 2
 
 // ── source ───────────────────────────────────────────────────────────────────
 // 5 float4 per instance: [0..2] rows of the instance-to-component 3x3 (.w = 0),
 // [3] origin.xyz + per-instance random in .w, [4] cull sphere centre.xyz + radius in .w.
 Buffer<float4> SrcInstances;
+Buffer<float>  SrcCustomData;     // CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS 个 / 实例（源序）
+uint           bHasCustomData;    // 0 = 生产者没给，可见槽写零
 Buffer<uint>   SrcInstanceCount;  // [0] = live instance count (CPU path writes the array size)
 Buffer<float4> SrcClusterBounds;  // centre.xyz + radius per cluster
 
@@ -31,6 +36,7 @@ RWBuffer<uint>   RWClusterVisible; // 1 per cluster
 RWBuffer<float4> RWVisTransforms;  // 3 per visible slot
 RWBuffer<float4> RWVisOrigins;     // 1 per visible slot
 RWBuffer<float4> RWVisLightmap;    // 1 per visible slot (always 0 — no baked lighting here)
+RWBuffer<float>  RWVisCustomData;  // CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS 个 / 可见槽
 RWBuffer<uint>   RWLodCounters;    // 1 per LOD, compaction cursor
 RWBuffer<uint>   RWIndirectArgs;   // 5 uints per LOD
 
@@ -224,6 +230,18 @@ void InstanceCullCS(uint3 Id : SV_DispatchThreadID)
 	RWVisTransforms[Dst * 3u + 2u] = SrcInstances[Base + 2u];
 	RWVisOrigins[Dst] = SrcInstances[Base + 3u];
 	RWVisLightmap[Dst] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+	// ⚠️ 目标下标必须用**压缩后**的 Dst，源下标才是原始的 Instance：引擎按 InstanceId 取
+	// custom data，而 InstanceId 就是压缩后的槽位。两边写反的症状是"数值张冠李戴"，
+	// 且剔除一变就换一批 —— 没有任何断言会响。
+	{
+		const uint SrcBase = Instance * CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS;
+		const uint DstBase = Dst * CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS;
+		[unroll] for (uint C = 0u; C < CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS; ++C)
+		{
+			RWVisCustomData[DstBase + C] = (bHasCustomData != 0u) ? SrcCustomData[SrcBase + C] : 0.0f;
+		}
+	}
 }
 
 // -----------------------------------------------------------------------------

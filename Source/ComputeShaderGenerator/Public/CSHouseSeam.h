@@ -335,50 +335,18 @@ inline bool CutOnEdge(const FHouse& Self, const FHouse& Other, int32 EdgeIndex, 
 inline int32 BuildCornerElements(const TArray<FCorner>& Corners, uint32 Seed,
 	const CSHouseFrame::FBrickParams& Params, TArray<CSHouseFrame::FElement>& InOutElements)
 {
-	const float Length = FMath::Max(Params.Length, 1.0f);
-	const int32 MaxBricks = FMath::Max(Params.MaxBricks, 0);
-
-	// 全局砖序号跨"门框砖 + 接缝砖"连续（整栋房子一个 dispatch），所以起点要从已有元素接着数。
-	int32 Cursor = 0;
-	for (const CSHouseFrame::FElement& Existing : InOutElements) Cursor = FMath::Max(Cursor, Existing.BrickBegin + Existing.BrickCount);
+	// 全局砖序号跨"门框砖 + 接缝砖 + 角石"连续（整栋房子一个 dispatch），所以起点要接着已有元素数。
+	int32 Cursor = CSHouseFrame::NextBrickSlot(InOutElements);
 	const int32 Before = Cursor;
 
 	for (int32 Index = 0; Index < Corners.Num(); ++Index)
 	{
 		const FCorner& Corner = Corners[Index];
-		const float Height = Corner.TopZ - Corner.BottomZ;
-		if (Height < Length * 0.5f) continue;   // 半块砖都摆不下，同门框那条下限
-
-		CSHouseFrame::FPath Path;
-		Path.BaseZ = 0.0f;                      // 世界高度全部吃进 Frame.Origin，路自己从 0 起算
-		Path.TopZ = Height;
-		Path.LeftS = Path.RightS = Path.CenterS = 0.0f;
-		Path.MidKind = CSHouseFrame::EMidKind::None;
-		Path.bLeftJamb = true;
-
-		float Scale = 0.0f;
-		int32 Count = CSHouseFrame::SolveRun(Path.TotalLen(), Length, Params.Gap, Scale);
-		if (Count <= 0 || Scale <= 0.0f) continue;
-		// **只截断，绝不扩容**：容量是注册期一次付清的常量（同门框砖）。
-		Count = FMath::Min(Count, MaxBricks - Cursor);
-		if (Count <= 0) break;
-
-		CSHouseFrame::FElement Element;
-		Element.Path = Path;
-		Element.Frame.Origin = FVector3f(float(Corner.Point.X), float(Corner.Point.Y), Corner.BottomZ);
-		Element.Frame.AxisU = FVector3f(float(-Corner.Outward.X), float(-Corner.Outward.Y), 0.0f).GetSafeNormal();
-		Element.Frame.AxisV = FVector3f(0.0f, 0.0f, 1.0f);
-		Element.Frame.AxisN = FVector3f(float(-Corner.Outward.Y), float(Corner.Outward.X), 0.0f).GetSafeNormal();
-		Element.BrickBegin = Cursor;
-		Element.BrickCount = Count;
-		Element.Pitch = (Length + FMath::Max(Params.Gap, 0.0f)) * Scale;
-		Element.HalfLen = Length * Scale * 0.5f;
-		Element.LayoutScale = Scale;
 		// 逐实例随机数从**接缝身份 + 交点序号**派生，不从槽位派生：槽位是"这栋房自己的第几块砖"，
 		// 两栋房必然不同，而这两份砖是重叠的（见文件头）。
-		Element.RandomBase = Seed ^ (uint32(Index) * 2654435761u);
-		InOutElements.Add(Element);
-		Cursor += Count;
+		CSHouseFrame::AppendColumn(Corner.Point, Corner.Outward, Corner.BottomZ, Corner.TopZ,
+			CSHouseFrame::PathRandomBase(Seed, CSHouseFrame::EPathFamily::Seam, Index),
+			Params, InOutElements, Cursor);
 	}
 	return Cursor - Before;
 }

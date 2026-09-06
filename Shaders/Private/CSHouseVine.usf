@@ -30,10 +30,11 @@
 #define THREADGROUPSIZE_X 64
 #endif
 
-StructuredBuffer<float4> VineRecords;   // 3 个 float4 / 实例
+StructuredBuffer<float4> VineRecords;   // 4 个 float4 / 实例（第 4 个只用 xy）
 
 RWBuffer<float4> RWVineInstances;       // 5 个 float4 / 实例
 RWBuffer<uint>   RWVineCounter;         // [0] = 活跃实例数
+RWBuffer<float>  RWVineCustomData;      // CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS 个 / 实例
 
 float4x4 VineWorldToComponent;
 float3   VineBaseSphereCentre;          // 基础网格局部包围球心（未缩放）
@@ -52,10 +53,17 @@ void PackHouseVineCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	// 组件永远不会替我们清 counter，所以这一句是必需的而不是优化。
 	if (Index == 0u) RWVineCounter[0] = min(VineRecordCount, VineMaxInstances);
 
-	const uint Rec = Index * 3u;
+	const uint Rec = Index * 4u;
 	const float4 R0 = VineRecords[Rec + 0u];
 	const float4 R1 = VineRecords[Rec + 1u];
 	const float4 R2 = VineRecords[Rec + 2u];
+	const float4 R3 = VineRecords[Rec + 3u];   // xy = (SpawnTime 秒, 该实例在藤上的弧长 cm)
+
+	// 逐实例 custom data。**在下面那两条退化 return 之前写**：counter 是按记录数直接
+	// 写死的（见文件头），被 return 跳过的槽位若不写就留着上一次的值 —— 症状是零星
+	// 几片叶子的生长相位莫名其妙，且只在记录集变化时出现。
+	RWVineCustomData[Index * 2u + 0u] = R3.x;
+	RWVineCustomData[Index * 2u + 1u] = R3.y;
 
 	const float3 WorldPos = R0.xyz;
 	const float LengthScale = max(R0.w, 1e-4f);

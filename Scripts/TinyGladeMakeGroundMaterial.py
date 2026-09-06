@@ -28,8 +28,8 @@ PKG = "/PCGPlugins/HouseTest"
 MEL = unreal.MaterialEditingLibrary
 TOOLS = unreal.AssetToolsHelpers.get_asset_tools()
 
-GRASS = "/Game/TinyGlade/Textures/dirtpath_grass"
-PATH = "/Game/TinyGlade/Textures/dirtpath_1"
+GRASS = "/PCGPlugins/HouseTest/TinyGladeAsset/Textures/dirtpath_grass"
+PATH = "/PCGPlugins/HouseTest/TinyGladeAsset/Textures/dirtpath_1"
 
 grass_tex = unreal.EditorAssetLibrary.load_asset(GRASS)
 path_tex = unreal.EditorAssetLibrary.load_asset(PATH)

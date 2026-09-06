@@ -1,0 +1,167 @@
+# -*- coding: utf-8 -*-
+"""
+给地被（草 + 花）配资产：`ACSGroundActor` 的 `Grass` / `Flowers` 默认是空的，
+不跑这一遍**一株都不会长**（网格为空 = 那个物种整条关掉，见 `CollectCoverSpecies`）。
+
+选型依据（都是从 `D:\\MyProject\\Tiny Glade\\extracted\\meshes` 的原始 glb 量出来的）：
+
+  · 草 = `SM_TG_GrassBlade`（12 顶点 / 10 三角，5.76 × 50 cm）。它是 TG `_grass.raster`
+    那条 VS 公式在 h=1, w=1, LOD0 处的**数值烘焙件** —— 半宽 2.88 / 2.592 cm 与
+    `clamp(2.5(1−t²),0,1) × 0.04 × 0.72` 逐位对上。密度取 TG 的满密度实测值 50 株/m²。
+
+  · 花 = `lowpoly_flower`（**5 个三角**，36 × 38 × 15 cm）。TG 里唯一一件"单株"花；
+    ⚠️ 它的包围盒**离原点 30 cm 才开始**，所以必须靠 `bSeatOnBase` 坐底，否则整片花悬空 30 cm
+    （而实例数 / 包围盒 / 剔除球全都看不见这个错）。
+
+  · 薰衣草 = `garden_flower_01_lavender`（88 三角，40 × 40 × 182 cm）。它的茎**向下伸 1 m**
+    （Min.Z = −100 cm），所以 `bSeatOnBase` 必须**关掉** —— 坐底会把整根茎顶出地面。
+    原尺寸比房子还扎眼，缩到 0.35–0.5。
+
+  · ❌ **不要用** `meadow_lowpoly_flowers` / `clover_flowers` / `clover`：它们是 TG 的
+    **整片预散布网格**（130 m 见方、几万个三角），一个实例就铺满全场，不是单株。
+
+材质：TG 的 clutter 把颜色全烘在**顶点流**里，所以花一律走 `M_TG_VertexColor`，草走
+`MI_TG_Grass`（`M_TG_Grass` 的实例，两面 foliage + 程序化风，无贴图 —— 与 TG 的草
+"PS 一张贴图都不采、纯顶点色 + 解析法线"同路）。
+
+⚠️ **材质必须勾 `bUsedWithInstancedStaticMeshes`**：没勾的在实例路径上会被引擎**静默换成
+默认材质**，画面一片灰而所有 readback 断言照绿。本脚本会检查并补勾（这一步会改材质资产）。
+
+⚠️ 值要烘进 **BP CDO 与关卡实例两处**：只改 C++ 默认值、或只改 CDO，关卡里已存在的实例
+一个都不会变（状态文件坑表里的那条）。
+"""
+import unreal
+
+PKG = "/PCGPlugins/HouseTest"
+ASSET = "%s/TinyGladeAsset" % PKG
+
+GRASS_MESH = "%s/Meshes/SM_TG_GrassBlade" % ASSET
+GRASS_MAT_CANDIDATES = ["%s/Materials/MI_TG_Grass" % ASSET, "%s/Materials/M_TG_Grass" % ASSET]
+FLOWER_MAT = "%s/Materials/M_TG_VertexColor" % ASSET
+
+# (网格, 密度株/m², 容量, 缩放下限, 缩放上限, 倾倒角, 坐底, 盐)
+# 容量一律顶到 ClampMax：它是**天花板不是预算**，显存按实际格数分配（密度说了算），
+# 所以调高只是把"密度自动退让"的触发点推远，密度用不到的时候一个字节都不多花。
+CAP = 1048576
+FLOWER_SPECS = [
+    ("%s/Meshes/lowpoly_flower" % ASSET,            1.2,  CAP, 0.9,  1.6,  8.0,  True,  3),
+    ("%s/Meshes/garden_flower_01_lavender" % ASSET, 0.25, CAP, 0.35, 0.55, 5.0,  False, 5),
+]
+
+
+def load(path):
+    return unreal.EditorAssetLibrary.load_asset(path)
+
+
+def ensure_instanced_flag(mat, tag):
+    """补勾 `bUsedWithInstancedStaticMeshes` —— 没勾的材质在实例路径上会被静默替换成默认材质。
+
+    要爬到**根母材质**再勾：`UMaterialInstance` 上没有这个开关，勾在实例上不会有任何效果，
+    也不会报错。
+    """
+    if not mat:
+        return None
+    root = mat
+    while root is not None and root.get_class().get_name() != "Material":
+        root = root.get_editor_property("Parent")
+    if root is None:
+        unreal.log_warning("COVERSET %s: 找不到根母材质，无法检查 bUsedWithInstancedStaticMeshes" % tag)
+        return mat
+    if root.get_editor_property("bUsedWithInstancedStaticMeshes"):
+        unreal.log("COVERSET %-10s %s 已勾 bUsedWithInstancedStaticMeshes" % (tag, root.get_name()))
+        return mat
+    root.set_editor_property("bUsedWithInstancedStaticMeshes", True)
+    unreal.EditorAssetLibrary.save_loaded_asset(root)
+    unreal.log("COVERSET %-10s %s **补勾** bUsedWithInstancedStaticMeshes 并保存" % (tag, root.get_name()))
+    return mat
+
+
+def make_species(mesh, mat, density, cap, lo, hi, lean, seat, salt,
+                 height_jitter=0.25, align=0.0, sink=2.0):
+    # ⚠️ 一律用 **C++ 属性名**（同 `TinyGladeSetupStairs.py` 的既有约定）：python 侧的 snake_case
+    #    对 `b` 前缀布尔另有一套改名规则（`bSeatOnBase` → `seat_on_base`），猜错会抛异常。
+    s = unreal.CSGroundCoverSpecies()
+    s.set_editor_property("Mesh", mesh)
+    s.set_editor_property("Material", mat)
+    s.set_editor_property("DensityPerSqM", density)
+    s.set_editor_property("MaxInstances", cap)
+    s.set_editor_property("ScaleRange", unreal.Vector2D(lo, hi))
+    s.set_editor_property("HeightJitter", height_jitter)
+    s.set_editor_property("LeanDegrees", lean)
+    s.set_editor_property("AlignToNormal", align)
+    s.set_editor_property("Sink", sink)
+    s.set_editor_property("bSeatOnBase", seat)
+    s.set_editor_property("Salt", salt)
+    return s
+
+
+grass_mesh = load(GRASS_MESH)
+grass_mat = next((m for m in (load(p) for p in GRASS_MAT_CANDIDATES) if m), None)
+flower_mat = load(FLOWER_MAT)
+if not grass_mesh:
+    unreal.log_error("COVERSET FAILED: %s 不存在" % GRASS_MESH)
+    raise SystemExit
+if not grass_mat:
+    unreal.log_error("COVERSET FAILED: 草材质一个都不存在 %s" % GRASS_MAT_CANDIDATES)
+    raise SystemExit
+if not flower_mat:
+    unreal.log_error("COVERSET FAILED: %s 不存在" % FLOWER_MAT)
+    raise SystemExit
+
+ensure_instanced_flag(grass_mat, "grass")
+ensure_instanced_flag(flower_mat, "flower")
+
+grass = make_species(grass_mesh, grass_mat, 50.0, CAP, 0.85, 1.25, 12.0, True, 1)
+
+flowers = []
+for path, density, cap, lo, hi, lean, seat, salt in FLOWER_SPECS:
+    mesh = load(path)
+    if not mesh:
+        # 缺一种花不算失败：TG 提取件的成色不一，缺了就少一种，草与其余的照长。
+        unreal.log_warning("COVERSET 跳过缺失的花：%s" % path)
+        continue
+    box = mesh.get_bounding_box()
+    unreal.log("COVERSET flower %-26s tris=%d 尺寸=%.0f×%.0f×%.0f cm minZ=%.1f seat=%s"
+               % (mesh.get_name(), mesh.get_num_triangles(0),
+                  box.max.x - box.min.x, box.max.y - box.min.y, box.max.z - box.min.z,
+                  box.min.z, seat))
+    flowers.append(make_species(mesh, flower_mat, density, cap, lo, hi, lean, seat, salt))
+
+
+def apply(obj, where):
+    obj.set_editor_property("bGroundCoverEnabled", True)
+    obj.set_editor_property("Grass", grass)
+    obj.set_editor_property("Flowers", flowers)
+    unreal.log("COVERSET %-34s 草 50 株/m² + %d 种花" % (where, len(flowers)))
+
+
+# ---- BP CDO：新拖进关卡的实例从这里取默认值 ----
+bp = load("%s/BP_TinyGladeGround" % PKG)
+if bp:
+    apply(unreal.get_default_object(bp.generated_class()), "CDO")
+    unreal.EditorAssetLibrary.save_loaded_asset(bp)
+
+# ---- 关卡实例：CDO 的默认值**不传播到已存在的实例**，必须逐个再写一份 ----
+A = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+for level in ("L_TerrainOpsDemo", "L_HouseGroundDemo"):
+    unreal.EditorLoadingAndSavingUtils.load_map("%s/%s" % (PKG, level))
+    n = 0
+    for a in A.get_all_level_actors():
+        name = a.get_class().get_name()
+        if "Ground" not in name or "Shaper" in name:
+            continue
+        apply(a, "%s/%s" % (level, a.get_actor_label()))
+        # 散一趟并把 GPU 计数打出来 —— "脚本跑成功了"与"真的长出草了"是两回事，
+        # 而后者只有 counter 说了算（CPU 全程不知道长了几株）。
+        a.call_method("RebuildGroundCover")
+        reason = a.call_method("GetGroundCoverUndrawableReason")
+        if reason:
+            unreal.log_warning("COVERSET %s 画不出来：%s" % (a.get_actor_label(), reason))
+        for i in range(1 + len(flowers)):
+            unreal.log("COVERSET   物种 %d 实例数 = %s"
+                       % (i, a.call_method("DebugReadGroundCoverCountGpuSync", (i,))))
+        n += 1
+    unreal.EditorLoadingAndSavingUtils.save_current_level()
+    unreal.log("COVERSET %s -> %d ground actors" % (level, n))
+
+unreal.log("COVERSET DONE")

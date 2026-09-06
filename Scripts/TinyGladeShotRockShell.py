@@ -54,6 +54,16 @@ GRID_X, GRID_Y = 48, 27
 PIXEL_DELTA = 12
 # 精确 (0,0,0) 的容许上限，与 `TinyGladeShotSofteningStats.py` 的 `ZERO_FAIL` 同一个数。
 ZERO_FAIL = 0.005
+# 壳的近景单独放宽（2026-08-31，壳改 TG 形态之后）：胞腔间的裂缝是**几何真值** ——
+# 相邻胞腔的浮高差（`CellRelief` 逐胞腔随机）把缝拉成全遮蔽的深槽，槽底间接光精确为零，
+# 实测 0.772%（10/1296），且只出现在这一张（其余五张 ≤ 0.077% ⇒ 预热本身是好的）。
+# 这条阈值的**本职**是抓坑 ⑨（预热失效 ⇒ 整片未直射面全零，历史上是两位数百分比），
+# 2% 对那个失效模式仍然一眼红；别拿它去卡裂缝 —— 消裂缝黑的正式旋钮是
+# `RockShellSkirtTilt`（裙圈外撇斜壁互相交叉，2026-08-31 用户方案），那是观感决策，
+# 不该由出图脚本的阈值倒逼。
+# overhead 同限：正俯视能看进个别槽底（边缘磕碰 `RockShellChipAmount` 让盖缘高低错落，
+# 实测 0.54% = 7 个采样点，全在缝线上）—— 同一类几何真黑，不是预热失效。
+CREVICE_ZERO_FAIL = {"wall_shell_on": 0.02, "overhead": 0.02}
 
 ACTORS = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
 STATE = {"ticks": 0, "handle": None, "plan": [], "world": None, "ground": None,
@@ -247,7 +257,8 @@ def report():
         unreal.log("ROCKSHELL PIXELS %-16s zero=%.3f%%" % (name, z * 100.0))
         # 坑 ⑨ 的门：预热到位之后没有哪一张该剩下大片精确零。0.5% 与
         # `TinyGladeShotSofteningStats.py` 的 `ZERO_FAIL` 同源（那边实测 16 次起就是 0.000%）。
-        if z > ZERO_FAIL:
+        # 近景那张走 `CREVICE_ZERO_FAIL`（裂缝槽底的几何真黑，见常量处注释）。
+        if z > CREVICE_ZERO_FAIL.get(name, ZERO_FAIL):
             unreal.log_error("ROCKSHELL !! %s 有 %.3f%% 的像素精确 (0,0,0) —— Lumen 预热没起作用（坑 ⑨）"
                              % (name, z * 100.0))
             ok = False

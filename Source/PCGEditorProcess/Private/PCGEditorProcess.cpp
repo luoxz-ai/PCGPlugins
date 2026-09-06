@@ -3,6 +3,9 @@
 #include "PCGEditorProcess.h"
 #include "CSGroundActor.h"
 #include "CSGroundPaintEdMode.h"
+#include "CSHouseActor.h"
+#include "CSWindowBrushEdMode.h"
+#include "CSHouseResizeSelectionWatcher.h"
 #include "CSInstanceBrushEdMode.h"
 #include "CSPointBrushActor.h"
 #include "CSPointBrushEdMode.h"
@@ -153,7 +156,14 @@ void FPCGEditorProcessModule::StartupModule()
 	AMeshGeneratorBrushCache::OnInstanceBrushEditorRequest.AddRaw(this, &FPCGEditorProcessModule::StartInstanceBrush);
 	ACSPointBrushActor::OnPointBrushEditorRequest.AddRaw(this, &FPCGEditorProcessModule::StartPointBrush);
 	ACSGroundActor::OnGroundPaintEditorRequest.AddRaw(this, &FPCGEditorProcessModule::StartGroundPaint);
+	ACSHouseActor::OnWindowBrushRequest.AddRaw(this, &FPCGEditorProcessModule::StartWindowBrush);
 	AGPUSkeletalTree::OnGenerateTreeEditorRequest.BindRaw(this, &FPCGEditorProcessModule::GenerateGPUSkeletalTree);
+
+	// D5 拉尺寸的失选监听。放在这里而不是 InitializeEditorUI：它绑的是 runtime 侧的静态
+	// 委托，不碰 Slate / LevelEditor，没有等 PostEngineInit 的理由；对 GEditor 的依赖是
+	// 惰性的（只在真有房子进模式时才去挂 USelection，见 UpdateSelectionBinding）。
+	HouseResizeSelectionWatcher = MakeUnique<FCSHouseResizeSelectionWatcher>();
+	HouseResizeSelectionWatcher->Start();
 
 	// Defer editor UI initialization until the engine is fully loaded.
 	// At PostConfigInit, FCoreStyle and LevelEditor are not yet available.
@@ -176,20 +186,29 @@ void FPCGEditorProcessModule::ShutdownModule()
 		PostEngineInitHandle.Reset();
 	}
 
+	if (HouseResizeSelectionWatcher)
+	{
+		HouseResizeSelectionWatcher->Stop();
+		HouseResizeSelectionWatcher.Reset();
+	}
+
 	ViewEditCategoryViewportOverlay.Reset();
 	AMeshGeneratorBrushCache::OnInstanceBrushEditorRequest.RemoveAll(this);
 	ACSPointBrushActor::OnPointBrushEditorRequest.RemoveAll(this);
 	ACSGroundActor::OnGroundPaintEditorRequest.RemoveAll(this);
+	ACSHouseActor::OnWindowBrushRequest.RemoveAll(this);
 	AGPUSkeletalTree::OnGenerateTreeEditorRequest.Unbind();
 	if (!IsEngineExitRequested() && GEditor)
 	{
 		if (bEditorModeRegistered) FEditorModeRegistry::Get().UnregisterMode(FCSInstanceBrushEdMode::EM_CSInstanceBrush);
 		if (bPointBrushModeRegistered) FEditorModeRegistry::Get().UnregisterMode(FCSPointBrushEdMode::EM_CSPointBrush);
 		if (bGroundPaintModeRegistered) FEditorModeRegistry::Get().UnregisterMode(FCSGroundPaintEdMode::EM_CSGroundPaint);
+		if (bWindowBrushModeRegistered) FEditorModeRegistry::Get().UnregisterMode(FCSWindowBrushEdMode::EM_CSWindowBrush);
 	}
 	bEditorModeRegistered = false;
 	bPointBrushModeRegistered = false;
 	bGroundPaintModeRegistered = false;
+	bWindowBrushModeRegistered = false;
 	ACSShallowWaterCapture::OnBakeResultMeshDelegate.Unbind();
 }
 
@@ -237,6 +256,16 @@ void FPCGEditorProcessModule::InitializeEditorUI()
 		bGroundPaintModeRegistered = true;
 	}
 
+	if (!FEditorModeRegistry::Get().GetFactoryMap().Contains(FCSWindowBrushEdMode::EM_CSWindowBrush))
+	{
+		FEditorModeRegistry::Get().RegisterMode<FCSWindowBrushEdMode>(
+			FCSWindowBrushEdMode::EM_CSWindowBrush,
+			LOCTEXT("CSWindowBrushMode", "CS Window Brush"),
+			FSlateIcon(),
+			false);
+		bWindowBrushModeRegistered = true;
+	}
+
 	ViewEditCategoryViewportOverlay = MakeUnique<FViewEditCategoryViewportOverlay>();
 	ViewEditCategoryViewportOverlay->Start();
 }
@@ -264,6 +293,18 @@ void FPCGEditorProcessModule::StartPointBrush(ACSPointBrushActor* TargetActor)
 	FEditorModeTools& ModeTools = GLevelEditorModeTools();
 	ModeTools.ActivateMode(FCSPointBrushEdMode::EM_CSPointBrush);
 	if (FCSPointBrushEdMode* BrushMode = ModeTools.GetActiveModeTyped<FCSPointBrushEdMode>(FCSPointBrushEdMode::EM_CSPointBrush))
+	{
+		BrushMode->SetTargetActor(TargetActor);
+	}
+}
+
+void FPCGEditorProcessModule::StartWindowBrush(ACSHouseActor* TargetActor)
+{
+	if (!TargetActor || !GEditor) return;
+
+	FEditorModeTools& ModeTools = GLevelEditorModeTools();
+	ModeTools.ActivateMode(FCSWindowBrushEdMode::EM_CSWindowBrush);
+	if (FCSWindowBrushEdMode* BrushMode = ModeTools.GetActiveModeTyped<FCSWindowBrushEdMode>(FCSWindowBrushEdMode::EM_CSWindowBrush))
 	{
 		BrushMode->SetTargetActor(TargetActor);
 	}

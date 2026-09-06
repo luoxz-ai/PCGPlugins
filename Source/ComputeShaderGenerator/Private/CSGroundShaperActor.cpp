@@ -2,6 +2,7 @@
 
 #include "CSGroundActor.h"
 #include "CSGroundShaperField.h"
+#include "CSHouseHandleActor.h"   // MakeEditorGizmoProp —— 示意道具的共享配法
 #include "Components/BillboardComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Engine/StaticMesh.h"
@@ -16,10 +17,9 @@ ACSGroundShaperActor::ACSGroundShaperActor()
 	// 示意圆柱：只是编辑器里"这里有座土台"的把手，游戏里不存在。
 	EditorShapeComponent = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("EditorShape"));
 	EditorShapeComponent->SetupAttachment(RootComponent);
-	EditorShapeComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-	EditorShapeComponent->SetHiddenInGame(true);
-	EditorShapeComponent->SetCastShadow(false);
-	EditorShapeComponent->bIsEditorOnly = true;
+	// 与拉尺寸抓手的示意锥同一份配法。本类是 `ACSTinyGlade`（要产石阶网格），继承不到
+	// `ACSHouseHandleActor`，但"编辑器示意道具"这六行没理由各写一遍。
+	ACSHouseHandleActor::MakeEditorGizmoProp(EditorShapeComponent);
 
 	static ConstructorHelpers::FObjectFinderOptional<UStaticMesh> CylinderMesh(TEXT("/Engine/BasicShapes/Cylinder.Cylinder"));
 	EditorShapeMesh = CylinderMesh.Get();

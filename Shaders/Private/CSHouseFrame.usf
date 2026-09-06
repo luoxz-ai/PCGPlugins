@@ -20,7 +20,9 @@
 //   [2] AxisV.xyz（竖直，单位）               | TopZ
 //   [3] BaseZ | LeftS | RightS | MidMeasure（圆弧 = 扫角，平顶 = 长度）
 //   [4] asuint 位标志 | asuint 砖序起点 | asuint 砖数 | Pitch（相邻砖中心距）
-//   [5] HalfLen（首块砖的弧长）| LayoutScale（长度轴铺装缩放）| asuint 随机数基 | _
+//   [5] HalfLen（首块砖的弧长）| LayoutScale（长度轴铺装缩放）| asuint 随机数基 | CrossScale（横截面缩放，柱头/柱础）
+//   [6] CullBelowZ（世界 Z 低于它的砖写负值随机数 ⇒ 材质 discard；≤ 0 = 不剔）
+//       | ShearAtS0（首块砖顶边朝 −S 多伸出的 cm）| ShearAtS1（末块砖顶边朝 +S）| 保留
 //
 // packed 行布局照抄 CSGpuInstancedMesh.usf：前三行是被缩放过的基（**矩阵的行**），第 4 行是
 // 原点 + 每实例随机数，第 5 行是剔除球（必须包住变换后的基础网格，否则实例会在视锥边缘闪掉）。
@@ -37,7 +39,7 @@
 #define THREADGROUPSIZE_X 64
 #endif
 
-#define FRAME_PATH_STRIDE 6
+#define FRAME_PATH_STRIDE 7
 
 #define FRAME_FLAG_LEFT_JAMB  1u
 #define FRAME_FLAG_RIGHT_JAMB 2u
@@ -147,6 +149,7 @@ void ScatterHouseFrameCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	// 线性扫比二分短、也没有边界条件可写错；而且这一步与砖数无关，砖再多也不变慢。
 	uint Path = FramePathCount;
 	uint Begin = 0u;
+	uint Count = 0u;
 	for (uint K = 0u; K < FramePathCount; ++K)
 	{
 		const uint4 Ints = asuint(FramePaths[K * FRAME_PATH_STRIDE + 4u]);
@@ -154,6 +157,9 @@ void ScatterHouseFrameCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 		{
 			Path = K;
 			Begin = Ints.y;
+			// 砖路的长度也要带出循环 —— 下面判 bLast 要它。区间是 [Ints.y, Ints.y + Ints.z)，
+			// 上面那行 if 的条件本身就是这条口径的证据。
+			Count = Ints.z;
 			break;
 		}
 	}
@@ -166,6 +172,7 @@ void ScatterHouseFrameCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	const float4 R3 = FramePaths[Base + 3u];
 	const float4 R4 = FramePaths[Base + 4u];
 	const float4 R5 = FramePaths[Base + 5u];
+	const float4 R6 = FramePaths[Base + 6u];
 
 	const float3 Origin = R0.xyz;
 	const float3 AxisU = R1.xyz;
@@ -199,22 +206,61 @@ void ScatterHouseFrameCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	const float3 LocalX = mul(float4(AxisX, 0.0f), FrameWorldToComponent).xyz;
 	const float3 LocalY = mul(float4(AxisY, 0.0f), FrameWorldToComponent).xyz;
 	const float3 LocalZ = mul(float4(AxisZ, 0.0f), FrameWorldToComponent).xyz;
-	const float3 LocalOrigin = mul(float4(WorldPos, 1.0f), FrameWorldToComponent).xyz;
+	float3 LocalOrigin = mul(float4(WorldPos, 1.0f), FrameWorldToComponent).xyz;
 
 	// 长度轴额外吃铺装缩放（`SolveRun` 把整条路恰好铺满就靠它）。
 	float3 BlockScale = FrameBlockSize;
 	if (dot(BlockScale, BlockScale) < 1e-8f) BlockScale = float3(1.0f, 1.0f, 1.0f);
 	BlockScale.y *= LayoutScale;
+	// 横截面缩放（柱头 / 柱础）：进深轴与墙法线轴同乘。≤ 0 = 旧数据没填这一格，按 1 处理。
+	const float CrossScale = R5.w > 1e-4f ? R5.w : 1.0f;
+	BlockScale.x *= CrossScale;
+	BlockScale.z *= CrossScale;
 
-	const float3 ScaledX = LocalX * BlockScale.x;
+	float3 ScaledX = LocalX * BlockScale.x;
 	const float3 ScaledY = LocalY * BlockScale.y;
 	const float3 ScaledZ = LocalZ * BlockScale.z;
+
+	// -------------------------------------------------------------------------
+	// 洞缘四级之③：端头那块砖**剪切**成上宽下窄，贴住收窄的洞缘
+	// -------------------------------------------------------------------------
+	// ①按剪影裁行时切口取的是"带内最宽的那个高度"，于是拱圈往上收的那一头会在砖与洞之间
+	// 留一条缝。把端头砖的**顶边**朝洞多推出 Shear、底边不动，缝就没了。
+	// TG 对位物是 `flags & 32` 的"局部 z 按拱高曲线缩放"—— 同一件事的另一种参数化。
+	//
+	// ⚠️ 剪切**不加任何逐实例数据**：基是三个任意向量，倾斜高度轴就是一次剪切。
+	// 平顶段的轴向是 +X 朝上、+Y 沿 −S（见文件头），所以"朝 +S"就是 −ScaledY 方向。
+	const float ShearAtS0 = R6.y;
+	const float ShearAtS1 = R6.z;
+	const bool bFirst = (Brick == Begin);
+	const bool bLast  = (Brick + 1u == Begin + Count);
+	// 只有一块砖而两端都挨着洞时取较大的那个：剪切是平行四边形，一个自由度救不了梯形。
+	// 硬凑两头会把砖推进洞里，而画面上只是"洞缘多了一小块"——不会有任何断言报红。
+	const float ShearFirst = bFirst ? ShearAtS0 : 0.0f;
+	const float ShearLast  = bLast  ? ShearAtS1 : 0.0f;
+	const float Shear = (ShearLast >= ShearFirst) ? ShearLast : -ShearFirst;   // 正 = 朝 +S
+	if (abs(Shear) > 1e-4f)
+	{
+		// −ScaledY 是 +S。ScaledY 已含铺装缩放，取单位向量才不会让剪切量跟着砖长缩放。
+		const float3 AlongS = -normalize(ScaledY);
+		// 局部 x ∈ [−0.5, 0.5] ⇒ 给基加 `AlongS * Shear` 让顶边 +Shear/2、底边 −Shear/2；
+		// 再把原点推 +Shear/2 就变成"底边不动、顶边 +Shear"。
+		ScaledX += AlongS * Shear;
+		LocalOrigin += AlongS * (Shear * 0.5f);
+	}
 
 	const uint Row = Brick * 5u;
 	RWFrameInstances[Row + 0u] = float4(ScaledX, 0.0f);   // .w 必须是 0：引擎拿它做选中/hitproxy
 	RWFrameInstances[Row + 1u] = float4(ScaledY, 0.0f);
 	RWFrameInstances[Row + 2u] = float4(ScaledZ, 0.0f);
-	RWFrameInstances[Row + 3u] = float4(LocalOrigin, FrameInstanceRandom(RandomIndex));
+	// 逐实例随机数的**负值哨兵** = 材质里的剔除位（`FElement::CullBelowZ`）。真实随机数恒 ≥ 0，
+	// 所以 −1 不会与任何取值相撞；`M_TinyGladeBrick` 的 OpacityMask = saturate(PerInstanceRandom + 1)
+	// 把它裁掉。比较用**世界** Z（`WorldPos` 还没进组件空间），与 CPU 侧填的口径一致。
+	const float CullBelowZ = R6.x;
+	const float InstanceRandom = (CullBelowZ > 0.0f && WorldPos.z < CullBelowZ)
+		? -1.0f
+		: FrameInstanceRandom(RandomIndex);
+	RWFrameInstances[Row + 3u] = float4(LocalOrigin, InstanceRandom);
 
 	const float3 SphereCentre = LocalOrigin
 		+ ScaledX * FrameBaseSphereCentre.x
@@ -223,5 +269,7 @@ void ScatterHouseFrameCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	// 剔除球必须包住**变换后**的基础网格：基向量是单位长，所以按最大轴缩放放大即可。
 	// 少放大一点点就会在视锥边缘闪掉实例，而且只在斜看时出现，最难复现。
 	const float MaxAxisScale = max(BlockScale.x, max(BlockScale.y, BlockScale.z));
-	RWFrameInstances[Row + 4u] = float4(SphereCentre, FrameBaseSphereRadius * max(MaxAxisScale, 1e-3f));
+	// 剪切把砖撑宽了，剔除球要跟着涨 —— 少涨一点就会在视锥边缘闪掉，且只在斜看时出现。
+	RWFrameInstances[Row + 4u] = float4(SphereCentre,
+		FrameBaseSphereRadius * max(MaxAxisScale, 1e-3f) + abs(Shear));
 }

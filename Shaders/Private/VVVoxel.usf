@@ -14,6 +14,21 @@ StructuredBuffer<float4> PathPointFrameNormals;
 StructuredBuffer<float4> PathPointSurfaceTargets;
 StructuredBuffer<float4> PathPointSurfaceNormals;
 StructuredBuffer<int4> SegmentMeta;
+/**
+ * UV 组数。引擎的 TexCoord 流是**交错**的（LocalVertexFactory.ush 的
+ * `VertexFetch_TexCoordBuffer[NumFetchTexCoords * VertexId + CoordIndex]`），所以步长必须由
+ * 它决定，不能写死 2。默认 1 时下面的写入与改动前**逐位相同**，既有的藤/道路一行不用改。
+ *   set0 = (周向 U, CurveV)        贴图
+ *   set1 = (SpawnTime 秒, 弧长 cm) 生长动画（TinyGladeHouse D13 裁决 3/7）
+ *   set2 = (环半径 cm, 0)          由细变粗的 WPO 要知道往回收多远
+ */
+uint VineTexCoordSets;
+
+/** 逐点生长通道 (SpawnTime, 弧长 cm)。CPU 折线通路上传；GPU 线路径下是零缓冲。 */
+StructuredBuffer<float2> PathPointGrowth;
+
+/** 0 = 关掉表面吸附（见 FindNearestVoxelSample 里的长注释）。四个读体素的参数结构都带它。 */
+uint VineSurfaceAdsorption;
 StructuredBuffer<int4> VoxelCells;
 StructuredBuffer<uint> VoxelHashSlots;
 StructuredBuffer<float4> VoxelNormals;
@@ -32,7 +47,7 @@ RWStructuredBuffer<float4> RW_PathPointSurfaceNormals;
 // GPU-resident mesh path consumes directly, plus DrawIndexedIndirect args and CPU-readback counters.
 RWBuffer<float> RWPositions;    // 3 floats / vertex
 RWBuffer<uint>  RWTangents;     // 2 packed 8888 SNORM / vertex (TangentX, TangentZ)
-RWBuffer<float> RWTexCoords;    // 2 floats / vertex
+RWBuffer<float> RWTexCoords;    // 2 floats * VineTexCoordSets / vertex（交错，见 VineTexCoordSets）
 RWBuffer<uint>  RWColors;       // packed / vertex
 RWBuffer<uint>  RWBaseIndices;
 float4x4 VineWorldToLocal;
@@ -746,6 +761,22 @@ bool FindNearestVoxelSample(float3 Query, out float3 OutTarget, out float3 OutNo
     OutNormal = float3(0.0f, 0.0f, 1.0f);
     OutSampleMode = VINE_VOXEL_SAMPLE_MODE_FAIL;
 
+    // 表面吸附总开关（TinyGladeHouse D13，2026-09-06 裁决 3）。墙面藤的中心线本来就长在
+    // 墙面参数坐标里、映射时已带 StandOff，没有可吸附的东西 —— 这里一刀短路，三个调用方
+    // （BuildRawVoxelVineFrame / ApplyVVNoise / FinalProject）全部走各自的 no-sample 回退。
+    //
+    // 短路的是**采样**，不是 BuildAxes 那个 pass：Pass C 的环心读 PathPointSurfaceTargets，
+    // 而那条流的唯一播种者就是 BuildVVVoxelAxesCS。把 pass 一起跳掉的后果是环心全塌到世界
+    // 原点、整棵藤缩成一个结 —— 不崩、不报错、没有断言。
+    //
+    // 用 uniform 而不是 permutation：分支全 wave 一致，运行时代价为零，也不必多编一套着色器。
+    // 代价是那几条体素 SRV 仍要绑上（CPU 侧给 1 元素哑缓冲）。想连绑定一起省掉才需要
+    // permutation —— 那是后续优化，不是正确性前提。
+    if (VineSurfaceAdsorption == 0u)
+    {
+        return false;
+    }
+
     // Prefer the local expanding voxel interpolation around the query point.
     // The target bucket search is only a fallback for sparse surface regions.
     uint NeighborSampleMode = VINE_VOXEL_SAMPLE_MODE_FAIL;
@@ -1369,7 +1400,25 @@ void BuildVVVoxelCS(uint3 DispatchThreadId : SV_DispatchThreadID)
             float3 RadialNormal = SafeNormalize3(Binormal * Profile.x + FrameNormal * Profile.y, FrameNormal);
             RWTangents[Index*2+0] = PackSnorm8888(float4(Tangent, 0.0f));       // TangentX = 沿管切线
             RWTangents[Index*2+1] = PackSnorm8888(float4(RadialNormal, 1.0f));  // TangentZ = 法线(+w 符号)
-            RWTexCoords[Index*2+0] = U; RWTexCoords[Index*2+1] = V;
+            // UV 是**交错**的，步长 = 组数 * 2。写死 2 的后果是第 2 组起全部错位，
+            // 而画面上只表现为"贴图有点怪" —— 没有任何断言会响。
+            const uint UVSets = max(VineTexCoordSets, 1u);
+            const uint UVBase = Index * UVSets * 2u;
+            RWTexCoords[UVBase + 0u] = U;
+            RWTexCoords[UVBase + 1u] = V;
+            if (UVSets >= 2u)
+            {
+                const float2 Growth = PathPointGrowth[PointIndex];
+                RWTexCoords[UVBase + 2u] = Growth.x;   // SpawnTime 秒
+                RWTexCoords[UVBase + 3u] = Growth.y;   // 该点的世界弧长 cm
+            }
+            if (UVSets >= 3u)
+            {
+                // 环半径。**不用另存一条流** —— Profile 已经是缩放后的截面坐标，
+                // 它的模长就是这一圈的半径。材质的 WPO 拿它决定往轴线收多远。
+                RWTexCoords[UVBase + 4u] = length(Profile);
+                RWTexCoords[UVBase + 5u] = 0.0f;
+            }
             RWColors[Index] = 0xFFFFFFFFu;
 #else
             RW_OutVertices[Index] = float4(OutPosition, 1.0f);
@@ -1761,7 +1810,8 @@ void VineUVWriteCS(uint3 DispatchThreadId : SV_DispatchThreadID)
     }
     uint P = Index / VineUV_ProfileCount;
     float V = (P < VineUV_PointCount) ? VineUV_CurveV[P] : 0.0f;
-    RW_VineUV_TexCoords[Index * 2u + 1u] = V;
+    // 同上：步长跟着组数走。这一趟只覆盖 set0 的 V，别的组不碰。
+    RW_VineUV_TexCoords[Index * max(VineTexCoordSets, 1u) * 2u + 1u] = V;
 }
 
 // ============================================================================

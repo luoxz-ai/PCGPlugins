@@ -159,3 +159,92 @@ float GroundShaperHeightAtXY(float2 P)
 	}
 	return H;
 }
+
+/**
+ * 同一个高度场，但**每座塑形物的台顶半径临时加大 `RadiusBonus`** ⇒ 衰减开始得更靠外。
+ *
+ * 用途只有一个：披挂岩壳的「石头隆起的最大高度需要外扩一定距离，衰减比地面更晚」
+ * （用户规格 2026-08-31 第 6 条）。加的是 `A.z`（`Radius`）而不是缩 `A.w`（`Falloff`）——
+ * 前者把台顶整体外推、裙边形状原样保留；后者会把裙边压陡，连带改掉坡度 mask 与石阶的等值线。
+ *
+ * ⚠️ **这个函数没有 CPU 孪生**（`CSGroundShaperField.h` 里没有对应物），因为 CPU 侧没有任何
+ * 消费者：镜像、拾取、房子落座读的都是真地面高度，只有壳需要这条外扩的。别顺手给它加一份
+ * 孪生然后忘了同步 —— 真要加，就得连 `GroundShaper.CpuGpuFieldParity` 一起扩。
+ */
+/**
+ * 同一个高度场，但**只把峰高 ≥ `MinPeak` 的塑形物算进来**，矮的一律当不存在。
+ *
+ * 用途只有一个：石阶的「矮塑形物不出台阶」门控（`ACSGroundActor::StairMinMoundHeight`）。
+ * 本座的峰高取 `EvalOne` 在 `S → 1`（台顶）时的取值 = `台高 × (1 + 二次抬升系数)`，
+ * **不是**裸的台高 —— 二次抬升会把台顶再顶上去一截，只比台高会把临界档判低。
+ *
+ * ⚠️ 这个函数只许当**门控**用，别拿它的返回值当地面高度：矮座与高座重叠处它给的是
+ * 高座那一份，比真地面低，拿去解等值线或算块底 Z 会让石阶陷进土里。
+ *
+ * ⚠️ 同 `GroundShaperHeightAtXYExpanded`，**没有 CPU 孪生**（`CSGroundShaperField.h` 里没有
+ * 对应物），因为 CPU 侧没有消费者。真要加就得连 `GroundShaper.CpuGpuFieldParity` 一起扩。
+ */
+/**
+ * 本点**由哪座塑形物说了算**（贡献最大的那座），返回那一座的峰高。
+ *
+ * 高度场是逐座取 max，所以「贡献最大」与「决定本点高度」是同一件事 —— 两者用同一个判据，
+ * 石阶的顶层判断因此和它脚下的地面永远出自同一座。
+ *
+ * 用途只有一个：石阶的「掐掉最顶上那一级」（`ACSGroundActor::bStairDropTopStep`）——
+ * 顶层的位置由**整座的峰高**决定，本格高度看不出自己离峰顶还有多远。
+ *
+ * ⚠️ 返回的是峰高，**不是本点高度**，别拿去当地面用。同样没有 CPU 孪生。
+ */
+float GroundShaperPeakAtXY(float2 P)
+{
+	float BestH = -1.0f;
+	float Peak = 0.0f;
+	for (uint i = 0; i < GroundShaperCount; ++i)
+	{
+		const float4 B = GroundShaperParams[i * 3u + 1u];
+		const float h = GroundShaperEvalOne(
+			P,
+			GroundShaperParams[i * 3u + 0u],
+			B,
+			GroundShaperParams[i * 3u + 2u]);
+		if (h > BestH)
+		{
+			BestH = h;
+			Peak = max(B.x, 0.0f) * (1.0f + max(B.w, 0.0f));
+		}
+	}
+	return Peak;
+}
+
+float GroundShaperHeightAtXYTallOnly(float2 P, float MinPeak)
+{
+	float H = 0.0f;
+	for (uint i = 0; i < GroundShaperCount; ++i)
+	{
+		const float4 B = GroundShaperParams[i * 3u + 1u];
+		if (max(B.x, 0.0f) * (1.0f + max(B.w, 0.0f)) < MinPeak) continue;
+		H = max(H, GroundShaperEvalOne(
+			P,
+			GroundShaperParams[i * 3u + 0u],
+			B,
+			GroundShaperParams[i * 3u + 2u]));
+	}
+	return H;
+}
+
+float GroundShaperHeightAtXYExpanded(float2 P, float RadiusBonus)
+{
+	if (RadiusBonus <= 0.0f) return GroundShaperHeightAtXY(P);
+
+	float H = 0.0f;
+	for (uint i = 0; i < GroundShaperCount; ++i)
+	{
+		float4 A = GroundShaperParams[i * 3u + 0u];
+		A.z += RadiusBonus;
+		H = max(H, GroundShaperEvalOne(
+			P, A,
+			GroundShaperParams[i * 3u + 1u],
+			GroundShaperParams[i * 3u + 2u]));
+	}
+	return H;
+}

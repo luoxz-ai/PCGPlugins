@@ -1,0 +1,127 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="770" viewBox="0 0 980 770" font-family="'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif">
+  <defs>
+    <marker id="arw" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0 0L7 3.5L0 7Z" fill="#475569"/></marker>
+    <marker id="arwN" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0 0L7 3.5L0 7Z" fill="#0f766e"/></marker>
+    <pattern id="sv-stripe-bg" patternUnits="userSpaceOnUse" width="10" height="10">
+      <rect width="10" height="10" fill="#fef3c7"/>
+      <rect y="1" width="10" height="2" fill="#d97706" opacity="0.264249"/>
+      <rect y="6" width="10" height="1.5" fill="#d97706" opacity="0.264249"/>
+    </pattern>
+    <pattern id="pickable-domain-cross-bg" patternUnits="userSpaceOnUse" width="12" height="12">
+      <rect width="12" height="12" fill="#e0e7ff"/>
+      <path d="M0 6H12" stroke="#4f46e5" stroke-width="1" opacity="0.316770"/>
+      <path d="M6 0V12" stroke="#4f46e5" stroke-width="1" opacity="0.316770"/>
+    </pattern>
+    <style>
+      .lane { font-size: 13px; font-weight: 600; fill: #475569; }
+      .bt   { font-size: 13px; font-weight: 600; fill: #1e293b; }
+      .tx   { font-size: 12px; fill: #334155; }
+      .mono { font-size: 12px; fill: #1e293b; font-family: Consolas, 'Courier New', monospace; }
+      .cap  { font-size: 12px; fill: #64748b; }
+      .producer { fill: #eef2f7; stroke: #64748b; stroke-width: 1; }
+      .quiet    { fill: #f8fafc; stroke: #94a3b8; stroke-width: 0.8; }
+      .payload  { fill: url(#sv-stripe-bg); stroke: #b45309; stroke-width: 1.2; }
+      .core     { fill: url(#pickable-domain-cross-bg); stroke: #4f46e5; stroke-width: 1.2; }
+      .flow   { stroke: #475569; stroke-width: 1.4; fill: none; marker-end: url(#arw); }
+      .leader { stroke: #94a3b8; stroke-width: 0.8; stroke-dasharray: 3 2; fill: none; }
+      .nrm    { stroke: #0f766e; stroke-width: 2; fill: none; marker-end: url(#arwN); }
+    </style>
+  </defs>
+
+  <rect width="980" height="770" fill="#ffffff"/>
+  <text x="40" y="34" font-size="17" font-weight="700" fill="#0f172a">岩壳假倒角：缺口法线的生成（当前实现）</text>
+
+  <!-- ① 逐顶点慢变量 -->
+  <text x="40" y="66" class="lane">① 逐顶点慢变量 · 生产一次（改图案后重烘）</text>
+  <rect x="40" y="78" width="230" height="54" rx="6" class="producer"/>
+  <text x="52" y="98" class="bt">路线 A · 资产烘焙（已执行）</text>
+  <text x="52" y="118" class="tx">离线脚本算好四个量，写进资产顶点色</text>
+  <rect x="40" y="140" width="230" height="54" rx="6" class="producer"/>
+  <text x="52" y="160" class="bt">路线 B · 运行时壳（待编译）</text>
+  <text x="52" y="180" class="tx">建壳时现算同一批量，随网格上传</text>
+  <line x1="270" y1="105" x2="328" y2="112" class="flow"/>
+  <line x1="270" y1="167" x2="328" y2="160" class="flow"/>
+
+  <rect x="330" y="78" width="310" height="116" rx="6" class="payload"/>
+  <text x="342" y="98" class="bt">顶点色 RGBA（通道字典 v2）</text>
+  <text x="342" y="118" class="tx">R　盖/裙：1 = 顶盖，0 = 侧裙</text>
+  <text x="342" y="136" class="tx">G　到上沿折痕多远：0 = 贴着，1 = 远</text>
+  <text x="342" y="154" class="tx">B　每石头一个常数，错开噪声花样</text>
+  <text x="342" y="172" class="tx">A　石头的水平朝外方向（编码成角度）</text>
+
+  <path d="M640 136H698" class="leader"/>
+  <rect x="700" y="78" width="240" height="116" rx="6" class="quiet"/>
+  <text x="712" y="98" class="bt">只装"定位量"</text>
+  <text x="712" y="120" class="tx">每石头常数或线性渐变；</text>
+  <text x="712" y="140" class="tx">缺口的形状不在顶点里，</text>
+  <text x="712" y="160" class="tx">由逐像素噪声在带内生成，</text>
+  <text x="712" y="180" class="tx">横向细度 = 屏幕像素。</text>
+
+  <!-- ② 逐像素 -->
+  <text x="40" y="232" class="lane">② 逐像素 · 材质 M_TinyGladeRockShell 每帧</text>
+  <path d="M485 194V244" class="flow"/>
+
+  <rect x="380" y="246" width="220" height="72" rx="6" class="quiet"/>
+  <text x="392" y="266" class="bt">光栅化插值（顶点 → 像素）</text>
+  <text x="392" y="286" class="tx">四个通道随三角形摊成逐像素值，</text>
+  <text x="392" y="304" class="tx">并附带像素世界坐标、平直面法线</text>
+
+  <rect x="40" y="246" width="300" height="72" rx="6" class="quiet"/>
+  <text x="52" y="266" class="bt">啃边噪声（Value，特征 ~1 m）</text>
+  <text x="52" y="286" class="tx">输入：像素世界坐标 + B 的相位偏移</text>
+  <text x="52" y="304" class="tx">输出 n ∈ [−1,1]，决定带缘被咬多深</text>
+  <line x1="380" y1="282" x2="342" y2="282" class="flow"/>
+
+  <line x1="600" y1="282" x2="618" y2="282" class="flow"/>
+  <path d="M190 318V352H618" class="flow"/>
+
+  <rect x="620" y="240" width="320" height="170" rx="6" class="core"/>
+  <text x="632" y="260" class="bt">RockShellEdgeBevel（Custom 节点）</text>
+  <text x="632" y="286" class="tx">① 距离还原：d = G × 50 cm</text>
+  <text x="632" y="308" class="tx">② 按盖/裙(R)选带宽 20/8、咬深 ±50/±25 cm</text>
+  <text x="632" y="330" class="tx">③ 强度 t：贴折痕 = 1，往内被噪声 n 啃着衰减</text>
+  <text x="632" y="352" class="tx">④ 轴 = 折痕切向（由朝外方向 A 求出）</text>
+  <text x="632" y="374" class="tx">⑤ 法线绕轴倒 45°×0.5×t：盖朝外、裙朝上</text>
+
+  <path d="M780 410V422" class="flow"/>
+  <rect x="620" y="424" width="320" height="40" rx="6" class="quiet"/>
+  <text x="632" y="449" class="tx">弯过的法线接 Normal（世界空间），光照读成缺口</text>
+
+  <!-- ③ 折痕截面 -->
+  <text x="40" y="500" class="lane">③ 折痕截面 · 几何没动，只有法线在带内弯</text>
+
+  <!-- 石体 -->
+  <polygon points="120,620 560,620 660,700 660,724 120,724" fill="#e2e8f0" stroke="none"/>
+  <line x1="120" y1="620" x2="560" y2="620" stroke="#334155" stroke-width="2"/>
+  <line x1="560" y1="620" x2="660" y2="700" stroke="#334155" stroke-width="2"/>
+  <line x1="660" y1="700" x2="900" y2="700" stroke="#94a3b8" stroke-width="1" stroke-dasharray="5 4"/>
+  <text x="906" y="704" class="cap">地面</text>
+  <text x="132" y="712" class="cap">盖面（cap）</text>
+  <text x="566" y="676" class="cap" transform="rotate(38 566 676)">裙面</text>
+
+  <!-- 倒角带（噪声啃出的参差左缘） -->
+  <polygon points="444,620 438,612 452,614 446,606 462,610 458,602 472,606 470,600 560,600 560,620"
+           fill="#f5c4b3" fill-opacity="0.75" stroke="#d85a30" stroke-width="0.8"/>
+  <polygon points="560,620 598,650 590,658 554,628" fill="#f5c4b3" fill-opacity="0.75" stroke="#d85a30" stroke-width="0.8"/>
+
+  <!-- 法线箭头：带外直立，带内向外弯（最大 45° = 0.5·lerp 到水平） -->
+  <line x1="180" y1="620" x2="180" y2="566" class="nrm"/>
+  <line x1="280" y1="620" x2="280" y2="566" class="nrm"/>
+  <line x1="470" y1="620" x2="488" y2="569" class="nrm"/>
+  <line x1="515" y1="620" x2="546" y2="576" class="nrm"/>
+  <line x1="552" y1="620" x2="590" y2="582" class="nrm"/>
+  <line x1="622" y1="670" x2="656" y2="628" class="nrm"/>
+
+  <!-- 标注 -->
+  <text x="120" y="548" class="cap">远离折痕（G = 1）：法线保持平直</text>
+  <path d="M240 552 274 562" class="leader"/>
+  <text x="298" y="524" class="cap">倒角带 8–20 cm，左缘被噪声啃出 ±25/50 cm</text>
+  <path d="M420 528 452 598" class="leader"/>
+  <text x="700" y="538" class="cap">盖-裙折痕（G = 0）</text>
+  <path d="M698 534 564 614" class="leader"/>
+  <text x="668" y="576" class="cap">弯 0.5·t，最大 45°</text>
+  <path d="M666 572 594 580" class="leader"/>
+  <text x="676" y="654" class="cap">裙侧同理，弯向竖直向上</text>
+
+  <text x="40" y="752" class="cap">几何零改动、剪影不变；t 随噪声沿折痕忽有忽无 —— 光照把带内像素读成"被磕掉的边"，就是游戏里看到的小缺口。</text>
+</svg>

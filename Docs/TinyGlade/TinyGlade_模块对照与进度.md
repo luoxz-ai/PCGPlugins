@@ -1,15 +1,15 @@
 # Tiny Glade 模块对照与进度（合卷）
 
-自监督循环的**状态文件**（卷零）与四份**模块对照文档**（卷一～卷四）的合卷。
+自监督循环的**状态文件**（卷零）与**模块对照文档**（卷一～卷五）的合卷。
 每一轮迭代开始时读卷零、结束时更新卷零 —— 没有它，循环会失忆重做。
 
 设计裁决在 [`TinyGladeHouse_Plan.md`](TinyGladeHouse_Plan.md)，逆向证据在
 [`TinyGlade_对比逆向报告.md`](TinyGlade_对比逆向报告.md)，全部文档的地图在 [`index.md`](index.md)。
 
-> **合卷说明（2026-08-31）**：本文由五份独立文档合并而成，正文一字未改，只做了三件事 ——
+> **合卷说明（2026-08-31）**：卷零～卷四由五份独立文档合并而成，正文一字未改，只做了三件事 ——
 > ① 每份原文的 H1 换成下表的卷标题、其余标题整体降一级；② 跨文档链接改成本文的卷内锚点；
 > ③ 文件路径按新目录 `Plugins/PCGPlugins/Docs/TinyGlade/` 更新。
-> **四卷各自的「证据标注约定」保留原样、没有合并** —— 它们的口径逐卷不同
+> **卷五为本轮直接成文，不是合并产物。** 各卷的「证据标注约定」一律保留原样、没有合并 —— 它们的口径逐卷不同
 > （证据种类、易误采提醒、轴向换算都不一样），压成一张表会丢信息。
 
 | 卷 | 内容 | 合并前的文件名 |
@@ -19,6 +19,7 @@
 | [卷二](#vol-2) | 窗户（D8）与装饰／藤蔓（D12/D13）对照 | `TinyGlade_窗户与装饰对照.md` |
 | [卷三](#vol-3) | 楼梯模块对照 | `TinyGlade_楼梯模块对照.md` |
 | [卷四](#vol-4) | 渲染与光照对照 | `TinyGlade_渲染光照对照.md` |
+| [卷五](#vol-5) | 砖构件对照：门框 / 转角 / 垛口 / 接缝 / 上沿 | *（本轮新增，无前身）* |
 
 ---
 
@@ -51,29 +52,56 @@
 | PDB 符号 | `D:/MyProject/Tiny Glade/tmp/pdb_symbols.txt` | 97033 条。**最硬的证据** —— 系统的参数签名直接说明它读什么写什么 |
 | 逆向分析 | `D:/MyProject/Tiny Glade/MESH_GENERATION_ANALYSIS.md` | 461 行，自带 `【确凿】/【推测】/【待确认】` 标注，沿用这套 |
 | 两轮对照评审 | [`TinyGlade_对比逆向报告.md`](TinyGlade_对比逆向报告.md)（同目录，两轮已合卷） | 含**被否条目**与「看似该抄其实不该抄」清单，别重复推翻 |
-| 提取资产 | `Content/TinyGlade/`（`/Game/TinyGlade`） | 网格/贴图/材质实例。尺寸一律实测，不猜 |
+| 提取资产 | `Content/HouseTest/TinyGladeAsset/`（`/PCGPlugins/HouseTest/TinyGladeAsset`） | 网格/贴图/材质实例。尺寸一律实测，不猜 |
 | 反编译着色器 | `D:/MyProject/Tiny Glade/tmp/shaders` | GLSL 实证 |
+| **exe 反汇编** | `tiny-glade.exe` + `tiny_glade.pdb`（同目录） | **2026-09-06 新开**。比 PDB 签名更硬：签名只说“读什么写什么”，反汇编说**做了什么**。用法见下 |
 | 模块对照文档 | **本文卷一～卷四**（四份对照已并入本文，调研面已闭合） | 本循环自产。结论前置 + A1..An 行动项，**已被本文引用的部分都经驱动方复核** |
 | Houdini 原型 | `D:/MyProject/Houdini/TinyGlade/TinyGlade.hip` | 用户的意图原型，对照写法见 `CSGroundShaper.md`（同目录） |
 
 解 PDB 系统签名的用法（已验证）：找到含系统名的 `bevy_ecs::label::impl$0::as_any<...FunctionSystem<...>>` 行，
 `sed -n '<行号>p' pdb_symbols.txt | tr ',' '\n' | grep -oE "(EventReader|EventWriter|Res|ResMut|Query)<[a-zA-Z_:]+"`。
 
+**反汇编的用法（2026-09-06 打通，一趟 15 秒）**：这台机器**没装** Ghidra / IDA / radare2，但 MSVC 的
+`dumpbin` 就够 —— PDB 就在 exe 旁边，它能解 Rust 的 mangled 名、标出**函数边界**与**调用目标**：
+
+```powershell
+& "<VS>/VC/Tools/MSVC/<ver>/bin/Hostx64/x64/dumpbin.exe" /DISASM:NOBYTES "<TG>/tiny-glade.exe" | python grab_funcs.py > out.asm
+```
+
+`grab_funcs.py` 是个**流式**过滤器（十几行）：顶格且以 `:` 结尾的行是函数标签，按关键词只留命中的函数体。
+58 MB 的 exe 反汇编出来上 GB，流式处理**不落全量磁盘** —— 实测 15 秒、输出 400 KB、一次捞 8 个函数。
+
+⚠️ 两条读法上的坑：
+- 浮点常量是 `__real@<hex>` 的**单精度**，且 **TG 的单位是米**：
+  `struct.unpack('<f', struct.pack('<I', 0x3fb70a3f))` → 1.43，正是 rank-2 窗宽 143.5 cm。
+  不换算的话会把 0.9 当成 90 而不是 90 cm，整条推理跟着歪。
+- 函数可能被**内联**掉（`mirror_holes_as_needed` 就搜不到）。搜不到 ≠ 不存在。
+
 ### 模块状态
 
-⚠️ **下表最后更新于 2026-08-30 23:16，已落后于代码。** 2026-08-31 上午另有四个模块落地，
-本节**没有**被那一轮回填 —— 下一轮开循环时先把这四行改掉，别照着「待办」重做一遍：
+✅ **2026-08-31 岩壳体积那一轮已回填**（下表原停在 08-30 23:16）。补落地的模块逐行列在这里，
+下面那张主表的「状态」列也已同步 —— 别再照着旧的「待办」重做一遍：
 
-| 模块 | 落地文件（源码核对，2026-08-31） | 表里还写着 |
+| 模块 | 落地文件（源码核对，2026-08-31） | 旧表写的 |
 | --- | --- | --- |
-| D5 拉尺寸 | `CSHouseResize.h`（单边推拉纯函数 + 尺寸禁带；抓手 / gizmo / EdMode 仍不在范围内） | 待办 |
+| D5 拉尺寸 | `CSHouseResize.h`（单边推拉纯函数）+ `ACSHouseActor::PushEdge`（机制入口）+ `CSHouseResizeHandleActor`（抓手，2026-09-05）+ `CSHouseResizeSelectionWatcher`（编辑器失选监听）。**尺寸禁带已随四坡屋顶同日删除**；仍不做自定义 EdMode / HitProxy（用户裁决：用标准 gizmo） | 待办 |
 | D7 接缝 | `CSHouseSeam.h`（纯函数接缝砖，`Canonical()` 保证两房逐位相同；洞走 clip） | 待办 |
-| D8 窗 | 洞与谓词已落地，回归有 `demo_house_window`；`ACSWindowMarker` 交互 actor 仍未写 | 待办（已解卡） |
+| D8 窗 | **整个模块已合上**：洞与谓词 + `ACSWindowMarker`（`CSHouseFeatureMarker.{h,cpp}`，2026-08-31 晚） | 待办（已解卡） |
 | D12 摆件 | `CSHouseDecor.{h,cpp,usf}` + `CSGroundDecor.{h,cpp}`（五家锚点）；复杂度场那一半按 C2 有意未做 | 待办 |
+| D7 转角角石 | `CSHouseQuoin.h`（2026-08-31，见「转角角石已落地」一节）—— **D7 两半至此都合上** | 待办 |
+| D7 包边石（A8） | `CSHouseTrim.h`（2026-08-31，见「包边石已落地」一节）：墙顶压顶 + 墙脚勒脚，勒脚按洞切段 | 待办 |
+| D4 屋面（四坡 + 瓦） | `CSHouseTile.{h,cpp,usf}`（**另一会话**重构；本轮补资产接线 + 6 条回归）—— ⚠️ 裁决四冲突**已由用户裁掉**：脊向派生 + 平局归 X，见 `bRidgeAlongX()` | 待办 |
+| D4 屋面收尾（瓦厚 / 密度 / 脊瓦 / 尖顶） | 瓦厚与尺寸系数、排距定档 827 片、`CSHouseTile` 脊瓦、`ACSHouseActor::RebuildRoofFinials` 尖顶（2026-08-31，见「屋面收尾一轮」一节） | 待办 |
+| D9 岩壳「石头隆起」 | `CSGroundRockShell.usf` 六参数（用户规格 2026-08-31），全部蓝图可调 | 待办 |
+| D9 岩壳体积（TG 两层） | `CSGroundRockShell.usf`：`:563` 基准偏移 + 表面起伏改坡度比例（见「岩壳体积再补两层」） | *（本轮新增）* |
+| D8 特征标记（A6） | `CSHouseFeatureMarker.{h,cpp}` + `UCSHouseSubsystem::PickHouse` + `ACSHouseActor::MarkerWindows`（见「D8 收口」） | *（本轮新增）* |
+| 楼梯 S3 | **旧路已删干净**：`AnalyticRingRadius` 全仓 0 命中，`BuildStepPlan` 只剩注释里的历史提及 | 「旧路一行没删」 |
 
-⚠️ 这四行是**读源码与回归脚本得出的**，不是跑过验收门的结论 —— 构建 / 单测 / 演示回归的实际结果
-要按本卷「验收门」自己跑一遍才算数。同一轮里自动化测试文件数也从 61 涨到 **92**，
-回归脚本的 demo 段涨到 **11** 个（新增 `demo_house_window` / `demo_house_seam` / `demo_house_resize`
+✅ **验收门已跑过两轮**（2026-08-31 晚）：全量构建 `Result: Succeeded`；岩壳体积那一轮
+单测 103 绿 0 红、回归 `passed=225 failed=0`；D8 收口那一轮单测 **105 绿 0 红**、
+回归 **`passed=231 failed=0` / `REGRESS OK`**。上表前几行原是**读源码与回归脚本
+得出的**，本轮的实跑把它们一并盖住了。自动化测试文件数从 61 涨到 **92**，回归脚本的 demo 段
+涨到 **11** 个（新增 `demo_house_window` / `demo_house_seam` / `demo_house_resize`
 / `demo_house_decor` / `demo_skirt_decor`）。
 
 | 模块 | 本项目现状 | 对照结论 | 状态 |
@@ -81,16 +109,16 @@
 | D1 地面 | 镜像 + GPU 投影，32 m / 64 格 | — | 已落地 |
 | D2 顶点色笔刷 | 区域派发 + 每帧异步推送 | — | 已落地；地面材质已接（顶点色 R 混草地/土路） |
 | D3 通知直推 | `OnGroundChanged` 三处广播 | — | 已落地 |
-| D4 房屋 / 屋面 | 面板 + clip；屋面共享求值器；脊向滞回 | — | 已落地 |
-| D6 门洞 | **逐像素 clip**（TG 原版做法）+ 门框砖 | ⚠️ **触发规则与 TG 不同**，见下 | 已落地；砖排布 bug 已修（根因见「踩过的坑」） |
-| D9 承重柱 + 塑形物 | **链 A + 链 B 全部落地**（裙边噪声、二次抬升、披挂岩壳） | 用 TG 原件图案，原生 ×65 单张 | 完成；**岩壳材质已拍板改 lit**（裁决六），待执行 |
+| D4 房屋 / 屋面 | ~~面板 + clip~~；屋面共享求值器；脊向滞回 | — | 屋面已落地；**墙体正按 2026-09-05 的两层裁决重做**（砖层 + 灰泥层，「面板 + clip」将退役，见「挖洞策略改成 TG 的真两层」一节） |
+| D6 门洞 | **逐像素 clip** + 门框砖 ⚠️ 「TG 原版做法」这个措辞是**误述**（卷二 A1）：TG 的门拱确实用逐像素 clip，但它同时靠 `flags&32` 把洞缘砖**贴合**过去；2026-09-05 起本项目照抄那套四级 | ⚠️ **触发规则与 TG 不同**，见下 | 已落地；砖排布 bug 已修（根因见「踩过的坑」） |
+| D9 承重柱 + 塑形物 | **链 A + 链 B 全部落地**（裙边噪声、二次抬升、披挂岩壳、石头隆起六参数、TG 的基准偏移 + 坡度比例起伏） | 图案用 TG 原件，但 `PatternScale=0.35`（**绝对密度锚点已被用户有意放弃**）；体积两层已对齐 TG，`rocky_terrain.y/.z` 与水体仍缺 | 完成；**岩壳材质裁决六已执行**（`M_TG_Texture` 本体已翻 `MSM_DefaultLit`，见同名小节） |
 | D10 subsystem | GUID 注册表 + 兜底快扫 | — | 已落地 |
 | D11 Spline 块排布 | `SolveBlockLayout` | — | 已落地，被石阶与门框复用 |
-| **楼梯** | **S1 已落地**：marching squares 等值线 + 定容 + `InterlockedAdd`（`CSGroundStairs.usf`） | 旧路一行未删，两条路并存 | **S1 + S2 已落地并独立复核**；S3 **已解卡**（裁决一：删旧路 + 门框改解析），待动工 |
-| D5 拉尺寸 | 无 | TG 的脊长是长宽比的**连续函数**，没有「翻轴」这个事件 | 待办；零阻塞隐患已修；**C-D5-1 已拍板**（不改连续脊长，改用尺寸最小距离挡翻轴） |
-| D7 接缝角柱 | **墙-顶三处收边已封**（檐口 / 山墙 / 屋脊）；墙角与形状相交仍是空白 | TG 在形状相交处**先开洞再砌缝砖**，且**全库无任何角柱/墙裙/脊瓦预制件**，全是一个 `brick` | 待办；**C-D7-1/2 已拍板**：只出接缝砖、纯函数形态、洞走渲染层，两房其余内容完全独立 |
-| D8 特征标记 / 窗 | 谓词（**一维 S 区间**，2026-08-30 降维）、`FCSOpeningClipField`（**二维**，上下都有界）、窗台实心盒、`bAnySill` 窗台砖分支**全都已在** | TG 的窗**不是** clip，是 CPU 裁砖 + 预制窗框盖缝；本项目的设施反而更强，窗户**一行 shader 都不用加** | 待办（**已解卡**）；C1 已拍板选甲，主体（对照文档 A6）可动工；窗洞一律走 clip，不挖真几何 |
-| D12 decor 摆件 | 无（相关标识符全仓 0 命中，干净白纸） | TG 是七家锚点生产者 + **候选点烘在资产里**；「复杂度场」在 TG 无对位物 | 待办；**C2 已关闭**（用户"随便"⇒ 保留自有复杂度场，只订正措辞） |
+| **楼梯** | **S1 + S2 + S3 全部已落地**：marching squares 等值线 + 定容 + `InterlockedAdd`（`CSGroundStairs.usf`） | 旧路**已删干净**（`AnalyticRingRadius` 全仓 0 命中，`BuildStepPlan` 只剩注释） | 完成（S3 于 2026-08-31 收尾，08-31 晚源码复核过） |
+| D5 拉尺寸 | `CSHouseResize.h`：单边推拉（纯函数）+ `PushEdge` 入口 + `CSHouseResizeHandleActor` 抓手（2026-09-05） | TG 的脊长是长宽比的**连续函数**，没有「翻轴」这个事件 | 已落地（2026-08-31）。⚠️ **C-D5-1 的裁决四当日即被推翻**：四坡屋顶落地后翻轴事件不存在，`RidgeSwitchRatio` 滞回与尺寸禁带（`FCSHouseResizeBand` / `CSHouseResize_ApplyBand` / `RawFootprintSize`）**一并删除** —— 逆向侧那条"连续函数"反而是对的。抓手 / gizmo / EdMode 交互仍不在范围内 |
+| D7 接缝角柱 | **墙-顶三处收边已封**（檐口 / 山墙 / 屋脊）；~~墙角与形状相交仍是空白~~ —— **两半均已落地**（形状相交 = `CSHouseSeam.h`，墙角 = `CSHouseQuoin.h`，2026-08-31） | TG 在形状相交处**先开洞再砌缝砖**，且**全库无任何角柱/墙裙/脊瓦预制件**，全是一个 `brick` | 已落地（2026-08-31，含 A8 包边石 `CSHouseTrim.h`）；**C-D7-1/2 已拍板**：只出接缝砖、纯函数形态、洞走渲染层，两房其余内容完全独立 |
+| D8 特征标记 / 窗 | 谓词（**一维 S 区间**，2026-08-30 降维）、`FCSOpeningClipField`（**二维**，上下都有界）、窗台实心盒、`bAnySill` 窗台砖分支**全都已在** | TG 的窗**不是** clip，是 CPU 裁砖 + 预制窗框盖缝。⚠️ **2026-09-05 订正**：「本项目设施更强、窗户一行 shader 都不用加」只对「实心盒 + clip」那版成立 —— 改两层之后本项目也走 CPU 裁砖，且比 TG 多一级（洞缘砖的**双向**贴合，TG 只压 z） | **已落地**（2026-08-31）：洞 + 谓词 + `ACSWindowMarker` 交互 actor（见「D8 收口」一节）。C1 已拍板选甲；**转角窗于 2026-09-05 永久否决**（窗恒锚单条边，距角过紧直接不生成，W4/A14 作废）。**2026-09-06 重定向**：附属物自带预制网格 + 锚点权威 + attach + 被拒隐藏 mesh（见「附属物持有 mesh、锚点是权威」一节）；原「线框回执」被 mesh 显隐取代 |
+| D12 decor 摆件 | `CSHouseDecor.{h,cpp,usf}` + `CSGroundDecor.{h,cpp}`：**五家锚点已落地** | TG 是七家锚点生产者 + **候选点烘在资产里**；「复杂度场」在 TG 无对位物 | 锚点层已落地（2026-08-31）；复杂度场那一半**按 C2 有意未做**；**C2 已关闭**（用户"随便"⇒ 保留自有场，只订正措辞） |
 | D13 藤蔓 | **已落地到「墙上长出可信的藤」这一档**（枝 319 / 叶 216） | 另写了墙矩形 → 折线 → GPU 打包实例的通路 | 完成第一档；花/三季/上屋顶/wall_jump 未做 |
 | D14 渲染 / 光照 | **VSM 已关 + 观感一轮已落地**（天光真因、下半球色、曝光钉死、石材、埋深闭式解） | TG 是**完整的现代延迟渲染器**：2×uint32 G-buffer、三级联 PCSS、半分辨 GTAO、ReSTIR GI + L1 探针、Tony McMapface。观感来自算法不是资产 | 待办；**C-R1 已拍板**（clip 是正式路线、代理不许有真洞），计划正文已同步订正 |
 
@@ -98,11 +126,13 @@
 
 **索引**（历史共十条。VSM 与 **C1** 于 2026-08-30 上午关闭；**同日第二批用户一次性关掉六条**，
 见下面「第二批裁决」；`LiftHeight` 于同日稍后补拍（裁决七）。
-⚠️ **当前只剩「门洞触发规则」一条真的没拍**，其余全部有结论）：
+⚠️ 门洞触发规则已于 2026-09-04 关闭，「两层挖洞与裁决三的口径」于 2026-09-05 当日澄清 —— **当前一条待拍板都没有**）：
 
 | 编号 | 一句话 | 卡住什么 | 状态 |
 | --- | --- | --- | --- |
-| **门洞触发规则** | 本项目道路驱动；TG 的门**与道路无关** | D6 的语义 | ⛳ **仍待拍板 —— 唯一剩下的一条**（无倾向，取决于你要哪种玩法） |
+| **两层挖洞 vs 裁决三** | 砖层在洞处**不摆砖**，算不算「真几何洞」 | 砖层的实现口径 | ✅ **2026-09-05 当日澄清**：用户裁决**在材质中挖洞、以及删除 instance，都不算修改了几何**。裁决三禁的是「切 / 砌出带洞的网格」（布尔、剖面扫出的洞壁）——渲染层 discard 与不发实例都在允许范围内，**两层方案完整符合裁决三**。只有「几何上永远是实心盒」这句措辞不再准确 |
+| **门洞触发规则** | ~~TG 的门与道路无关~~ ⇒ **这条 2026-09-04 已推翻**：TG 的拱**就是道路驱动的**，而且拱宽 = 路在墙上截出的那一段的长度 | D6 的语义 | ✅ **不必再拍板**（触发规则本来就同构）；改为「宽度/位置的口径与 TG 不同」，见「门洞：TG 确实是道路驱动」一节 |
+| **岩壳换 Houdini 新配方** | 用户已在 Houdini 重构链 B（配方存档于 `CSGroundShaper.md` 重构节） | D9 链 B 的图案与 kernel | ✅ **已裁决（2026-08-31 稍晚）：保留 UE 大体方案**（"算法上比较干净"）。只取一个点子落地：裙圈倾斜（`RockShellSkirtTilt`，见下节）。Houdini 配方留档不移植 |
 | **`LiftHeight` 语义** | 二次抬升让台顶 = `LiftHeight × 1.021`，属性名不再等于台顶高 | D9 的参数口径 | ✅ **裁决七**：选甲 —— 照原型留 2% 溢出，代码零改动 |
 | **门框设施冲突** | 石阶 S3 要删的 `EnsureCapacity`/`RDG_SmoothSpline`，正是门框砖的地基 | 石阶 S3、门框重构 | ✅ **裁决一**：选乙 —— 删旧路，门框改 100% GPU 解析推导 |
 | **C-D7-1 + C-D7-2** | 相交处开不开洞、接缝是 actor 还是纯函数 | D7、多栋房叠放 | ✅ **裁决二**：只产生接缝砖，其余完全独立；actor 形态否决 |
@@ -151,14 +181,26 @@
   DFAO 把拱周围当实墙压暗。用户已知情接受（与 2026-08-29「gpumesh 进不了 lumen 那就无视它」同向）。
 - ⇒ **C-R1 随之关闭**：D14 正文改成 clip 路线，且**删掉「代理另建带真洞低模」那条出路** —— 它本身就是真几何洞。
 
-**裁决四（C-D5-1 → 否决连续脊长）**：**不改** TG 的连续脊长；保留离散脊向 + `RidgeSwitchRatio = 1.15`
-滞回，另加一条「**房屋尺寸更换有最小距离**」把翻轴现象挡在发生之前。
+**裁决四（C-D5-1 → 否决连续脊长）**：~~**不改** TG 的连续脊长；保留离散脊向 + `RidgeSwitchRatio = 1.15`
+滞回，另加一条「**房屋尺寸更换有最小距离**」把翻轴现象挡在发生之前。~~
 
-- ⚠️ **口径需要在 D5 动工时定死，本条不阻塞下游**：驱动方读作「在 `|X − Y|` 上开一条**禁带** ——
+> ❌ **本裁决 2026-08-31 已被用户推翻并整套删除**（同日的四坡屋顶裁决）。屋顶改成四坡后脊向由
+> 长轴**连续导出**（`FCSRoofDesc::bRidgeAlongX()`，无存储态、平局归 X）、正方形处脊长连续收到 0，
+> **「翻轴」这个事件根本不存在了** —— 逆向侧那条「TG 的脊长是长宽比的连续函数」反而是对的。
+> 于是 `RidgeAxis` / `ChooseRidgeAxis` / `RidgeSwitchRatio` 与禁带三件套
+> （`FCSHouseResizeBand` / `CSHouseResize_ApplyBand` / `RawFootprintSize` / `FootprintBandFraction`）
+> 全部从代码删除，**下面两条口径与单测要求随之作废，别照着实现**。权威留档见
+> [`CSHouseRoof.h`](../../Source/ComputeShaderGenerator/Public/CSHouseRoof.h) 的 `bRidgeAlongX()` 头注释
+> （"这条同时**取代了裁决四**"）与 `CSHouseResize.h` 的「尺寸禁带已删除」段。
+> 保留下来的只有硬下界 `MinFootprint`（默认 200 cm），它与翻轴无关。
+
+- ~~⚠️ **口径需要在 D5 动工时定死，本条不阻塞下游**：驱动方读作「在 `|X − Y|` 上开一条**禁带** ——
   单边推拉若让差值落进带内就 clamp / 跳到带外沿，长宽比因此永远不停在翻转点附近」，
   因为只有它真的**消掉现象**；另一种读法「拖动增量小于阈值不改尺寸（死区）」只消抖动、不消翻转。
-  若用户要的是后者，改一个常量的事，规格其余部分不变。
-- 单测「连续单边推拉扫过穿越点全程恰好翻一次」按新口径改写 —— 禁带口径下应是**一次都不翻**。
+  若用户要的是后者，改一个常量的事，规格其余部分不变。~~
+- ~~单测「连续单边推拉扫过穿越点全程恰好翻一次」按新口径改写 —— 禁带口径下应是**一次都不翻**。~~
+  现役替代断言：`House.TilePyramid`（4 cm 一步扫过正方形，瓦数跳变 < 80）与回归脚本
+  `demo_house_resize()` ②（60 步 × 5 cm，`jumps == 0`）—— 钉的是**连续性**，不是翻转计数。
 
 **裁决五（C2）**：用户「随便，我不是那么在乎」⇒ **保留复杂度场这个自有设计**，只把计划 D12 里
 "依据 TG"的措辞订正成"本项目自有；TG 用的是七家锚点 + 烘在资产里的候选点"。锚点叠加案不做。
@@ -194,7 +236,85 @@
   那条 bug 只影响开发期的视觉验证，不影响交付物。**但它仍然没修**，开发期验证照旧只能靠 readback 断言。
 
 
-#### ⛳ 仍待拍板（另一条）：门洞的触发规则与 TG 不同（2026-08-30 发现）
+#### ❌ 已推翻：「门洞的触发规则与 TG 不同」（2026-08-30 的结论，2026-09-04 证伪）
+
+**用户实测先给的信号**：在 TG 里画路穿墙，*路只擦过墙一点点时，拱非常窄*。这与"TG 的拱与道路无关"
+直接冲突，回头复核 PDB —— **旧结论错了，而且错在方法上**。
+
+**旧结论错在哪（两处，都值得记）**：
+
+1. **引错了系统。** 旧结论把 `construct_gates` 当成"产门洞的"，但符号表里它整族都是**木门扇**：
+   `country_core::components::WoodenGate`、`construct_gates::construct_wooden_gate_doors`、
+   `DoorMeshInProgress::add_quad`、`door_mesh` / `door_mesh_gap`、`is_sewer_gate`、
+   `Gates::clear`。它是往已经存在的洞里安一扇木门，不是开洞的那一步。
+2. **只看了系统自己的参数表，没看上游谁写了它的输入。** 拱那个系统的签名确实一个 path 都没有
+   （见下），但它读的 `PublicWalls` / `WallPathSegmentationMasksMinusStairs` 是被上游一个
+   **读路径栅格的系统**写进去的。"签名里没有 ⇒ 与它无关"这一步推理不成立。
+
+**真链路**（PDB 里带完整泛型的 `IntoScheduleConfigs::into_configs<void (*)(...)>` 实例化，
+参数表是逐字的，不是推测）：
+
+```text
+① (PathRastersResources, ResMut<PublicWalls>, EventReader<OnWallChanged>, Res<UiSignifierStream>)
+   ⇒ 唯一读路径栅格又写 PublicWalls 的墙系统。按名字与排除法即
+     `system_wall_constructor::segmentation::sample_wall_path_intersections`
+     ——「采样墙 × 路径的交集」，把路在这面墙上截出的区间写回 PublicWalls。
+② calculate_wall_path_segmentation
+   (OnWallChanged, ResMut<PublicWalls>, ResMut<WallPathSegmentationMasks>, Res<UiSignifierStream>)
+   ⇒ 把①的区间变成沿墙的一维 mask；`score_split_candidate` / `add_splits_in_empty_range`
+     / `process_segment` 在 mask 上**打分求解**分割点。
+③ split_wall_path_segment_into_platform_stairs ⇒ WallPathSegmentationMasksMinusStairs（挖掉楼梯占的区间）
+④ 拱系统 (OnWallChanged, CreateRoofCmd, SwitchRoofTypeCmd, ResMut<PublicWalls>,
+   ResMut<WallPathSegmentationMasksMinusStairs>, Res<AssetSsboLibrary>, Res<UiSignifierStream>,
+   EventWriter<ConstructGateCmd>, ResMut<ArchSegments>, ResMut<BuildingHadArchesLastFrame>,
+   EventWriter<RecalculateRoofCmd>, Query<&Roof>)
+   ⇒ 段 → ArchSegments，并发 ConstructGateCmd 去安木门扇。
+⑤ construct_arches → create_stone_arch_profile + ArchFunction::remap_t + ArchWalker::walk 摆拱圈石。
+```
+
+**最硬的一条**：`ArchSegment` 的构造函数签名是 **`ArchSegment (*)(WallPathSegment)`** ——
+拱是由**墙路径的一段**直接变成的。而 `WallPathSegment` 自带 `length_ws` / `length_ws_2d`。
+⇒ **拱宽 = 那一段的世界长度**，也就是路在墙上截出来的弦长。路只擦过一点点 ⇒ 段很短 ⇒ 拱很窄。
+用户的实测与这条逐字对得上。
+
+**所以待拍板的那条问题作废了**：「画路穿墙 → 自动开拱」**本来就是 TG 的规则**，不是本项目的自有发明。
+剩下的分歧不在"要不要道路驱动"，而在**口径**：
+
+| | 本项目 | TG |
+| --- | --- | --- |
+| 路的连续值 | `Road >= DoorOnWeight` **当场二值化**（`CSHouseActor.cpp:441`），只留"几个采样点算路" | 路径栅格是抗锯齿覆盖率（`zeno` 光栅化），交集区间是连续量 |
+| 分段 | 与路无关的**等分**：`N = round((边长−2×60)/150)`，`Pitch = 可用长/N` | 由路×墙的交集 mask **打分求解**分割点 |
+| 拱宽 | `(Pitch − PierWidth) × 离地收窄`，与路无关，量化到 2 cm | **= 段长 = 路的弦长**，连续 |
+| 拱位 | 槽心 `S0 + Pitch/2` | 段心 = 交集区间中心 |
+| 拱高 | 恒 = 半宽（正半圆） | `ArchType` + `InnerWalls::update_arch_height` + `is_default_arch_height`：独立状态，可非默认 |
+| 段的类型 | 恒为拱 | `ArchSegments` / **`LintelSegments`** 两种 |
+| 门扇 | **没有这个概念**（洞里只有门框砖） | `construct_gates` 按 `segment_length` **现搭** quad 网格，随洞宽连续变宽；只有把手是预制件 |
+
+**木门扇也走同一条宽度源（用户 2026-09-04 补充实测：门洞与木门**都**随画路由窄变宽）**：
+`construct_gates` 里有 `segment_length`，`MaterialStats` 有 `add_gate_length` 与
+`set_gates_segments_count` —— 门按**段**计数、按**长度**计量。而门扇本身是**现搭的**，不是缩放预制件：
+`DoorMeshInProgress::add_quad` + `door_mesh` / `door_mesh_gap` 逐 quad 拼出来。
+资产侧对得上：`extracted/meshes/wooden_gate/` 里**只有** `door_handle_circle.glb` 与 `ladder.glb`，
+**没有门扇网格**（板材是 `wooden_plank*.glb`，下水道栅是 `sewage_gate_bar.glb`）。
+⇒ 洞与门扇共用同一个 `WallPathSegment` 的长度，两者都随路连续变宽，且拖动期每帧重建。
+
+⚠️ **本项目这一半是零**：洞口中间只有门框砖，没有"门扇"这个概念
+（`ACSHouseActor::RevealMaterial` 那条内壁路 2026-08-29 已被裁掉）。要复刻"由窄变宽的木门"
+得新起一档：门扇按洞宽现生成（板条实例 + 把手预制件），而不是塞一张固定网格再缩放。
+
+⚠️ **这一节推翻的只是「与道路无关」。** 下面这些旧证据仍然成立、别一起扔掉：
+`BuildingHadArchesLastFrame` 确实是跨「围合体→建筑」的滞回；TG 的 "wall path" 确实指墙自己画出的曲线
+（`WallPathSegment`）而不是小路 —— 只不过**切段的依据里包含了小路**；地形石阶那条
+`rocky>0.2 && smoothstep(0.075,0.125,path)>0.99 && water<0.5` 也照旧。
+
+**方法论教训（比结论本身值钱）**：Bevy 的 system 签名只说明**直接**依赖。任何"X 与 Y 无关"的结论，
+必须再查一遍"谁写了 X 读的那几个 Resource"。这次是靠 PDB 里的
+`into_configs<void (*)(...)>` 泛型实例化拿到逐字参数表反查出来的 —— 那些行**比裸符号名信息量高一个量级**，
+以后先 grep 它们。
+
+#### （历史）2026-08-30 当时的记录
+
+##### 旧记录：门洞的触发规则与 TG 不同（2026-08-30）
 
 PDB 签名实证：
 
@@ -205,7 +325,7 @@ construct_gates 读：ConstructGateCmd(事件) · TerrainHeightsData · PublicWa
                               · WallPathSegmentationMasksMinusStairs
 ```
 
-**两条链路都没有任何 path / road 输入。** TG 的拱是「墙变了或加了屋顶 → 把墙自己的折线切段 → 段成为拱或楣」，
+~~**两条链路都没有任何 path / road 输入。**~~ ⚠️ **这句是错的**，见上一节：拱系统自己的签名里确实没有，但它读的 `WallPathSegmentationMasksMinusStairs` 正是路径栅格烘出来的。 TG 的拱是「墙变了或加了屋顶 → 把墙自己的折线切段 → 段成为拱或楣」，
 `BuildingHadArchesLastFrame` 是跨「围合体变成建筑」这个转换的滞回。
 
 ⚠️ 易误读：TG 的 "wall path" 指**墙自己画出来的曲线**，不是小路。`calc_path_wall_segmentation`
@@ -214,7 +334,7 @@ construct_gates 读：ConstructGateCmd(事件) · TerrainHeightsData · PublicWa
 TG 里**唯一**被 path mask 驱动的几何是地形石阶：`rocky>0.2 && smoothstep(0.075,0.125,path)>0.99 && water<0.5`
 —— 而这一条本项目已经复刻（塑形物那圈随路生灭的石阶）。
 
-所以「画路穿墙 → 自动开拱」是**本项目的自有规则**（计划 D6 的用户裁决），不是 TG 的。三个选项：
+~~所以「画路穿墙 → 自动开拱」是**本项目的自有规则**，不是 TG 的。~~ ⚠️ **已推翻**：它就是 TG 的规则。下面三个选项随之作废，真正的分歧见上一节的口径对照表。当时列的三个选项：
 ① 保留自有规则，只订正计划里"依据 TG"的措辞；② 改成 TG 原版（推翻 D6 一整节 + 回归里几条断言）；
 ③ 两者叠加（屋顶决定基础规则，道路额外点亮/加宽）。**未拍板前不动 D6。**
 
@@ -272,36 +392,7 @@ B 存形状 id 且已被 `M_TinyGladeWall` 消费）；D14 关于 UV1 的告警�
 `BindHouseMaterials` 漏了 `FrameMaterial`（`RevealMaterial` 属性随内壁一起作废，可一并清理）；
 D14 否决自定义 VF 的第一条理由所引的 deprecated CVar 在 UE 5.7.4 源码里查无对应物。
 
-### C1 已拍板：窗户谓词降维成一维 S 区间（2026-08-30）
-
-**用户裁决：永久放弃"门上开窗"。** 三条出路里选**甲** —— 谓词从 `(S, Z)` 二维矩形降成同边一维
-S 区间，与 `CSHouse_BuildBodySoup` 的单游标扫掠同维；乙（面板垂直细分）与丙（一块面板带多个
-clip 场）都不做。**D8 由此解卡。**
-
-原矛盾（2026-08-30 发现，两边各自都对）：
-
-- `QueryFeaturePlacement` 判的是二维 `(S, Z)` 矩形 —— 谓词**允许**高窗压在低门上方。
-- 而铺墙板是**单游标 `Cursor` 沿 S 的单调扫掠**，每块面板只带**一个** `ClipField`。S 上重叠的
-  第二个洞轻则被前一块无 clip 的面板咬掉半边，重则因 `CellMax - CellMin < O.Width` 被**静默丢弃**。
-
-谓词说"能放"、几何却砌不出来，违反 D8「谓词是唯一真源」那条纪律。**降维就是让谓词说的话几何一定做得到。**
-
-**落地（同日）**：
-
-- `CSHouse_OpeningsOverlap`（`CSHouseProfile.h`）签名加 `PierWidth`，比的是两洞的**面板格**
-  （`CSHouse_OpeningCell`：半宽 + 半个墩）按 `OpeningClearance` 膨胀后是否相交，`Z` 不再进判据。
-- **比格不比洞**是关键：格才是扫掠真正消费的那个区间 —— 两格互不相交 ⇒ 游标永远顶不到洞，
-  那条 `continue` 对"过了谓词的洞"变成不可达路径。墩宽也因此只有 `CSHouse_OpeningCell` 一处真源，
-  将来做窗户对照 A3（按洞型分流墩宽）时谓词自动跟随。
-- `CSHouse_OpeningBounds`（二维包围盒）随之删除，无其它调用方。
-- 单测 `House.OpeningOverlap` 反转：原来断言"同 S 高窗放行"，现在断言**必冲突**；另加两条 ——
-  "把窗抬到 1000 cm 仍冲突"（防二维判据被悄悄加回来）、"两洞让开 20 cm 但两格相交 ⇒ 仍冲突"。
-- `Z0/Z1` **保留**：窗台高、窗顶高照旧表达，`FCSOpeningClipField` 仍是二维逐像素判据。
-  放弃的只是**同边 S 重叠的洞堆叠**这一种摆法。
-
-**代价（明确接受）**：门上方开窗、以及任何同边 S 上重叠的洞，永久不支持。TG 里这种堆叠也确实罕见。
-窗户与装饰对照的 **A7（面板垂直细分）随之作废**；**A6（`ACSHouseFeatureMarker` + `ACSWindowMarker`）
-不再有前置裁决**。
+### C1 已拍板：窗户谓词降维成一维 S 区间（2026-08-30）— 正文已并入 [TinyGladeWindow.md](TinyGladeWindow.md#c1-已拍板窗户谓词降维成一维-s-区间2026-08-30)
 
 ### 楼梯：第一步已经确定（subagent 对照结论）
 
@@ -325,9 +416,14 @@ clip 场）都不做。**D8 由此解卡。**
 PDB 里有 `roof_shape::ridge_length_01_from_rectangle_ratio` —— **脊长是矩形长宽比的连续函数**，
 接近正方形时连续退化成 hip 顶。既不需要滞回，也不需要那条滞回单测。
 
-本项目是**离散翻轴** + `RidgeSwitchRatio = 1.15` + 滞回带。这把计划 `:239` 记的【推测】
-升级成了【确凿】。要不要改成连续脊长，需要拍板 —— 改了会让拉尺寸过程中屋顶**连续形变**
+~~本项目是**离散翻轴** + `RidgeSwitchRatio = 1.15` + 滞回带。~~这把计划记的【推测】
+升级成了【确凿】。~~要不要改成连续脊长，需要拍板~~ —— 改了会让拉尺寸过程中屋顶**连续形变**
 而不是在某个比例上"啪"地翻一下，观感差别很大。
+
+> ✅ **已结案（2026-08-31）：用户选了连续脊长这一侧，裁决四作废。** 屋顶改四坡后脊向由
+> `bRidgeAlongX()` 从长轴连续导出、正方形处脊长为 0，`RidgeAxis` / `ChooseRidgeAxis` /
+> `RidgeSwitchRatio` 与那条滞回单测**全部删除**，逆向侧这条【确凿】反而成了现行实现。
+> 详见 [`TinyGladeHouse_Plan.md` D4 屋顶节](TinyGladeHouse_Plan.md) 与 `CSHouseRoof.h` 头注释。
 
 #### C-D7-1 / C-D7-2：接缝的做法和形态都与计划不同（2026-08-30）
 
@@ -946,6 +1042,1344 @@ DF/RT/Lumen 三个 flag）：一次投入同时解决阴影、距离场、光追
 DF/RT 表示**，所以房子在屏幕内时已经在给 Lumen 贡献遮挡与弹射；真正缺的是离屏与远场
 （症状是随镜头突变）。
 
+### 转角角石已落地（2026-08-31）—— 合卷卷一 A7 / 卷五 A11
+
+D7 的两半至此都合上：**形状相交**那半（接缝砖）2026-08-31 上午落地，**墙自身转角**这半本轮落地。
+
+新增 `Public/CSHouseQuoin.h`（纯 header，与 `CSHouseSeam.h` 同形态），`ACSHouseActor` 侧新增
+`bQuoinEnabled` / `QuoinInset` 两个属性、`GetQuoinBrickCount()` / `GetQuoinColumnCount()` 两个访问器、
+`BuildQuoinBricks()` 一个方法。演示房子实测 **4 根柱 / 48 块砖**（`quoin=48`），
+总砖数在无路时 48、六拱时 144。
+
+#### 判据不是"不穿模"，是"那条棱被遮住了"
+
+⚠️ 这一条差点写错。四面墙是**精确 butt joint**（合卷卷一 §4.1 已经量过：零重叠、零缝隙），
+所以"角石不能穿模"是一条**恒真**断言，写了也永远绿。真正的破绽是外角那个立面由三块 quad 拼成
+（0 号墙端盖 / 1 号墙外面 / 2 号墙端盖），而 `AddQuad` 的 UV 从 quad 局部 (0,0) 起算
+⇒ 那两条一个墙厚宽的端盖是**各自独立的 UV 岛、横轴还沿墙厚方向**，砖纹到角就断。
+
+单测 `House.QuoinCoversOuterEdge` 因此测的是：砖的横截面在**两个相邻墙面各自的外法线**上
+都伸出墙外表面（余量 > 0.5 cm）。只伸出一个方向 = 只遮住半条棱。四组用例覆盖轴对齐 / yaw 37° /
+正方形带偏移 / 带内缩，逐角逐面共 32 条。
+
+#### 与接缝柱共用发射器（A11 的可执行版本）
+
+新抽 `CSHouseFrame::AppendColumn(点, 朝外, 底, 顶, 随机数基, 参数, 元素表, 游标)`：
+接缝柱与角石都走它，`CSHouseSeam::BuildCornerElements` 从 40 行缩到 10 行。
+理由是 TG 侧的实证（合卷卷五 §1、§3.3）：那边转角、墙裙、缝砖、雉堞、承重柱**全是同一个
+`brick` × 逐实例非均匀缩放**，138 个网格里砖只有一个，而每砖 96 字节的记录**没有 mesh 索引字段**。
+
+单测 `House.QuoinSharesTheColumnEmitter` 拿同一组输入喂两条路，逐字段比 `FElement`
+（砖数 / 槽位 / Pitch / HalfLen / LayoutScale / Path.TopZ / 三根轴）。谁将来复制一份出去，它就红。
+
+#### 🐛 那条单测第一次跑就抓到一个真缺陷
+
+`Seed ^ (uint32(Index) * K)` 在 **`Index == 0` 时是恒等映射** ⇒ 任意两个家族只要 seed 撞上，
+各自的 0 号柱就共享同一个逐实例随机数。接缝砖那条从落地起就是这么写的。
+
+**症状要等到有人给砖材质接上 `PerInstanceRandom` 色差那天才显形**，在那之前砖数 / 位置 /
+三角形数所有几何断言全绿 —— 与 S1 那个"随机种子取了槽位"是同一类不会报红的缺陷。
+
+修法：新增 `CSHouseFrame::ColumnRandomBase(Seed, FamilySalt, Index)` =
+`HashCombine(HashCombine(Seed, FamilySalt), Index*2654435761 + 0x9E3779B9)`，
+家族盐登记在 `CSHouseFrame::EColumnFamily`（`Seam` / `Quoin`）。**接缝砖的随机数值因此变了**，
+但没有任何断言钉过它的具体值（只钉过"两房算出同一个"与"槽位移动时不变"），两条都仍然成立。
+
+#### ⚠️ 顺带修回一个被我自己弄失效的守门人
+
+角石**恒出砖** ⇒ `RebuildFrame` 的 `BrickCount == 0` 分支在演示关卡里**不再自然可达**，
+而那条分支正是"撤实例源之前先把 GPU counter 清零"的所在（不清就会把陈旧计数器连同 buffer
+一起交回给组件，画面上砖原样立着而四条数值断言全绿 —— 2026-08-31 出图抓到过现场）。
+
+原来守它的断言是 `擦掉路 ⇒ gpu == 0`，现在 `gpu == 48`。**如果只把期望值改成 48 就完事，
+那个守门人就在这一轮悄悄失效了。** 回归里因此显式补了一段：关掉 `bQuoinEnabled` + 无路
+⇒ 断言 `bricks == 0` 且 `gpu == 0`，再打开确认角石回来。
+
+#### 本轮未做（如实列出）
+
+- **`CornerMargin` 四角禁区不等宽**（合卷卷一 §4.1 第 4 条）没顺手改。它作用在 `F.Len` 上，
+  而 1/3 号墙的 `F.Len` 已经是 `Footprint.Y − 2T` ⇒ ±X 墙实际保留 `T + 60`、±Y 墙保留 `60`。
+  改它会移动 `SplitEdgeIntoSlots` 的可用区间 ⇒ **门的位置与数量会变** ⇒ 演示回归里一批断言
+  跟着动。那是另一件事，别和角石混在一轮里。
+- **墙裙（A8）** 与**垛口**：`AppendColumn` 已经是它们现成的发射器（各自加一个家族盐即可），
+  但两者的驱动曲线不是竖直线段（墙裙沿墙脚、垛口沿墙顶），要先决定"沿边铺"那条路怎么走。
+- **角石的砖没有交替进退**（TG 的 quoin 是一进一出的）。当前是一根等截面柱。
+  要做的话是 kernel 里按砖序号奇偶给 `BlockScale.x` 加一个偏移，不动排布。
+
+#### 验收门（本轮）
+
+```text
+构建   Result: Succeeded（UETest574_2Editor Win64 Development，-NoUba -MaxParallelActions=3）
+单测   Success=98 Fail=0（新增 4 条：QuoinCoversOuterEdge / QuoinSharesTheColumnEmitter
+                          / QuoinRandomIgnoresSlot / QuoinTruncatesNeverGrows）
+回归   passed=208 failed=0 / REGRESS OK（新增 8 条断言）
+零阻塞 八条 flushes=0 全部照绿（角石只是同一趟 dispatch 里多几条路，没有新的同步点）
+```
+
+
+### 包边石已落地（2026-08-31）—— 合卷卷一 A8 / 卷五 A11
+
+计划 D11 实拍图注里那三样（「墙顶城齿、转角角石、勒脚石排 —— 同一种『离散块沿线累积』」）
+至此齐了：角石上一轮，**墙顶压顶石 + 墙脚勒脚石**本轮。
+
+新增 `Public/CSHouseTrim.h`；`ACSHouseActor` 侧新增 `bTrimEnabled` / `bTrimTop` / `bTrimBase` /
+`TrimTopOffset` / `TrimBaseOffset` / `TrimOpeningClearance` 六个属性、三个访问器、
+`BuildTrimBricks()` 一个方法。演示房子实测：**无门时 148 块（顶 4 段 + 底 4 段），
+六拱时 114 块（底带被切成 6 段）**。
+
+#### 水平砖路是白拿的：`FPath` 早就有 `EMidKind::Flat`
+
+包边不需要新的路型 —— `Flat` 中段（矩形洞的平顶用的那个）就是水平走向的砖路：
+`EvalPath` 给 `OutSZ = (LeftS + T, TopZ)`、切向 `(1,0)`。所以只加了一个发射器
+`CSHouseFrame::AppendFlatRun`，与角石的 `AppendColumn` 并列，两者共用同一个 `SolveRun`、
+同一套负缝、同一份容量、同一个随机数基。
+
+⚠️ **砖的三轴在水平路上换了位置**：kernel 对切向 `(1,0)` 算出 `OutwardSZ = (0,1)` ⇒
+`AxisX`（`FrameBrickDepth`）指向**竖直向上**。也就是**包边这一课的高度是 `FrameBrickDepth`**、
+进深是墙厚。四家共用一个组件、一份 `BlockSize`（TG 全库也只有一块 `brick`），
+所以想让包边比拱缘更厚，只能连拱缘一起改。
+
+#### ⚠️ 必须避开洞，而且这件事没有任何数值断言看得见
+
+墙脚那条带的 Z 就是门洞的底（门 `Z0 = 0`）。不切的话勒脚石会从门口正中一路铺过去 ——
+**砖数、零阻塞、三角形数、GPU 计数器全都照绿**，只有出图看得见。这正是本模块唯一的难点。
+
+切法：把边的 S 区间减去"与本带 Z 区间相交"的洞的 S 区间。**判据带 Z**，所以高窗不切勒脚、
+落地门不切压顶。单测 `House.TrimAvoidsOpenings` 把四件事钉住：
+两扇落地门把 0 号墙的底带切成 3 段、高窗不切、把窗抬到墙顶则顶带被切成 2 段、
+重叠的洞不产生负长度或错序的段。
+
+回归里的可断言证据是**段数**：`get_trim_base_run_count()` 在有门时 6、擦掉路后回到 4，
+且合回去之后砖更多（148 > 114）。段数变化只可能来自"切了"。
+
+#### 顺带把随机数基改名
+
+`ColumnRandomBase` → `PathRandomBase`，`EColumnFamily` → `EPathFamily`（新增 `TrimTop` /
+`TrimBase` 两个盐）。名字里的 "Column" 在水平砖路上是错的，趁只有两个调用点改掉。
+上一轮那条"`Index == 0` 时 XOR 是恒等映射"的修法一字未动。
+
+#### 本轮未做（如实列出）
+
+- **包边不外挑**。四家共用一份 `BlockSize` ⇒ 包边的横跨墙厚方向恒等于墙厚，与墙面齐平，
+  没有传统压顶石那种外伸。合卷卷五 §4.2 的实测支持这个取舍：TG 上沿的"更厚更亮"来自
+  水平向胀大 + 顶面受光 + 随机层高，**不是**来自更宽的一课。要真外挑得给包边单开一个组件。
+- **城齿（垛口）**：包边是它的地基（同一条水平路），但垛口要按砖序号奇偶抬高一格，
+  且那是墙**顶**的形态选择（TG 侧是 `FlatRoofRimStyle` 这个屋顶样式枚举，见卷五 §4.3）。
+  等要做"平屋顶"时一起。
+- **`CornerMargin` 四角禁区不等宽**（卷一 §4.1 第 4 条）仍未改 —— 改它会移动门的位置与数量。
+
+#### 验收门（本轮）
+
+```text
+构建   Result: Succeeded
+单测   Success=100 Fail=0（新增 2 条：TrimTilesThePerimeter / TrimAvoidsOpenings）
+回归   passed=214 failed=0 / REGRESS OK（本轮新增 6 条断言）
+零阻塞 八条 flushes=0 全部照绿
+容量   258/512，无截断告警
+```
+
+
+### 🐛 岩壳加载后长错地方：`!bChanged` 早退门吞掉了三条派生链（2026-08-31 已修）
+
+用户在 `L_TerrainOpsDemo` 里肉眼发现的：碎石贴在地面矩形的一个角上，而土台上一块都没有。
+
+#### 根因：加载时序 + 一个只考虑了镜像的早退门
+
+`ACSGroundActor::RefreshHeightsInRegion` 末尾本来就串着三条派生链的重建（石阶 / 岩壳 / 裙边摆件），
+但函数中段有一道幂等短路：
+
+```cpp
+if (!bChanged) return;   // 加载后重导出结果与序列化值一致时不重建、不标脏
+```
+
+加载时序是**塑形物先向地面注册、后落自己的变换** ⇒ 那一瞬间打包出来的
+`GetHeightFieldParams().Profile.xy` 还是 `(0, 0)` ⇒ 岩壳已经按"塑形物在原点"披挂过一趟。
+等变换落定、`RebuildHeightsFromShapers()` 再进来时，**镜像是序列化的、本来就对** ⇒
+`bChanged == false` ⇒ 直接 return，**尾部那三条派生链重建永远到不了** ⇒ 壳永久停在陈旧位移上。
+
+这条早退门违反的正是计划 D3 自己的纪律：「消费者无条件重求值、靠幂等哈希兜底」。
+三条链各自都有幂等守卫（`RockShellBuiltHash` / `SkirtDecorHash`；石阶是定容单 dispatch、
+每笔落笔本来就在跑），真没变时放它们过去是**纯空转**。
+
+#### 修法
+
+`if (!bChanged)` 分支里补上 `RebuildStairs(); RebuildRockShell(); RebuildSkirtDecor();` 再 return。
+
+#### 实测（`Scripts/TinyGladeProbeShellPlacement.py`，本轮新增的探针）
+
+塑形物在 (6400, 6400)、台顶 714.70、`Radius+Falloff = 1400`：
+
+| 时刻 | 活三角 | 质心 | 落在触及范围内 |
+| --- | --- | --- | --- |
+| **修前** 加载后 | 293 | (577, 671) | **0 / 293** |
+| **修前** `RebuildHeightsFromShapers()` 后 | 293 | (577, 671) | 0 / 293 |
+| **修前** 显式 `RebuildRockShell()` 后 | 1112 | (6387, 6388) | 1111 / 1112 |
+| **修后** 加载后（三个阶段读数全相同） | **1112** | **(6387, 6388)** | **1111 / 1112** |
+
+最刺眼的一条现象：修前那 293 个活三角**带着土台的 Z**（区间 [−1.8, 713.2]，台顶 714.7）
+却挂在原点附近的平地上 —— 它们是"塑形物还在原点"那一趟的遗物。
+
+#### ⚠️ 为什么演示回归一直全绿（这条比修法本身更值得记）
+
+两层原因叠在一起：
+
+1. **`demo_rock_shell` 在量岩壳之前先画了路。** `PaintRevision` 在 `RockShellInputHash` 里
+   （壳在路上是连续下沉，画一笔就得重披挂），落笔走的是**另一条**重建路径 —— 于是它在测之前
+   就把陈旧态顺手治好了。
+2. **那三条断言（skirt / plateau / flat）是相对塑形物自身位置分类的**，塑形物在哪它们都绿。
+   它们能证明"壳贴着裙边"，**证明不了"壳在该在的地方"**。
+
+⇒ 新断言 `straight after load the shell already hugs the shaper (no rebuild needed)` 因此必须
+排在 `demo_rock_shell` 的**所有重建之前**（`set_editor_property` / `rebuild_terrain` /
+`reset_paint` 每一句都会把它治好），判据是**活三角质心到塑形物中心的距离 ≤ Radius + Falloff**。
+
+#### 这一类缺陷的通用形状（第八条被实测推翻的推断）
+
+"派生链的输入变了，但触发重建的那个判据只看了另一样东西"。前面已经栽过同型的：
+门框砖的陈旧 GPU counter、S1 的随机种子取槽位、`bDoOverrideArgs` 那次。
+共同点都是**几何断言全绿、只有出图或专门的位置判据看得见**。
+
+#### 验收门（本轮）
+
+```text
+构建   Result: Succeeded
+单测   Success=95 Fail=0
+回归   passed=207 failed=0 / REGRESS OK
+探针   PROBE OK（TinyGladeProbeShellPlacement.py，5/5）
+```
+
+⚠️ 本轮验收门是**等另一个会话的重构（`FCSRoofDesc` 脊向改为由长轴导出）落地之后**才跑的 ——
+中途有一段时间模块只有测试侧编译不过（114 个错误全在三个测试文件），那不是本轮改动引入的。
+
+
+### 四坡屋顶 + 屋面瓦（2026-08-31，另一会话的重构 + 本轮资产收尾）
+
+**这一节记的不是我做的那部分**：`FCSRoofDesc` 的重构与 `CSHouseTile` 模块由另一个会话完成，
+我接手的是它差的最后一步（资产接线）与回归覆盖。
+
+#### 结构性改动（别人做的）
+
+- **双坡屋顶整套删除，改成四坡（hip）**。`FCSRoofDesc` 不再存 `RidgeAxis`，脊向由长轴导出
+  （`bRidgeAlongX()`），`RidgeSwitchRatio` 滞回一并消失；脊长 = 长边 − 短边，正方形退化成金字塔尖。
+- **新模块 `CSHouseTile`**（`.h/.cpp/.usf` + 440 行单测）：屋面**全部由瓦铺成**，
+  **房体三角汤里一片屋面都没有**。一条「内距 d ⇒ 梯形半宽 `w(d) = L − d`」的式子同时覆盖
+  四个坡面、四条角斜脊和中间短脊，边界情形自动落在同一条公式上。
+- `ACSHouseActor` 侧接线齐：组件、容量预留、交接、`RebuildRoofTiles` 的哈希短路、轴向自动判定。
+
+~~⚠️ **它与合卷卷零记的裁决四冲突**：裁决四**否决了连续脊长**、保留离散脊向 + `RidgeSwitchRatio`
+滞回、改用「尺寸禁带」挡翻轴。现在代码走的是派生脊向（= C-D5-1 的甲案）。
+**代码与状态文件仍然分叉，等用户拍板**：要么裁决四作废、这里改写，要么那次重构回退。~~
+
+> ✅ **分叉已合（2026-08-31）：用户裁掉裁决四，采派生脊向（C-D5-1 甲案），重构不回退。**
+> 随之删除的有 `RidgeAxis` / `ChooseRidgeAxis` / `RidgeSwitchRatio` 与禁带三件套
+> （`FCSHouseResizeBand` / `CSHouseResize_ApplyBand` / `RawFootprintSize` / `FootprintBandFraction`）。
+> 本节上方那三条「结构性改动」描述的就是现行实现，照它读即可。
+
+#### 它差的最后一步（本轮补上）
+
+**`RoofTileMesh` 在关卡与 BP CDO 里都是空的**，而属性注释写着"留空 = 不铺瓦" ⇒
+**四坡屋顶一片瓦都没有**，而回归里零瓦断言 ⇒ 从落地到发现之间没有任何东西会红。
+这正是仓库反复记的那一枪：「像 `StairMesh` 那样一直是空的，而所有断言照绿」。
+
+新增 [`Scripts/TinyGladeSetupRoofTiles.py`](../../Scripts/TinyGladeSetupRoofTiles.py)：
+
+- 接 `/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/roof_tile` + `MI_roof_tile_normal`；
+- **CDO 与关卡实例都写**（CDO 不传播到已存在实例）；
+- 自带执行面判据：母材质必须勾 `bUsedWithInstancedStaticMeshes`（没勾会**静默换默认材质**，
+  症状与"没绑材质"逐像素相同）且不许是 `MSM_Unlit`（裁决六）。实测 `M_TG_Texture` 两条都满足。
+
+实测：每栋 **56 片**、共 112 片，`GetRoofTileUndrawableReason()` 空串。
+
+#### 回归新增六条
+
+重点是 `get_roof_tile_undrawable_reason()` 那条执行面判据；另外钉住"拉大 footprint 瓦变多、
+缩回去数量复原、关掉整面消失、打开复原"。
+
+⚠️ 写这几条时踩了一个 UE Python 陷阱，值得记：**`get_editor_property` 拿到的 `FVector2D`
+是活引用**，留着它当"原值"、改完再拿它还原，等于把放大后的值又写了一遍 ——
+症状是"缩回去瓦数不回去"，看着像重建哈希漏了缩小方向（第一版就是这么误诊的，实测停在 128）。
+必须把分量快照成浮点数。
+
+#### 只报告、未处理
+
+- **56 片瓦盖一个 600×400 的四坡顶，密度偏低**（瓦网格 118.8 × 100 × 100 cm，相当大）。
+  调 `RoofTileRowOverlap`（1.6）/ `ColumnOverlap`（1.06）即可加密，不用改代码。等用户看过再定。
+
+
+### 屋面收尾一轮：瓦密度定档 + 脊瓦 + 尖顶（2026-08-31，用户逐条指定）
+
+用户看图给了四条，逐条落地。前两条是**把用户在编辑器里试出来的值收进默认值**，后两条是新东西。
+
+#### ① 瓦太厚 → `RoofTileThickness`（默认 6 cm）
+
+**根因不是排布，是"法线轴用了原生尺寸"。** TG 的 `roof_tile` 实测 **118.8 × 100 × 100 cm** ——
+它是个**单位块**，真实厚度由 TG 逐实例缩放压出来（`_nani_instanced_roof` 的 VS 里那个 `scale_t`）。
+我们这边面内两轴按排距缩了、法线轴却一直取原生 100 cm ⇒ 屋顶看着像堆了一层砖。
+新参数直接指定法线轴厚度，`≤ 0` 保留"用原生尺寸"的老行为。同时开了 `RoofTileSizeScale`
+（只乘面内两轴 ⇒ **瓦数不变**，只改每片大小；改瓦数请调排距，那是另一件事）。
+
+#### ② 瓦数与墙顶：把用户试出来的值收成默认
+
+- `RoofTileRowPitch = 16.9` / `ColumnPitch = 27.75`（读用户存盘的 `House_Pillar`，768 片/栋）。
+  上一节记的"56 片密度偏低"到此定档：实测 **827 片/栋**。
+- `bTrimTop = false` —— **用户核对过 TG 里墙顶那道压顶线脚根本不存在**，默认关掉。
+  连带把回归里 `frame brick count is in the right ballpark` 的下限从 200 调回 **150**
+  （96 拱缘 + 48 角石 + 40 贴地包边 = 184）。⚠️ 这条区间上一次刚因为加角石+包边从 60 抬到 200，
+  **两次都是"合法产量变了"而不是"实现坏了"** —— 改区间前先确认是哪一种。
+- `RoofHeightOffset = 12`（屋面整体抬 12 cm）。偏移加在 `FCSRoofDesc::EaveZ` 这**唯一真源**上，
+  瓦 / 脊瓦 / 尖顶自动一起跟上，不会"瓦抬了别的没抬"。
+- `RoofTileYawJitter = 0`（原 0.04 rad ≈ 2.3°）—— 用户说"每一个元素都有点歪"，就是它。
+
+#### ③ 脊瓦：交汇处的对切缝（`RoofRidgeCapScale`，默认 1.15）
+
+四个坡面的瓦在角斜脊 / 屋脊上是**对切**的，缝一眼看得见。盖瓦骑在缝上，法线取**两坡法线的
+角平分**，沿五条脊线（4 条角斜脊 + 1 条屋脊）再铺一遍同一块 `roof_tile`。
+
+**TG 侧没有专门的脊瓦网格**（`assets/meshes` 138 个里查无 `roof_ridge`），所以这里不引入新资产。
+角平分是闭式的：相邻两坡的外法线是 `(sx·sinP, 0, cosP)` 与 `(0, sy·sinP, cosP)`，和归一化即得 ——
+不必去查"这个角挨着哪两个 Side"，也就写不出一张与 Side 编号耦合的表。正方形时 `RidgeHalf == 0`，
+屋脊那条自然跳过，仍与 `RidgeLength()` 的 `max(…, 0)` 同源。
+
+⚠️ **写这段时自己埋了一个"数值全绿、画面翻掉"的雷**：脊瓦的基一开始是左手的（55 块），
+瓦会背面朝外、光照整个反掉，而位置与数量断言全绿。靠 `House.TileOnRoof` 里那条
+「每块瓦的基都必须右手」抓到，修法是 `dot(cross(D0,D1),D2) < 0` 时翻 `AlongRow` 那根。
+
+⚠️ **脊瓦落在与坡面瓦同一个输出数组里**，于是 `TileCoursesLineUp`（11 排变 23）与
+`TilePyramid`（每面 107 变 95）**分类恒错**。修法不是调阈值，是在夹具
+`CSHouseTileTest_MakeParams()` 里把 `RidgeCapScale` 置 0 —— 那几条用例问的是"四个坡面各铺了
+什么"，脊瓦不属于任何坡面。脊瓦另立 `House.TileRidgeCaps`（右手基 / 法线比坡面更竖直 /
+金字塔仍有四条角斜脊 / `MaxTilesBound` 覆盖脊瓦 / 开脊瓦不改动坡面那一批）。
+**这是"让每条用例只测它该测的东西"，与 `RockShell.DrapesOnSlopes` 那次中性化同一手法。**
+
+#### ④ 尖顶：脊端点那两处三面交汇（`RoofFinialMesh` / `Scale` / `Sink`）
+
+先把 TG 挖清楚了再写（PDB + 反编译 VS，本轮新查）：
+
+| 证据 | 内容 |
+|---|---|
+| `system_roof::visual::place_spires::place_roof_spires` | 产出系统，本轮才发现（此前"`system_roof::visual` 七个函数"那次盘点漏了它） |
+| `Query<(&Roof, &RoofAnimation), With<RoofSpire>>` + 一次 `filter_map` | **一座屋顶最多一根**，且有屋顶拿不到（平顶 / 山墙那一档） |
+| `RoofSpire { vec4 position; float roof_animation_t; float roof_profile; float radius; }` | **没有任何旋转** —— 尖顶恒竖直、绕自身轴对称，摆位只是一个点 |
+| `_instanced_roof_spire` 的 VS | 只对 `roof_profile_mult > -0.001` 的顶点（底裙那 504/828 个）横向放大 `radius·2 · lerp(.6,1,mult) · lerp(.4,1.5,1-profile)`，竖直分量一动不动，最后整体 **×0.5** |
+| `roof_spire.json` | 828 顶点，属性只有 `Vertex_Position / Vertex_Normal / roof_profile_mult`，**没有 UV** |
+
+于是：「屋顶越大裙摆越张、杆子不变粗」是 TG 的做法，本项目的 `RoofFinialScale` **默认 0.5 就是
+那个硬编码常数**。
+
+⚠️ **本项目摆的是"每个屋脊端点一根"，与 TG 的"每屋顶一根"有意分叉**（`roof_tip_offset_xz` 给的
+是一个点，他们尖顶那一档本来就是锥/金字塔）。我们的四坡脊是一条**线段**，两端各有一处
+「两条角斜脊 + 一条屋脊」三面交汇的破口，用户指的正是那里。正方形时脊长为 0、两端重合 ⇒
+自动退化成金字塔尖上的一根，**不需要为金字塔写特例**（断言在回归里）。
+
+实现上刻意**没有**再复制一套 palette / 容量 / 交接机器 —— 一两根而已，走普通
+`UStaticMeshComponent`。三处值得记：
+
+- **竖直轴从包围盒判**（最长的一轴 = 朝上）。源 JSON 是 y-up 的，本仓库导入后已转成 Z-up
+  （实测 220.6 × 220.6 × 303.8 cm，判定 `up axis=2`）。自动判轴让**两种口径都不必手工转资产**；
+  代价是"矮胖的尖顶"会判错轴。
+- **枢轴直接放在脊端点上**：TG 那张的枢轴恰在裙摆与杆子的交界（包围盒 `z ∈ [−85.8, +218.0]`），
+  裙摆天然垂到瓦面以下把破口盖住（0.5 缩放下垂 42.9 cm）。换枢轴在底面的资产用 `RoofFinialSink` 压。
+- **必须用三平面材质**：`roof_spire` 没有 UV，`MI_roof_tile_normal` 这种跟 UV 走的会采到垃圾。
+  接的是石阶那轮建的 `M_TinyGladeStone`。
+
+⚠️ 哈希短路里**组件数也要进条件**：蓝图重跑构造脚本会销毁 transient 组件而形态哈希一个字没变，
+只比哈希的话尖顶会在重跑构造脚本后**永久消失**。
+
+⚠️ 这是 `ACSHouseActor` 身上**唯一**的 `UStaticMeshComponent`，而 `CSVineScatter` 的
+`CollectSurfaceTriangles`（`CSVineScatter.cpp:38`）恰好按这个类型遍历 —— 旧的 `VineScatter`
+三个入口对房子此前**恒返回空三角集**，现在会变成"只有尖顶那点面"。房子自己的藤蔓走另一条
+通路，不受影响；但把房子喂给旧入口的话，藤蔓会全爬在尖顶上。
+
+#### 验收
+
+建库无错；单测 **103 / 0**（新增 `House.TileRidgeCaps`：坡面瓦 478 + 脊瓦 55，金字塔 56）；
+回归 **224 / 0**（新增尖顶 7 条：可画性 / 矩形两根 / 正方形退化成一根 / 回矩形复原 /
+撤资产组件销毁 / 原因串说得出断在哪一环 / 接回来复原）。演示关卡实测每栋 827 片瓦 + 2 根尖顶。
+
+### 岩壳「石头隆起」六参数已落地（2026-08-31，用户规格）
+
+用户看图提的两条：**包边缝隙过多、包边太小（没有体积）**。追下来是两件独立的事，外加一次
+对 TG 位移公式的反编译 —— 后者把我自己前一版的修法直接否掉了。
+
+#### 先算的那笔账：缝隙不是图案漏的
+
+图案本身零重叠零空隙（盖 86.60% + 裙 13.40% = 100.0000%）。缝来自**整个胞腔被判死**：
+
+```text
+裙边环   宽 8.0 m   面积 503 m²   周长 63 m
+胞腔     5.53 m（原生）           面积 30.6 m²
+环里放得下 16.4 个   实测活了 13.7 个     胞腔/环宽 = 0.69
+```
+
+**整圈只排得下一层胞腔**，坡度 mask 再啃掉边缘的半个 ⇒ 画面上就是"几块大板 + 大缝"。
+TG 的 5.53 m 是给**真悬崖**用的，套到 8 m 裙边的小土台上本来就不成立。
+
+⇒ 用户裁决走 **C：`RockShellPatternScale` 默认 1.0 → 0.35**（胞腔 1.94 m，能排四层）。
+**"与 TG 同绝对密度"这个锚点被有意放弃**，`CSGroundActor.h` 的字段注释已改写记录这条。
+
+⚠️ **连带后果必须记住**：缩放缩的是**整张 tile**，0.35 之后 tile 只有 **47.8 m** < 128 m 的地面，
+**覆盖区外静默无壳**，而平铺补不上（tile 不是周期的）。`RebuildRockShell` 因此新增一条
+逐塑形物的覆盖区检查，超出会打 Warning。
+
+#### 🔍 反编译 TG 的位移 kernel，推翻了我自己的第一版修法
+
+我最初把"没体积"归因于 `Relief × Rock` 被 mask 吃掉，加了个 `ReliefFloor` 下限（默认 0.5）。
+用户随后提出一个更具体的假设，去 `_rocky_terrain_displace_rocky_terrain.cs` 逐行核，**假设成立**：
+
+```glsl
+// _748 = 地形法线   _741 = |∇h|   _752 = rocky_terrain.x（岩石 mask）   _727 = 130/dims（格距 m）
+_761 = 贴地位置
+     + N * mix(-0.3, 0.1*mix(0,3,rand(cell)), cell_bby) * mask * (1-road) - N*road   // ← 我们已有的全部
+_1030 = _761
+      + N * ( mix(-0.2, 1 - smoothstep(4, 7, |∇h|), noise01)     // 噪声决定这一点凸出还是缩进
+              * smoothstep(0, 0.3, rocky.x) * |∇h| ) * 0.3       // ★ 突起量 ∝ 坡度
+      + N * rocky_terrain.y;                                      // ★ 我们从没读过的第二个通道
+```
+
+**`_761` 恰好就是我们原有实现的全部** —— TG 的 `Relief × mask` 与我们写的一模一样，我们抄对了。
+体积来自另外两项：**突起量正比于地形陡峭度**，以及 `rocky_terrain.y` 那份偏移。
+`1 − smoothstep(4,7,|∇h|)` 还说明极陡崖面上突起反而收回去，只有中等坡度最鼓。
+
+⇒ **`ReliefFloor` 默认改回 0（TG 口径）**，退回纯调参用途；体积的职责交给下面这一组。
+（抬它的副作用是实测过的：0.5 会让 `RockShell.DrapesOnSlopes` 的最大垂直距离从 66 涨到 83.9 cm，
+那条容差是按"厚度被 mask 压着"标定的。想再抬就得连容差一起重新标定。）
+
+#### 六个参数（全部蓝图可调，`CS Ground|Rock Shell|Rise`）
+
+| 属性 | 规格条目 | 默认 | 作用 |
+| --- | --- | --- | --- |
+| `RockShellCellExpand` | ② ⑤ | 12 cm | 每片沿 **−DirToCentroid**（朝外）扩张，闭合片间缝。带到质心的半径淡入，否则内部点被推过质心翻转三角 |
+| `RockShellRiseMultiplier` | ③ | 1.25 | **石头高 = 地形高 × 本值**。1.0 = 贴地（旧行为） |
+| `RockShellRiseNoiseAmount` | ④ | 25 cm | 隆起噪波幅度，按隆起量淡入（平地不加，否则整片地起毛刺） |
+| `RockShellRiseNoiseWavelength` | ④ | 400 cm | 噪波波长 |
+| `RockShellRiseExtend` | ⑥ | 150 cm | **台顶外扩**：把每座塑形物的 `Radius` 临时加上本值再求值 ⇒ 隆起的衰减比地面**晚**这么远。加 `Radius` 而不是缩 `Falloff` —— 后者会压陡裙边，连带改掉坡度 mask 与石阶等值线 |
+| `RockShellEdgeCeiling` | ⑧ | 0.9 | 末端边缘的隆起 / 地面高度 上限，**必须 < 1**（=1 会让最外圈与地面共面 ⇒ 一圈 z-fighting，内部再夹到 0.999） |
+
+新增共享求值口 `GroundShaperHeightAtXYExpanded(P, RadiusBonus)`（`CSGroundShaperField.ush`）。
+⚠️ 它**没有 CPU 孪生** —— CPU 侧没有消费者（镜像、拾取、落座读的都是真地面高度）。真要加孪生
+就得连 `GroundShaper.CpuGpuFieldParity` 一起扩。
+
+#### 🐛 ⑧ 的门写错了两次，两次都被断言抓住
+
+「末端边缘」这个门比想象中难写，两版都报红：
+
+| 版本 | 权重 | 症状 |
+| --- | --- | --- |
+| v1 | `1 − RockMask` | 坡度 mask 在 band **两端**都掉到 0，内侧那端是台子肩部、地面还有六七百 cm 高 ⇒ 把石头压进台子里，`DrapesOnSlopes` 66 → 68.7 cm |
+| v2 | `smoothstep(0, CellRelief, RiseH − GroundH)` | 外扩把**整条剖面**往外推 ⇒ 整条裙边上两者都差一大截 ⇒ 夹紧全程生效，内圈被压到地面以下 **−62.3 cm** |
+| **v3** | `(1 − RockMask) × (1 − smoothstep(0.15, 0.5, GroundH / PeakHeight))` | ✅ 两端都要求"band 正在终止"**且**"地面已经落回基底"，只有外侧那端同时成立 |
+
+真正区分「内侧肩部」与「末端」的只有**绝对高度**。峰值取现成的 `MaxAbsHeight`
+（`RefreshHeightsInRegion` 里按 `PeakHeight()` 维护的那份台账），不为它新开调参量、也不重扫一遍。
+
+#### 断言
+
+单测 `RockShell.DrapesOnSlopes` 拆成两条职责：
+
+- **披挂契约在「隆起中性」下量**（`RiseMultiplier=1` / `RiseExtend=0` / `RiseNoise=0` /
+  `CellExpand=0` / `PatternScale=1` / `ReliefFloor=0`，测完还原）。⚠️ 这不是"调到能过"：
+  那条容差是在原生密度 + 厚度被 mask 压着的前提下标定的，把这些量归中性才是让它继续测它该测的东西。
+- **隆起单独断言**：同一批裙边顶点，倍数 1.0 vs 2.0 的 Z 均值必须抬高 > 20 cm。
+  倍数写死 2.0 而不是读属性 —— 读属性的话，谁把默认调回 1.0 这条就变成恒真的空判据。
+
+演示回归新增三条（`demo_rock_shell`）：
+
+```text
+[PASS] the rise really lifts the shell above the ground on the inner skirt   meanInner=299.6 cm n=3283
+[PASS] the outer edge tucks back into the ground (it never floats)           worstOuter=15.9 budget=41.0 meanOuter=-2.8 n=69
+[PASS] the inner skirt really does stand higher than the outer edge          299.6 vs -2.8
+```
+
+⚠️ 外缘那条量的是「顶点 Z − 该点地面高度」，而顶点 Z 里除了隆起还含**壳自身厚度**
+（`CellRelief` ± 与表面噪波）。所以口径是"高出去的部分不许超过壳自身的厚度"，
+**不能**写成"必须为负"。
+
+#### 未做（如实列出）
+
+- **`rocky_terrain.y` 那份偏移没实现**，显隐 mask 也仍然只用 `.x`（TG 用的是 `x + y`）。
+  用户的规格用「高度倍数」取代了 TG 的「坡度正比」，这一项因此暂时没有落点。
+- ~~**TG 的 `1 − smoothstep(4,7,|∇h|)`（陡坡收回突起）没有对位物**~~
+  —— **2026-08-31 稍晚已补**，连同整条「幅度 ∝ 坡度」一起，见下一节。
+
+### 岩壳体积再补两层：TG `:563` 基准偏移 + 表面起伏改坡度比例（2026-08-31）
+
+上一节结尾那两条「未做」是拿反编译逐行核出来的，但当时只落了**用户规格的六个参数**，
+TG 自己那两层体积一层都没抄。这一轮把其中两层补上 —— 都与 ③ 的隆起倍数**正交**，
+没有改动任何已记录的裁决。
+
+#### 为什么是这两层：TG 的体积从来不是"按台子多高放大"
+
+| | Tiny Glade | 本项目 ③（用户规格） |
+| --- | --- | --- |
+| 驱动量 | **坡度** `\|∇h\|` | **地形绝对高度** `H` |
+| 上界 | 有界：基准 `mix(−0.4, +0.2)` + 厚度 0.3 m + 起伏(∝坡度) ≈ **0.9 m 封顶** | 无界：`H × 1.25`，700 cm 台肩抬 175 cm |
+
+③ 在**缓坡小土台**上几乎给不出体积（台低 ⇒ 倍数乘出来的差值也小），而那正是本项目的常见配置。
+补上的两层都是**有界常量级**的，缓坡上照给 —— 两者互补，不是二选一。
+
+#### ① 基准偏移（`RockShellBaseLift` / `RockShellBaseSink`，20 / 40 cm）
+
+TG `_rocky_terrain_displace_rocky_terrain.cs:563`：
+
+```glsl
+_718.y = H + mix(-0.4, 0.2, clamp((mask + rocky_terrain.z) - 10.0 * path, 0.0, 1.0)) - <水体两项>;
+```
+
+沿**世界 Y**（我们是世界 Z）。mask 满 ⇒ 整张壳浮起 +0.2 m；mask 空或路上 ⇒ 沉 −0.4 m。
+我们落成 `Rise += lerp(-BaseSink, +BaseLift, saturate(Rock - Road))` ——
+`Road` 已经乘过 `RoadFade`（= TG 的 10×），所以 `Rock − Road` 就是那条 clamp 的逐项对位物。
+`rocky_terrain.z`（笔画自带的岩石度）本项目没有那条通道，是这一层唯一缺的输入。
+
+⚠️ **加在 ⑧ 的末端夹紧之后**：末端 `Rock → 0` 时本项恰好取满 `−BaseSink`，与 ⑧ 同向往地里扎，
+放后面不会把刚夹好的末端又顶回去。实测外缘均高从 **−2.8 cm 变成 −42.0 cm** —— 原来是"刚好蹭着
+地面"，现在是真的扎进去。
+
+#### ② 表面起伏改成「幅度 ∝ 坡度、且偏正」（`RockShellNoiseAmount` 语义变更）
+
+TG `:721`：
+
+```glsl
+N * mix(-0.2, 1.0 - smoothstep(4.0, 7.0, S), n01) * smoothstep(0.0, 0.3, rocky.x) * S * 0.3
+```
+
+旧写法是常幅对称的 `Turbulence × NoiseAmount`（默认 6 cm）。三处差都是承重的：
+
+| | 旧 | 新（TG 口径） |
+| --- | --- | --- |
+| 幅度 | 常数 6 cm | `NoiseAmount × 坡度`，默认 30 cm = TG 的 0.3 m |
+| 对称性 | 对称 ⇒ **净体积为零** | `mix(-0.2, Upper, n01)` 偏正，凹陷最多占两成 |
+| 陡崖 | 无 | `1 − smoothstep(4,7,S)` 把极陡面（>76°）的突起收回去 |
+
+⚠️ **`RockShellNoiseAmount` 的语义变了**：现在读作「坡度 = 1 时的满幅」。演示土台最陡 1.3125
+⇒ 实际值域约 **−7.9 .. +39 cm**。凡是拿它当"最大起伏"的地方都要乘坡度，本轮已同步三处：
+`CSGroundRockShellTests.cpp` 的 `DrapeTolerance` 与 `SinkLimit`（新增
+`CSRockShellTest_MaxSlope = Lift × 1.5 / Falloff`）、`TinyGladeDemoRegression.py` 的 `lift_budget`。
+
+#### 断言
+
+- 单测新增 ⓒ''「基准偏移把壳浮起来了」：`BaseLift` 0 → 100 cm，同一批裙边顶点均高
+  **316.8 → 383.1 cm**（+66.3）。写死 100 而不是读属性，同 ⓒ' 的理由 —— 读属性的话谁把默认
+  调成 0 这条就变成恒真的空判据。
+- `DrapesOnSlopes` 的中性块**同时归零 `BaseLift` / `BaseSink`**：它和「石头隆起」那一组同类，
+  都是**有意**把壳推离坡面的。最大垂直距离 66 → **75.6 cm**（容差 99.4 = 30 + 30×1.3125 + 30）。
+- 回归 `demo_rock_shell` 新增一条**与调参量无关**的门：外圈**平均**必须在地面以下。
+  上一条的上界跟着 `NoiseAmount` 一起涨，涨到某个值之后它就不再是个门；这条钉的是符号，不是量。
+
+#### 仍未做
+
+- **`rocky_terrain.y` / `.z` 两条通道**：TG 的显隐判据是 `smoothstep(0.1, 0.2, x + y) + water > 0
+  || z > 0`，基准偏移的参数也含 `.z`；我们只有坡度那一路（`.x` 的对位物）。这两条是**笔画自带的
+  岩石度**（`rasterize_terrain_stroke.cs:1442` 逐笔取 max 写出来的），要补就得先有"笔画带属性"
+  这个概念，不是改 kernel 能解决的。
+- **水体三项**（显隐、`−smoothstep(0.5,0.6,water.y)×0.2` 下沉、水线附近的低空侵蚀噪声）：
+  本项目没有水系统。
+- **逐胞腔径向胀缩的方向与随机性**：TG 是 `dir × 0.001 × mix(-3, 8, rand)`（−19.5..+52 cm、
+  无淡入、**偏向收缩**），我们的 `CellJitter` 默认 0（关着），取而代之的是 TG 没有的
+  `CellExpand = 12 cm 恒定朝外`（那是 Houdini 原型 `attribwrangle3/offset` 的口径）。
+- **`PatternScale = 0.35` 把烘死的 `LipOffset` 一起缩了**：19.5 → 6.8 cm，而裙边竖直高度
+  = 局部坡度 × LipOffset ⇒ 同坡度下我们的裙墙只有 TG 的 35%。这是缩放裁决的下游后果，
+  之前没有单独记过。
+- **坡度判据比 TG 钝一倍**：TG 的梯度是 heightmap 上 2 texel ≈ 0.51 m 的中心差分
+  （`_terrain_derivative.cs:17` 的 `_59 = 130/dims × 2`），我们是 `2 × CellSize = 1.0 m`。
+
+### 石墙冠缺陷：「石头隆起」默认归中性（2026-08-31 晚，用户看图裁决）
+
+用户贴 `L_TerrainOpsDemo` 截图：壳读成一圈**独立火山口壁** —— 顶圈比台顶高一大截、内壁带
+阴影、外立面近乎垂直，台顶陷在墙圈里。指令是「对比原版 TG 进行修改」。
+
+#### 根因是量纲，不是哪一项参数
+
+TG 的壳**从不离开地形**：全部位移有界（基准 ±0.2/−0.4 m + 厚度 0.3 m + 起伏 ∝ 坡度，
+合计封顶约 0.9 m）。「石头隆起」组的 `RiseMultiplier` 却是随台高线性长的**无界**量 ——
+演示档 `Lift=700` 下 1.25 倍在台肩处就是 +175 cm；`RiseExtend=150` 再让满高外推 1.5 m
+（外立面变垂直）；叠上基准 / 浮高 / 隆起噪波合计约 **2 m 石墙冠**。
+
+⇒ **三个默认归中性**：`RiseMultiplier` 1.25→1.0、`RiseExtend` 150→0、`RiseNoiseAmount` 25→0
+（TG 没有沿世界 Z 的噪波，它的表面细节全在 ∝ 坡度那条起伏里）。体积由 TG 口径的三层承担
+（`BaseLift`/`BaseSink`、`CellRelief`、坡度比例起伏）；**四个参数保留为风格化旋钮**，拧它们
+就是有意离开 TG 形态。关卡实例无序列化覆盖（查过，没有脚本钉这几个值），改默认即生效。
+
+#### 缺陷为什么逃过了全部断言 —— 补了两条反火山口
+
+单测在**中性档**量披挂、ⓒ' 只量倍数**差值**；**默认档的绝对形态从来没人量过**。补上：
+
+- 单测 ⓒ'''：恢复默认后，最高活顶点相对**台顶** ≤ `BaseLift + CellRelief + NoiseAmount×最大坡度
+  + 40`。实测 **−37.3 cm**（预算 129.4）—— 火山口态约 +200，一眼红。
+- 回归 `demo_rock_shell`：内圈最高顶点相对**局部地面** ≤ `BaseLift + (CellRelief +
+  NoiseAmount×坡度) × √(1+坡度²) + 40`。实测 161.0 ≤ 174.5。
+  原来那条「内圈均值 > 0」只查符号，删了（倍数差值仍由单测 ⓒ' 钉着）。
+
+⚠️ **√(1+坡度²) 那一项是踩出来的**：厚度与起伏沿**地形法线**位移，而判据量的是「顶点 Z −
+顶点自己 XY 处的地面」—— 法线位移把顶点水平推向下坡侧，脚下地面跟着降，竖直偏差 =
+法线位移 × √(1+g²)，52° 坡上是 **1.65 倍放大**（直觉里的 ×N.z 衰减方向是反的）。
+第一版预算没乘它，在**正确的**壳上误报 161 > 129。单测 ⓒ 除以 √(1+g²) 折垂距是同一件事的对偶。
+
+验收门（本轮）：构建 Succeeded、单测 105/0、回归 `passed=231 failed=0 / REGRESS OK`。
+
+#### 出图复核 + 两条追加实测（同日稍晚）
+
+`TinyGladeShotRockShell.py` 全机位重拍：近景/俯视/画路三张都已是 TG 形态（石头贴台披挂、
+台顶留草、路上壳沉两侧完好）。像素判据 A = 67.9%（阈 29%）、C = 5.3%（阈 2.75%），
+三次独立启动逐位相同。
+
+- **裂缝限额单开**：近景 `wall_shell_on` 有 0.772% 像素精确 (0,0,0) —— 全在胞腔裂缝槽底
+  （相邻胞腔浮高差把缝拉成全遮蔽深槽，间接光真值为零；其余五张 ≤ 0.077% ⇒ 预热是好的）。
+  坑 ⑨ 的 0.5% 阈把「预热失效」与「几何真黑」混在一起了，给这一张单开 `CREVICE_ZERO_FAIL
+  = 2%`（预热失效历史上是两位数百分比，2% 对它仍一眼红）。想消裂缝黑调 `RockShellCellExpand`，
+  那是观感决策，不由出图阈值倒逼。
+- **垂直拖动的显隐换批已实测对齐 TG**（用户提问驱动）：塑形物 `PostEditMove` 每帧
+  `RebuildTerrain`，`ComputeTopHeight = max(0, (Z − 地面Z) + LiftHeight)` 把 actor Z 折进台高，
+  岩壳哈希含 `Top.X` ⇒ 拖一帧披挂一帧。逐 50 cm 下压实测：7922 → 7706 → … → 4354（宏观
+  坡度恰到阈 0.75）→ 1176 → **0**（台高 200），每档掉几百上千个三角 = **整批胞腔一起 NaN**，
+  不是压扁渐隐；阈下那条尾巴（台高 400→200）是裙边噪声局部超阈的散石在分批走 —— 正是 TG
+  「不是形变，是换了一批在演」的机制。拉回原位逐位复原 7922（哈希幂等）。
+  探针脚本：scratchpad `probe_vertical.py`（一次性，未入库）。
+
+### 裙圈倾斜 `RockShellSkirtTilt` 已落地（2026-08-31 稍晚，用户方案）
+
+用户贴 TG 实拍近景确认机制：**TG 的腔壳互相插着** —— 裙墙滑到邻块盖底下，缝是被压住的
+阴影线，不存在透底间隙。落地方案照抄这个机制、不动 UE 大体架构：
+
+- kernel（`CSGroundRockShell.usf`）：**只把底圈**再沿 −DirToCentroid 朝外推
+  `RockShellSkirtTilt`（图案空间 cm，默认 20，世界 = ×PatternScale）。顶圈与盖一动不动 ⇒
+  缝的顶宽、披挂契约都不变，改的只是裙墙**倾角** —— 竖直裸墙变外撇斜壁，相邻胞腔的底圈
+  各自越过 Voronoi 边界钻到对方裙下，两片斜壁在 V 槽中段**互相交叉**。
+- 不乘半径淡入：底圈天然在胞腔边界上（|P − 质心| ≈ 胞腔半径），没有"内部点被推过质心"的风险。
+- 与 `CellExpand` 的分工：那个整片平移（含盖）收缝的**顶宽**；本值只动底圈，封的是**槽底视线**。
+
+实测：出图近景纯黑像素 **0.772% → 0.000%**（斜壁交叉后没有视线能进槽底），壳开关差异
+67.9% → 70.8%（斜壁多占了点剪影）。消裂缝黑的正式旋钮从此是它，出图脚本注释已同步。
+
+#### 🐛 顺带修的一条：演示关卡被"上下拖动实验"存进了下压状态
+
+回归三条地形断言突然红（台顶 393.8 vs 期望 803.2 ≈ **恰好一半**）—— 不是高度场坏了：
+`Shaper_Mound` 被用户在编辑器里垂直拖到 **z = −401** 后连关卡一起存盘（`LiftHeight` 也被
+改到 ≈787），`ComputeTopHeight = (Z − 地面Z) + Lift` ⇒ 台顶剩一半。而基准态恢复工具
+`TinyGladeResizeDemos.py` 的 `move()` **有意保留 Z** ⇒ 恢复不了这种状态。已给该脚本的
+塑形物段加**垂直归位**（Z 拉回地面 Z，带日志），跑一遍即复位（`z -401 -> 0`）。
+
+验收门：构建 Succeeded、单测 105/0、回归 `passed=231 failed=0 / REGRESS OK`、出图 VERDICT OK。
+
+### 边缘磕碰带 `RockShellChipAmount` 已落地（2026-08-31 稍晚，用户诉求）
+
+用户贴 TG 实拍问"岩石边缘的小磕碰是材质还是模型"。答案是**模型**：TG 逐顶点 FBM 的高频段
+打在边缘折线顶点上（角点钉死），剪影处读成豁口、面上读成细碎小凹凸；材质只贡献石纹条纹。
+但我们的 `RockShellNoiseAmount` 出不来这个效果 —— 那条是 TG `:721` 的大起伏（波长 1.5 m、
+幅度 ∝ 坡度、三倍频摊薄高频），调短波长会整张脸一起碎。
+
+⇒ 先落了一版**独立高频带**（40 cm Turbulence，满脸小凹凸）；**2026-09-01 反编译读全
+`displace:618` 后换成 TG 正版机制 —— mask 域扭曲**：
+
+```glsl
+_818 = (rest.xz × 0.5) + vec2(rockMask × 20.0);   // 空间底 ~130 m ≈ 常数；变化全来自 20×mask
+for (; _822 < 1; ) { ... }                         // 单倍频 value noise（倍频数就此确证：1）
+```
+
+mask 饱和的带内偏移恒为 20 ⇒ 噪声局部常数 ⇒ **面干净**；带边缘 mask 爬坡的一两米里域坐标
+扫过 ~14 格 ⇒ 相邻顶点互不相关 ⇒ **磕碰自动集中在边缘**；沿边缘的锯齿来自 mask 自身微起伏
+（TG 是逐笔 FBM 侵蚀，我们由裙边噪声提供）。UE 落地：
+`CSGSF_ValueNoise(XY × ChipFreq + Rock × 20)`，`ChipAmount` 默认 10 cm、
+`ChipWavelength` 改为**空间底**语义（默认 300 cm，只兜 mask 平坦的走廊）。
+
+⚠️ **订正昨天的说法**：「不能只在边缘、否则撕缝」只对**按顶点旗标**的门成立。TG 用
+**连续场做域扭曲** —— mask 是 XY 的连续函数，同 XY 双胞胎拿同一个偏移，边缘集中与
+不撕缝两头都占。光栅侧同时验了：PS 只有三平面 albedo，**无法线贴图** ⇒ 磕碰 100% 是几何。
+
+四处预算随之 += Chip 项（Contract 的 OwnRelief、DrapeTolerance、CrownBudget、SinkLimit；
+回归的 lift_budget / crown_budget 同步）。出图 `overhead` 因盖缘高低错落多出 7 个槽底真黑
+采样点（0.54%），并入 `CREVICE_ZERO_FAIL` 同限。
+
+验收门：构建 Succeeded、单测 105/0（一次 CEF `BUseSupportedRHIRenderer` 启动崩溃与改动
+无关，重试即绿）、回归 231/0、出图 VERDICT OK。
+
+### D8 收口：`ACSWindowMarker` 已落地（2026-08-31）—— 对照文档 A6 — 正文已并入 [TinyGladeWindow.md](TinyGladeWindow.md#d8-收口acswindowmarker-已落地2026-08-31-对照文档-a6)
+
+
+### 墙面「灰泥剥落 + 凸出砖」：09-03 建的图，09-04 第一次在引擎里看
+
+材质本体（`M_TinyGladeWall` 的重建，TG `_nani_plaster` 的移植）是 2026-09-03 落的，逐条口径
+在 `Scripts/TinyGladeMakeWallMaterials.py` 文件头。**但那一轮的收尾只到 numpy 逐像素仿真为止**
+（`wall_preview.png`），默认值全是对着那张没有光照、没有 tonemap、没有天光的图调出来的，
+材质从没在引擎里渲染过一次。本节记的是 09-04 补上的那一步和它翻出来的东西。
+
+#### 仿真与引擎差了多少：三条默认值全错，而且错的方向是**反的**
+
+第一次进引擎（`Saved/TinyGladeShots/walltex_v2_*`，同机位两趟：`MI_TinyGladeWall` 原样
+vs 同一张母材质但 `PeelAmount=-5`/`ProtrudeLevel=5` 的纯灰泥 MID）：
+
+| 判据 | 实测 | 读法 |
+| --- | --- | --- |
+| 两趟差异像素率 | 墙脚 66.0% / 半墙高 43.3% / 正对面 48.1% | 剥落与凸出**确实走到了像素**（不是"材质挂上去了"），但**六成的墙脚是砖** |
+| 差异像素在 peel 那趟的均色 | `(0.107, 0.095, 0.006)` | R≈G≫B，暖调、非中性灰 ⇒ 是砖色卡，不是引擎默认材质（那是 R≈G≈B） |
+| 纯灰泥那趟的全图标准差 | 0.058 ~ 0.156 | 不是纯色 ⇒ 灰泥贴图真的采到了 |
+
+三条判据全绿，**机制没问题**；出问题的是默认值，而且是仿真原理上预告不了的三条：
+
+- **剥落覆盖了大半面墙，与计划 §327「墙面本身是灰泥，砖只出现在三处」正好相反。**
+  真因不是参数调过头，是**移植时漏了一项**：TG 的灰泥是一张**只铺在部分墙面上的独立网格**，
+  侵蚀场里的 `cov`（覆盖度）在每块灰泥边缘自然衰减 ⇒ "哪儿是灰泥"由网格决定，噪声只负责啃边。
+  本项目墙板本体就是灰泥、铺满整面墙，`cov ≡ 1`，于是噪声一个人说了算。
+  修法是加一项 `PeelBias`（默认 −0.30，本项目独有、TG 无对位物）把整条门槛抬起来，
+  顶替那份缺失的覆盖度；`PeelAmount` 保持 TG 的 0..1 语义不动。
+- **`GrooveDarken = 0.45` 把砖缝压成纯黑沟**，整面墙读成鳞片。参照图
+  `img/tiny-glade-ref-corner-pillar.jpg` 里的缝是细暗线。改 0.75。
+- **`PlasterTiling = 0.2` ⇒ 世界周期 10 m**，一面 6 m 的墙只看得到一整块渐变 —— 灰泥贴图
+  等于没采。改 0.5。
+- **`ProtrudeLevel = 0.88` 读成一地碎屑**而不是"偶尔几块石头顶出来"。三档同机位对照
+  （0.83 / 0.88 / 0.93）选定 **0.93**。
+
+**改后同判据复测**（`walltex_v3_*`，同机位、同两趟）：差异像素率
+**墙脚 50.6% → 半墙高 6.5%**（改前 66.0% → 43.3%），正对面 48.1% → 18.9%、转角 32.5% → 5.2%。
+"墙脚破得多、越往上越完整"这条高度渐变**现在才读得出来**；改前那组数字之间几乎没有落差，
+说明高度项被噪声整个淹掉了。母材质从 49 节点 / PS 363 变成 50 节点 / PS 364（`PeelBias` 一项）。
+
+#### 🐛 `plaster_colors_layer00` 不是"那张灰泥贴图"，是**配色档 0 号**
+
+这条值得单记：`plaster_colors_layer00..07` 与 `brick_colors_layer00..04` 是 TG 让玩家**逐房选**
+的配色档（P00 三文鱼粉 / P01 赭黄 / P02 灰蓝 / P03 炭灰 / P04 淡灰绿奶白 / P05 鼠尾草绿 /
+P06 浅褐 / P07 藕粉；B00 米黄带红纹 / B01 淡奶黄 / B02 墨橄榄 / B03 橄榄黄 / B04 灰藕）。
+09-03 挑的"layer00"只是**下标 0**。在本关卡的光照下（天光下半球是草地绿
+`(0.10, 0.14, 0.055)`，D14 有意为之）P00 读成暗红褐、砖读成橄榄鳞片。
+默认值改成参照图里那一档：**灰泥 P04 + 砖 B01**。⚠️ 这是默认值不是结论 —— 换档只要在
+`MI_TinyGladeWall` 上改一个贴图参数；逐房差异将来应走顶点色 `Color.A` 色号 + 1D 调色板
+（见「逐房差异」那条 finding），不是给每栋房造 MID。
+
+同时核掉一条名字很像的假线索：`bricks_beige/dark/grey/light/yellow`、
+`plaster_peel_low/medium/high`、`nani_solid_albedo_layer00..08`、`wall` **全是 32×32 的 UI 图标**，
+不是可用的表面贴图。别再去翻第二遍。
+
+#### 出图管线上新踩的两条（与既有那张坑表并列）
+
+- **`always_persist_rendering_state` 不开 ⇒ 离屏捕获没有 ViewState ⇒ 关卡 PPV 里钉死的曝光
+  一条都不生效。** v1 那次五张图全是一片近黑（全图均色 0.003~0.03），差异率被压到 0.00% ——
+  症状长得像"改动没生效"，其实是**根本没曝光**。这条 `TinyGladeShotSkirt.py` 的坑 ⑦ 早就记过，
+  但新脚本抄的是 `TinyGladeShotWallRoofSeams.py`（那张表里没有），于是重踩一次。
+- **`-ExecCmds="py <脚本>"` 用 PowerShell `Start-Process -ArgumentList @(...)` 传会掉引号**，
+  UE 只收到 `-ExecCmds=py`，日志里是一行光秃秃的 `Cmd: py`，脚本从没跑过、编辑器也不会退。
+  要把整条命令行拼成**单个字符串**再传。
+
+#### 本轮产出
+
+| 文件 | 作用 |
+| --- | --- |
+| `Scripts/TinyGladeShotWallTexture.py` | peel / flat 两趟同机位 + 三条逐像素判据（五机位） |
+| `Scripts/TinyGladeShotWallVariants.py` | 默认值候选扫描：一次启动拍完 N 组参数（`VARIANTS` 表每轮要改） |
+| `Scripts/TinyGladeAnalyzeWallShots.py` | 上面那两趟 PNG 的判据（**编辑器外**跑，要全分辨率，采样格会漏掉凸出砖） |
+| `Scripts/TinyGladeMakeWallMaterials.py` | 加 `PeelBias`；四个默认值改档；`prune_orphan_overrides` |
+
+顺带清掉一条：`MI_TinyGladeWall` 上还挂着 `BrickSeed = stone_floor_2_seed`，来自被废弃的
+「用 seed 图逐格选砖」那版。**孤儿覆盖在 MI 面板上看不见**（面板由母材质的参数表驱动），
+只能靠脚本自己删 —— `build_wall_instance` 现在每次都按"本次建图登记过的参数名"过一遍。
+
+#### 未做（如实列出）
+
+- **`L_HouseGroundDemo` 里三个 house actor 的 `WallMaterial` 指的是母材质 `M_TinyGladeWall`，
+  不是 `MI_TinyGladeWall`**（关卡存盘时间早于 09-03 那次建图，而建图脚本有意不存关卡）。
+  今天两者渲染逐像素相同（MI 只覆盖贴图、且与母材质默认值一致），所以不是画面缺陷，
+  但"手感参数在 MI 上调"这句话对这张关卡不成立。修法是打开关卡重跑
+  `TinyGladeMakeWallMaterials.py` 再存盘 —— 本轮没做，因为后台进程存关卡会和用户开着的
+  编辑器抢同一个包。
+- **凸出砖仍然是"石头的顶盖"而不是整块石头**。`stone_floor_2` 的 seed 分格与 height 的石块
+  对不齐（09-03 已实测否掉逐格选砖），纯高度阈值切出来的必然是穹顶的帽子。0.93 只是把数量
+  压到读得过去，形状问题没解。
+- **AO 一张没有；`UseVertexCoverage` 恒 0**（顶点色 A 还是保留位）。TG 的 `cov` 项因此永远走
+  不到，`PeelBias` 是它的替身。哪天 A 通道被分配出去，这两项要一起重看。
+
+
+### D6 重做：门宽 = 路在墙上截出的弦长；新增门扇（2026-09-04）
+
+上一节把「TG 的门与道路无关」证伪之后，本节是照着 TG 的口径把 D6 改过来的实施记录。
+判据脚本 `Scripts/TinyGladeShotDoorWidth.py`（画不同宽度的路、量门宽），纯函数层
+`Public/CSHouseDoorRuns.h`，单测 `PCGPlugins.ComputeShaderGenerator.House.DoorRuns`。
+
+#### 改了什么
+
+| | 旧（等分槽 + 覆盖率二值投票） | 新（道路区间制） |
+| --- | --- | --- |
+| 路的连续值 | `Road >= DoorOnWeight` 当场二值化，只剩"几个采样点算路" | 沿边一次采样出**连续剖面**，端点在跨阈的相邻两点之间**线性求根** |
+| 门宽 | `(槽宽 − 墩宽) × 离地收窄`，**与路无关** | **= 区间长度**，路多宽门多宽 |
+| 门心 | 槽心（恒定） | 区间中心，跟着路走 |
+| 过宽的路 | 只能是一个顶满槽的拱 | 切成一排拱、相邻留 `PierWidth`（`DoorMaxWidth` 定档） |
+| 滞回 | 覆盖率双阈，key 里带段数 N | **区间交叠继承**，没有编号 |
+| 离地收窄 | 唯一的宽度源 | 降级成一个可关的乘数（平地上恒 1） |
+
+#### 实测（`TinyGladeShotDoorWidth.py`，同一面墙逐档加宽笔刷）
+
+```text
+笔刷半径      60    90   120   150   180   220
+这面墙的拱数   1     1     2     2     2     2
+总开口宽 cm   66   150   152   212   212   212
+路平移 60 cm ⇒ 门心移动 70 cm（旧口径恒为 0）
+```
+
+「路只擦过一点点 ⇒ 门很窄」这条用户实测**复现了**：最窄档 66 cm，最宽档 212 cm。
+`DoorMaxWidth = 160` 之后 r120 起裂成两拱 —— 这就是用户说的「路过宽时变成连续的石拱门」，
+比例参照 `img/tiny-glade-ref-arcade-piers.jpg` / `tiny-glade-ref-twin-arch-pier.jpg`（两拱夹一道窄墩）。
+
+⚠️ **`DoorMaxWidth` 的默认值必须比一面墙的可用跨度小，否则这条路永远走不到。**
+260 那一版比演示房 400 深那面墙的可用长 232 还大，宽路只得到一个顶满整墙的巨拱，
+拱廊那档从没出现过 —— 参数存在不等于路径被走过。
+
+#### 新增：门扇（`DoorLeafMesh` 一族）
+
+TG 侧：`construct_gates` 按 `segment_length` **现搭** quad 网格（`DoorMeshInProgress::add_quad`
++ `door_mesh` / `door_mesh_gap`），资产里只有把手（`wooden_gate/door_handle_circle.glb`），
+**没有门扇网格**。本项目**有意不同构**：用现成的 `door`（TG `decorators/door.glb`，实测
+120 × 75 × 250 cm、带 COLOR_0 无 UV）按洞宽缩放，纵横比拉过头时只缩不拉
+（`DoorLeafMaxStretch`）。竖直轴与宽度轴从包围盒自判，换 y-up 资产也立得起来。
+门扇高默认齐**起拱线**（`DoorLeafRise = 0`）—— 矩形门扇顶到半圆拱顶必然切角。
+
+#### 🐛 一次真崩：门扇批量注册 → Nanite 材质审计 → 渲染 flush → 断言
+
+`DoorMaxWidth` 调小、同一帧要建 2 个以上门扇的那一版当场崩：
+
+```text
+FStaticMeshComponentBulkReregisterContext::~ → FScene::BatchAddPrimitives
+  → ShouldCreateNaniteProxy → AuditMaterials → CheckMaterialUsage(MATUSAGE_Nanite)
+  → 材质缺这一位 ⇒ SetMaterialUsage 重编译 ⇒ FlushRenderingCommands()
+  → 抽干任务队列，把在途的 UCSMesh::EditMeshAsync 完成回调拉进来
+  → UCSMeshRenderComponent::HandleMeshChanged → MarkActorComponentForNeededEndOfFrameUpdate
+  → Assertion failed: !bPostTickComponentUpdate
+```
+
+**一个门扇时不崩**（走不到批量注册那条路），所以它是"数量一多才现形"的那类。
+修法两道：C++ 给门扇组件 `bDisallowNanite = true`（二十几个顶点的板子，Nanite 零收益，
+直接砍掉整条审计分支）；建材质的脚本里把 `used_with_nanite` 预先勾上。
+**这与"母材质没勾 `bUsedWithInstancedStaticMeshes` 会被静默换成默认材质"是同一族坑：
+材质用途标记要在资产上预先备好，不能等运行时注册时现补。**
+
+#### 🐛 另外三条静默失效（全部由判据抓到，都不报错）
+
+- **`str(枚举).endswith("DOOR")` 匹配不上**：UE Python 的 `str()` 给的是
+  `"CSOpeningType.DOOR: 0"`（带值），不是 `"CSOpeningType.DOOR"`。症状是"一档都没量到"，
+  而门明明在（`GetDoorLeafCount()` 同时报 1~3）。**枚举一律用对象比较。**
+- **判据在空数据下真空通过**：第一版跑完 `widths=[]` 照样打 `OK`。补了一条 ⓪：
+  量到的档数不足或一档都没开门，直接红。这正是坑表里"故意破坏世界侧的对照"要防的假绿。
+- **单拱宽当判据 → 切拱廊时假红**：路一宽过 `DoorMaxWidth`，单拱宽必然下降。
+  判据要量**总开口宽**（这面墙上所有拱之和）。
+- 出图机位两次拍到隔壁 `House_Pillar` 的墙（与卷零坑表「山墙机位拍进了隔壁房子的白墙」同型）。
+  现在脚本开拍前把别的 house actor 临时藏掉。
+
+#### 旧路已删干净
+
+`SplitEdgeIntoSlots`（等分槽）与 `DoorPitchTarget` 全仓 0 命中，实现、声明、单测
+`FCSHouseEdgeSplitTest` 一并删除（资产侧核过：BP 与关卡都没有覆盖过 `DoorPitchTarget`）。
+
+#### 未做（如实列出）
+
+- **拱形仍是半径 = 半宽的正半圆**，拱高与宽度**没有解耦**。TG 是
+  `create_stone_arch_profile` + `ArchFunction::remap_t` 的剖面曲线，逐砖带 3 点拱高
+  （`global_arch_height_vals`）由 PS 逐像素切；参考图 `tiny-glade-ref-twin-arch-pier.jpg`
+  里的拱明显**扁于半圆**（跨约 200、起拱以上只升约 80）。要改得同时动
+  `CSHouse_ClipKeeps` 与材质里那段 HLSL（两处必须同式，不一致不报错）。
+- **段的类型只有拱，没有楣**（TG 有 `LintelSegments`）。
+- **门扇仍是缩放预制件**，不是按洞宽现搭；宽度差得多时板条比例会被拉伸。
+- **`DoorLeafRise` 默认 0**，拱顶那半圆是空的（读作气窗）。要顶满得先有拱形门扇网格。
+
+### D6 续：拱高解耦 / 换回 TG 真门 / 门扇填满拱 / 四边接成环（2026-09-04 下午）
+
+同日上午把门宽改成"路在墙上截出的弦长"之后，用户看图给了四条反馈，逐条落地。判据仍是
+`Scripts/TinyGladeShotDoorWidth.py`（新增判据 ⑥）。
+
+#### ① 拱高与洞宽解耦（`DoorMaxArchRise`，默认 70 cm）
+
+用户："门上升过高"。半圆下**拱高恒等于半宽**，洞一宽拱就顶到很高。改成**椭圆拱**：
+半轴 = (半宽, Rise)，`FCSWallOpening::ArchRise` 为 0 时退回半圆、逐位不变。
+
+**改动小到出乎意料**，因为归一化在裁剪场里：`q = ((S−Cs)/HW, (Z−拱脚)/Rise)`，
+`dot(q,q) < 1` 从正圆变椭圆 ⇒ **材质里那段 HLSL 一个字都不用改**（它只看已归一化的 q）。
+"两处必须同式"那条老风险这次没咬到 —— 值得记：**把形状参数塞进归一化，判据就不必跟着改**。
+
+新单测 `House.ArchRise`：`ArchRise=0` 逐位退回半圆、剖面顶点不许落进裁剪曲线里
+（门框砖沿剖面走、洞由裁剪场切，两者不同式**没有任何报错**）、扁拱确实更早收拢、Rise 夹在洞高内。
+
+面板上因此有两个正交旋钮：`DoorHeight` 管整个洞多高，`DoorMaxArchRise` 管拱那一段升多高。
+
+#### ② 🐛 门扇用错了资产：`decorators/door.glb` 是交互代理盒
+
+用户："门没有使用 TG 的模型"。核过：`door.glb` 只有 **36 顶点、120×250×75、没有 UV** ——
+它是**交互/碰撞代理**，同族的 `*_collision` / `*_interaction` / `*_outline` /
+`decorator_test_door` 一样。TG 的真门是 **`balcony_door_rank1/2/3`**
+（源码路径 `decorator_visual/cottage_balcony_door.rs`；120 / 150 / 180 cm 宽 × 262.5 高，
+带 COLOR_0 **和** UV），而且**按尺寸分档**（`DecoratorSubtype` 的 rank）。
+
+⇒ `DoorLeafMesh` 改成 `DoorLeafMeshes` 数组：按每张网格自己的包围盒宽度排序，挑
+"native 宽度不超过洞宽的最大一档"，余下差值才交给缩放 ⇒ 拉伸量天然最小。**这就是 TG 的做法。**
+
+⚠️ 顺带解释了另一个假象：之前门扇渲染成**纯黑**，我一度当成材质问题。真因是代理盒的顶点色是 0，
+`VertexColor × Tint` 自然全黑 —— **"用错资产"的症状**。换成真门之后顶点色接回去就对了。
+
+#### ③ 门扇不是拱形网格，是**比洞更大的矩形**被墙切出剪影
+
+用户贴了实拍 `img/tiny-glade-ref-door-in-arch.png` 并问："它看上去像圆弧形，但你放的门不是，
+这是否意味着它实际上超出了拱形石墙的距离"。**是的**，三条证据：
+
+- 门的轮廓**严丝合缝贴着拱圈石内缘**，连侧边都没有缝；
+- 木板条是**竖直**的，各自终止在拱线上；
+- 拱圈石在门上投了一道软阴影 ⇒ 门是**凹进去**的。
+
+而 TG 的拱形状随洞宽 / 拱高连续变化，**一张固定网格不可能每次都对上那条曲线**
+⇒ 门扇不可能是建成拱顶的。它是一块比洞更大的矩形，退在墙面之后，由墙自己的 `OpacityMask`
+切出拱形剪影。⇒ **我们不需要拱形门扇网格。**
+
+落地：`DoorLeafWidthRatio` 0.94 → **1.0**，`DoorLeafRise` 0 → **1.05**（故意越过拱顶）。
+早先"门顶停在起拱线、拱顶那半圆空着"是反的，画面上是"方门塞在拱下面"。
+
+⚠️ 同时补了一条：**门扇厚度必须留在墙里**。宽门那档 `ScaleWidth > 1`，
+`balcony_door_rank*` 原生 31.6 cm 厚，乘上去比 24 cm 的墙还厚 ⇒ 会从两面探出去，
+剪影那套就失效了。现在按墙厚夹住（两侧各留 2 cm）。
+
+#### ④ 四条边接成一条闭合周界 ⇒ 转角能开门
+
+用户："根据 4 条边组合一个环形边肯定不是难事，转角处的设计参考 TG 就行"，并给了实拍
+`img/tiny-glade-ref-corner-arch-passage.png` —— **两道拱共用一根角柱，而且没有木门**。
+
+这与卷零上一节查到的 TG 模型一致：`Rectangle2d` 是**闭合周界参数 u**
+（`perimeter` / `get_pos_at_u` / `get_edge_id_at_u` / **`circular_slice`** 环形切片 /
+`get_normal_at_u_non_normalized_corners` 转角给未归一化角平分线）。
+
+落地：`FCSDoorRunParams::bClosed` + `ComputeDoors` 沿**整圈周界**采样求解，
+段再按边切回去；跨角的段被切成两片，两片都打 `CSHouse_StyleCornerDoor`：
+
+- 角柱（`CSHouseQuoin`）**留着当中墩** —— 它不是障碍，实拍里它就是那根柱；
+- 转角段**不装门扇**（实拍里转角是敞开的过道）；
+- 过宽切分放在**按边切完之后**做，一排拱因此不会骑在转角上。
+
+⚠️ `CornerMargin` 从门洞求解里**退场**（还被窗的谓词用着，不是死代码）：护角本来就是
+"四条独立边"模型的产物，环起来之后路自己决定开到哪儿。副作用是可用跨度变大 ——
+实测同一栋房的总开口宽上限从 212 涨到 312。
+
+⚠️ 滞回记忆改存**环参数**（`FCSDoorRunMemory::EdgeIndex` 恒 −1）。旧的逐边记忆读进来会全部
+失配 ⇒ 升级那一帧滞回失效一次，与"拉尺寸跨 round 边界"是同型但只发生一次，可接受。
+
+#### 实测
+
+```text
+笔刷半径      60    90   120   150   180   220
+这面墙拱数     1     1     2     2     2     3
+总开口宽 cm   66   150   152   224   272   312     （护角退场前上限是 212）
+斜穿转角     edges=[0,1] 两条边各开洞（0 号边还被切成两拱），门扇数 = 0
+```
+
+#### ⑤ 拱间墩改成小石柱：柱础 + 柱身 + 柱头（2026-09-04 傍晚）
+
+用户："两道门出现时中间会出现一个小型石柱"，并再次给出实拍 `img/tiny-glade-ref-twin-arch-pier.jpg`。
+与我们出图对比（`pier_d16_r180.png`）差在两处：我们的墩是**一摞同样的砖**，没有柱头 / 柱础；
+两道拱圈之间还夹着一块灰泥楔子，TG 那边两道拱圈直接收在柱头上。
+
+落地（`CSHouseFrame.{h,cpp}` + `CSHouseFrame.usf`）：
+
+- `FElement::CrossScale`：逐路**横截面缩放**（进深轴 + 墙法线轴同乘，长度轴不动），走 kernel
+  里原本空着的 `R5.w`。旧数据那一格是 0，kernel 按 1 处理，逐位兼容。
+- 墩那条竖直砖路拆成三段同一个 S：柱础（单砖，`CrossScale = PierCapitalScale`）、柱身（原来那条
+  均匀砖路，缩短两个帽子高）、柱头（单砖）。柱头高夹在墩高的 40% 内，墩很矮时两块帽子不能把柱身挤没。
+- 只有门框那条路填 `CapitalHeight`；接缝柱与角石沿用默认 0 —— 角石通高到檐口，柱头放在檐下没有意义。
+- 新单测 `House.FramePierCapital`：五条砖路 / 础与头各一块放大砖 / 三段首尾相接**同一列**
+  （`FramePierSingleColumn` 的不变量不许破）/ 荒谬的柱头高被夹住 / 关掉逐位退回三条。
+
+#### ⑥ 拱廊不装木门（2026-09-04 傍晚，用户实测）
+
+"两道门并排时只有拱没有木门" —— 木门只装在**单拱**上，一排连续拱是敞开的过道。我只在转角段
+做了这条（`CSHouse_StyleCornerDoor`），拱廊漏了。补 `CSHouse_StyleArcade`：`ComputeDoors` 里一条路
+被 `CSHouse_SplitRun` 切成多拱时每个子拱都打这一位；门扇看 `CSHouse_StyleNoLeafMask`
+（转角 | 拱廊）任一位就不装。判据脚本加 ⑦：单拱档恰好 1 扇门，多拱档 0 扇。
+
+#### ⑦ 砖构件外凸出墙面（2026-09-04 傍晚，用户："很多结构离墙太近了"）
+
+用户："应该是它们的中心在墙 mesh 上，而不是它们的最远端。" 根子在 `EnsureFrameComponent`：
+砖的穿墙厚度 = `FrameBrickThickness`，为 0 时取**墙厚**，而砖路走墙厚正中 ⇒ 砖的外表面与
+墙面**共面**，拱圈石 / 墩 / 勒脚全贴在灰泥里一点不凸。角石反倒是对的（`QuoinInset = 0`：
+一半在实体里、一半探出去）。TG 的砖本来就是墙本身、灰泥盖在外面，拱圈石天然凸出灰泥面并在
+门上投影（实拍 `img/tiny-glade-ref-door-in-arch.png` 里那道软阴影）。
+
+落地：`FrameBrickProtrude`（默认 6 cm）。自动档厚度 = 墙厚 + 2×它，**中心仍在墙厚正中**
+⇒ 两面各凸一截，"砖封住洞口断口两侧"那条既有约束不破。门框砖 / 勒脚 / 角石共用一份
+`BlockSize`，三家一起凸；显式给了 `FrameBrickThickness` 就照给的用。进了门框哈希，改参数会重建。
+门扇仍退在墙厚正中（厚度夹在墙内），于是比拱圈石前脸低 ~8 cm —— 正是"门凹在拱里"的关系。
+
+⚠️ 两道拱圈之间那块灰泥楔子只被柱头**盖住了下半**：它的成因是两个独立的洞各自起拱，
+拱圈从各自的洞缘出发。要像 TG 那样两道拱圈**收在一点**，得让相邻两拱共享起拱点 —— 那是
+"跨角连续拱曲线"同一族的活，未做。
+
+#### 🐛 转角标记被 `ResolvePierSpans` 擦掉（判据 ⑥ 抓到）
+
+第一次跑判据 ⑥：两条边确实都开了洞，但**门扇照装**。真因是 `ResolvePierSpans()` 开头那句
+
+```cpp
+for (FCSWallOpening& Opening : CurrentOpenings) Opening.StyleFlags = 0;
+```
+
+它在 `ComputeDoors` **之后**跑，整份清零把 `CSHouse_StyleCornerDoor` 一起擦了。
+改成只清墩那两位（`&= ~(PierBefore | PierAfter)`）。
+
+**这一族坑的形状**：`StyleFlags` 是多个生产者共用的位域，而清零写成了"整份"。
+再往里加位的人都会重踩 —— 所以清零那一行现在带着注释写死了"只清自己那两位"。
+
+单测 53 条全绿（新增 `House.ArchRise`）。
+
+
+### TG 的转角处理：四条互不相干的链（2026-09-04 调研）
+
+用户问的"TG 对转角怎么处理"。PDB 里能分出**四条**，本项目只对上了前两条。
+
+#### 前提：TG 的墙是**一条闭合周界曲线**，本项目是四条刚性边
+
+`utils::geometry::rectangle::Rectangle2d` 暴露的是一整套**周界参数 u** 的接口：
+`perimeter` / `get_pos_at_u` / `get_edge_id_at_u` / `get_closest_u_from_pos` /
+`as_curve2` / `as_curve3`，以及 **`circular_slice` / `circular_slice_segment_points`**
+—— 周界切片是**环形（可绕回）**的。
+
+⇒ **在 TG 里一段墙路径可以跨过转角**，拱因此也可以跨过转角。
+配套的是 `get_normal_at_u_non_normalized_corners`：转角处的法线取两条边法线的**未归一化和**
+（= 角平分线且更长），这正是沿周界外扩/挤出时做斜接（miter）需要的量。
+
+本项目是 `CSHouse_GetEdge` 给出的**四条独立刚性边**，每条边自己的 `S` 从 0 起算，
+门还被 `CornerMargin` 挡在离角 60 cm 之外 ⇒ **洞永远不可能跨角**。
+这也是卷一 §4.1 那条「墙角的问题不是穿模而是 UV 岛断裂」的同一个根：
+四条边各自的 UV 从 quad 局部 (0,0) 起算，纹理到角就断。
+
+#### 四条链
+
+| # | TG 侧 | 干什么 | 本项目 |
+| --- | --- | --- | --- |
+| 1 | `system_wall_constructor::utils::wall_corners::add_wall_corners` | 墙**自身**四角的砖 | ✅ `CSHouseQuoin.h`（四角竖直砖柱，与接缝柱共用 `AppendColumn`） |
+| 2 | `system_clutter::inter_shape_stitches::detect_intra_shape_corners` → `IntraShapeCorners` + `ShapeIntersectionHole`（**写 `WallHoles`**）→ `stitch_bricks::{InterShapeBrickStitches, StitchBrick}` | 两个**形状相交**处：先开洞，再砌缝砖 | ✅ `CSHouseSeam.h`（洞走 clip 不挖真几何，砖是纯函数） |
+| 3 | `WallCornerAttachment::{from_rectangle_corner_id, to_rectangle_corner_id, is_attached}`、`DecoratorSubtype::can_be_on_corner`、`should_offer_snap_to_corner` | 装饰件**吸附到转角**（按 corner id 记账） | ❌ 无。D12 摆件只有五家锚点，没有"转角"这一家 |
+| 4 | `system_decorator::decorator_visual::cottage_corner_window::generate_cottage_corner_windows` | **转角窗**（骑在角上的窗） | ❌ 无，且**永久不做**（2026-09-05 用户裁决）。D8 的窗只认单条边，距角过紧直接不生成 |
+
+另有 `stairs_railings_assemble::add_corner_stone_railing_piece`（楼梯栏杆的转角件），本项目楼梯没有栏杆。
+
+⇒ **想抄第 3/4 条，前置是「墙路径的周界参数化」那一层**（同卷四 §4.2 被否时列的前置②
+「墙高沿路径的曲线」是同一层设施）。在四条刚性边的模型下，转角窗与转角吸附都无处落脚。
+
+
+### 挖洞策略改成 TG 的真两层：砖层 + 灰泥层（2026-09-05 用户裁决）
+
+**用户裁决：抄 TG 的真两层。** 先前的「整块实心墙板 + 一个逐像素 clip 场」作废，
+计划正文已改写（`TinyGladeHouse_Plan.md` D4「墙的两层结构：砖层 + 灰泥层」；
+结论节 `:10`、D4 生成 bullet、D8「洞的实现」三处已标记被取代）。
+
+#### 触发这次裁决的调研：驱动方逐行读了 `_nani_plaster` 与 `_wall_wall_brick_lod0`
+
+用户问「TG 是不是墙灰用顶点色挖除、露出来的部分用 instance 砖填满」。答案是**一半对，
+而且对的那一半推翻了本文卷二 §1.2 原来的一句结论**（该处已就地订正）：
+
+- ✅ **灰泥确实是逐顶点标量 + PS discard 挖掉的，而且这是 TG 唯一可能的做法。**
+  `_nani_plaster...vs_main L129-146` 把 `gl_VertexIndex` 拆成 `(row = idx>>16, col = idx&0xFFFF)`，
+  偏移 `48 * (col + row * row_stride)` —— **规则栅格，没有索引缓冲、没有可跳过的四边形**。
+  PS 第一句 `if (clamp(in_var_C6,0,1) < 0.1) discard;`，`C6` 是从灰泥自己的顶点缓冲读的逐顶点标量。
+- ❌ **砖不是"填"进去的，砖是恒在的底层。** `system_wall_constructor` 沿墙曲线累积 `Vec<MyBrick>`
+  （一栋小屋数千块），灰泥是盖在砖墙外面的另一张网格。剥落/洞让灰泥消失，砖自然露出来。
+  ⇒ TG 是**「砖墙是底，灰泥是面漆」**，不是「灰泥是墙，挖开补砖」。
+- 🔑 **砖层也有逐像素裁剪** —— 这条决定了两层方案**不必丢弃现有设施**：
+  `_wall_wall_brick_lod0...ps_main L145-172` 的两处 `discard` 是同一判据的正反两支
+  （`普通砖 && world_y < 拱高 → discard` / `拱圈石(flags&8) && world_y > 拱高 → discard`），
+  `拱高` 由每砖 `global_arch_height_vals` 三点插值。**`FCSOpeningClipField` 的对位物就在这里**：
+  两层之后它从「墙板」搬到「每块砖」。而且本项目的场是二维、上下都有界 ⇒ 矩形窗与圆窗仍能精确裁，
+  TG 那条一维下界做不到。
+- 🔑 **TG 的洞几何就是二维 AABB，没有斜切轴**【确凿，PDB 泛型实参 `pdb_symbols.txt:86452`】：
+  `generate_plaster_mesh_and_entities<Map<Filter<Iter<tuple$<utils::geometry::aabb::Aabb2,
+  HoleType, HoleOrigin> > > > >`。坐实了逆向报告 L465 那条推断的前半、**证伪了后半** ——
+  TG 侧没有 `AxisUS` / `Skew` 的对位物。
+
+#### 落到本项目
+
+| 层 | 内容 | 洞怎么消失 |
+| --- | --- | --- |
+| A · 砖层 | `brick` 实例**铺满整墙** | **三级**：删实例 → 把剩下的砖挪到贴紧洞缘 → 逐像素裁兜底（见下） |
+| B · 灰泥层 | 规则四边形栅格，逐顶点覆盖度 | 洞内顶点覆盖度写 0（边缘衰减）⇒ PS `cov < 阈值 → discard` |
+
+#### 订正（同日稍晚，用户提问触发）：TG 的洞缘不是"全靠逐像素裁"
+
+用户回忆「TG 会删掉一部分砖的 instance，并且移动剩下砖的顶点让它们贴紧窗户」。**核实成立**，
+而且比本节初稿写的"逐砖 clip 细裁"更准 —— 逐像素裁只是第四级兜底：
+
+| 级 | 做什么 | 在哪做 | 实证 |
+| --- | --- | --- | --- |
+| ① 删实例 | 整块在洞内的砖不发；砖排按洞的高度阈值裁断 | CPU | `utils::trim_rows` 走 `utils::geometry::split_heightmap::split_heightmap_by_threshold<RowTrimmerSink>`，`impl$0::{above_to_below, below_to_above}` 是**穿越阈值**的回调，产出 `TrimmedRow` `[PDB] :92942, :86501-86505` |
+| ② 水平贴合 | 洞两侧那列砖缩短到抵住洞缘 | CPU 改逐实例非均匀缩放 | 砖是单位盒 × `Affine3Packed transform`，`InstancedWallData` 无 mesh_id ⇒ 改尺寸只能改 transform；`TrimmedRow` 语义即"被修剪过的一排" |
+| ③ **垂直贴合（逐顶点）** | 洞上缘那些砖的**局部 z 按洞高曲线缩放**，砖顶正好落在洞缘上，**并因此免逐像素裁** | **VS** | `[GLSL] _wall_wall_brick_lod0...vs_main.glsl:152`：`if (flags & 32) v.z = localPos.z * mix(arch.x, arch.y, 0.5 - localPos.x);` |
+| ④ 兜底 | 没被贴合、只是压在洞线上的**普通**砖逐像素 discard | PS | `[GLSL] ps_main:145-172` 正反两支 |
+
+**⇒ 洞缘精度主要来自"把砖挪到贴紧"，不是"把砖裁掉一半"。** 这坐实了 `[分析]` §1.7 对
+`flags&32`（拱压扁 + 免拱裁剪）的语义推测 —— 它就是③。
+
+⚠️ 两条边界（与本文卷二 §1.3 的结论一致，别抄错）：
+- `flags & 32` 是**墙砖专用管线**的位，TG 的**窗**不走它（`GothicWindowBricksInstanceData` 没有
+  flags 字段），窗的洞缘 TG 拿**预制框**盖住。~~本项目不做预制框 ⇒ ③对窗同样要开~~
+  **2026-09-06 订正**：用户裁决附属物自带预制网格 ⇒ 与 TG 同构。**同日再订正：④ 整个作废**
+  （用户裁决「砖头适配窗子直接改缩放就行，不需要 clip」），③ 对窗与门拱都开。
+- TG 的③只压 z（洞只有一条上界）。本项目③只服务门拱（`Z0 = 0`）也只需压 z；`FCSOpeningClipField` 的
+  二维性由④消费（窗的逐像素裁上下都有界，TG 无对位物）。
+
+⇒ `FCSOpeningClipField` 同时供③（求洞缘高度、拿来缩放砖的局部 z）与④（求逐像素判据）——
+**同一个场，两种消费方式**，仍然是唯一真源。
+
+**不变**：`FCSWallOpening` 与 `CSHouse_ComputeClipField` 仍是唯一真源；谓词 `CSHouse_QueryOpening`
+**零改动**；C1（一维 S 区间、永久放弃门上开窗）与同日的「不做转角窗」继续有效。
+⚠️ C1 选甲的**理由**（面板只带一个 clip 场）在两层之后不再成立 —— 但 C1 是用户裁决不是权宜之计，
+**不据此翻案**。
+
+**退役**：`AddPanel` 单游标扫掠、窗台实心盒（窗台就是洞下方照常摆的砖）、
+`M_TinyGladeWall` 的 `PeelBias`（2026-09-04 为顶替缺失的覆盖度而加，真覆盖度来了它就没用了）。
+`CSHouseFrame` 的门框砖 / 拱圈石**并入砖层**，不再是贴在实心盒外面的装饰。
+
+**最大风险**：拖拽期每帧重建从「千级三角一次上传」涨到「千级实例 + 一张栅格网格」。
+零阻塞纪律与哈希短路必须原样守住。
+
+**分期**：P1 砖层（**含①②③④四级**；验收：洞缘与改动前**逐像素相同** + 砖数在预算内 + 零阻塞断言不退化）→
+P2 灰泥层（验收：剥落沿高度的渐变读得出来，复用 `TinyGladeAnalyzeWallShots.py` 三条判据）→
+P3 `above_to_below` / `below_to_above` 过渡与「哪儿铺灰泥」的片边界。
+
+
+### 附属物持有 mesh、锚点是权威（2026-09-06 用户裁决）—— D8 交互层重定向
+
+**起因**：09-05 晚两轮追问「改房子尺寸时窗标记会怎样」与「TG 怎么解决」，追出来的东西直接触发了这次裁决。
+
+#### 现状（源码追出来的）
+
+- 标记**从不 attach**（`Host` 只是弱指针；对比拉尺寸抓手是 `AttachToActor` 的），**从不在房子变化时重解析**
+  （`ResolveHostAndRegister` 全仓调用点只有标记自己的生命周期钩子和单测）。
+- 诉求存墙局部 `(EdgeIndex, CenterS, SillZ)`、标记存世界变换，两边分家。`PushEdge(e)` 挪 e 侧两个角 = 第 e 与
+  第 (e+1)%4 条边的 S 原点 ⇒ **推第 e 条边，e 与 e+1 上的窗错位 Δ，另外两条完全正确**（四条边逐一推算验证：
+  e 上的窗随墙平移、e+1 上的窗沿没动的墙滑 Δ）。移动 / 旋转整栋房子 ⇒ 四面墙全错。改 `WallHeight` ⇒ `AboveEave` 静默拒。
+- **回执过期**：`bCausesCut` / `LastReject` 只在 `ResolveHostAndRegister` 里写，房子拒了标记还说"切了"。
+- **自愈方向反了**：`MarkerWindows` transient ⇒ 重开关卡按标记的陈旧世界位置重射线 ⇒ **洞跑去追标记**，用户看到窗又挪一次。
+- 计划 D8「吸附回位」整节零实现：`LastAcceptedWorld` / `SnappedWorld` / `SetActorTransform` 一个都搜不到。
+
+#### TG 怎么做（全部 `[PDB]` 实证）
+
+- **变换是每帧派生的**：`resources::walls::cached_decorator_transforms::CachedDecoratorTransforms::{insert, position,
+  try_position, transform, try_transform, swap_buffers_and_clear}` + `Local<CachedDecoratorTransformStorage>` 双缓冲；
+  产出系统（`pdb_symbols.txt:9033`）读 `PublicWalls` + `TerrainHeightsData` + `DecoratorStorage` 写缓存。**没有可以过期的东西。**
+- **锚点是序列化权威**：`resources::walls::wall_attachment::{WallAttachmentAnchor, WallAttachmentSide, WallCornerAttachment}`
+  带 serde；`WallCornerAttachment::{from_rectangle_corner_id, to_rectangle_corner_id, is_attached}` ⇒ 至少角挂载用的是
+  **拓扑角编号**而不是坐标。
+- **每种改法一个系统**：`decorator_on_rectangle_edited`（= 我们的 `PushEdge`）/ `decorator_on_move_shape` /
+  `decorator_on_wall_height_changed` / `decorator_on_freehand_wall_edited` / `move_decorators_following_anchors` /
+  `cull_oob_decorators` / 事件 `ReanchorDecorators`。
+- **裁决每帧重判**：`validate_blueprints` → `DecoratorBlueprints`，配 `clear_blueprints` / `copy_blueprints_to_prev` /
+  `iter_maybe_modified` + `PrevDecoratorBlueprints`。被拒的蓝图**不实例化** ⇒ 画面消失、存储保留。
+- **窗的 mesh 归 decorator**：`instantiate_blueprints` 出 `window_cottage_*` 实例，墙只 `trim_rows`。
+
+#### 用户裁决（三条，已写入计划 D8）
+
+1. **附属物自己持有 mesh**（预制 StaticMesh），房子只"适配"——只挖洞，不再砌窗框砖 / 窗台盒。
+   理由：布尔退场后"cutter 必须在房子网格里"这个约束没了。**比原口径更贴近 TG。**
+2. **位置存储与 TG 一致**：锚点 `FCSWallAnchor` 是唯一序列化权威，actor 变换派生；每次重建后房子把标记搬到
+   锚点所在处（`SnapToAnchor`）。拖 gizmo 反向：世界 → 射线 → 锚点 → 派生回变换（吸附）。
+3. **选中即可拖**：`UStaticMeshComponent` 自带编辑器 hit-proxy，点得到。
+
+#### 随之而来（驱动方推导，已写入计划 D8，可否决）
+
+- 锚点用**角相对** `(EdgeIndex, CornerSide, DistFromCorner, SillZ)` 而非绝对 `CenterS`（理由见计划 D8「锚点」）。
+  TG 直墙锚点字段 PDB 拿不到 ⇒ **卷二 U4 重新有下游**，但不阻塞——按性质对齐即可。
+- 标记 **`AttachToActor`** + 写相对变换 ⇒ 整栋移动 / 旋转 / 落座由场景图带走，只有 footprint / 墙高变化要通知。
+- **被拒 ⇒ 隐藏 mesh，标记留着**（对位 `validate_blueprints` 不实例化）。
+- **两层 P1 收窄**：④ 作废（见下），洞缘全靠 ①②③ 的几何贴合。
+- `CSHouseFrame` 的窗台砖分支（`bSill`）随之**退役**；门樘 / 拱圈石不受影响。
+- **卷二 A9 玻璃母材质提前变成必需**：窗有 mesh 就得有材质，`M_TG_Glass` 是 unlit 且只许 gallery 用（裁决六）。
+- 补 `PostEditUndo` ⇒ 顺手关掉 09-05 列的"移动-撤销后登记不刷新"疑点。
+- 卷二 W2「窗框资产引用放标记 actor 上、由房子另开实例通路」→ 后半作废：**标记自己就是实例通路**。
+
+#### 未决 / 待实测
+
+- 编辑器里拖动**父** actor 时，attach 的子 actor 是否也收到 `PostEditMove` —— 决定"房子被拖"会不会被误当"标记被拖"。
+  两种结果都无害（射线命中同一处），但要知道。
+
+#### 已落地并**实跑过**（2026-09-06）：构建 Succeeded、单测 **110 绿 0 红**、回归 **passed=228 failed=3**（剩下三条是门/拱段的既存基线红，见下）
+
+| 件 | 位置 |
+| --- | --- |
+| `FCSWallAnchor` + `CSHouse_MakeWallAnchor` / `CSHouse_AnchorS` / `CSHouse_AnchorToLocal` | `CSHouseProfile.h`（纯函数，无 world） |
+| `ACSHouseActor::AnchorToWorld` | 锚点 → 世界，`BlueprintPure`；构建空间的合成只此一处 |
+| 标记持 `MeshComponent` + `Anchor` / `LastAcceptedAnchor` + `SnapToAnchor` / `ApplyHostVerdict` / `RegisterAnchor` | `CSHouseFeatureMarker.{h,cpp}` |
+| `AttachToActor` 到宿主 | 整栋移动 / 旋转 / 落座由场景图带走，零同步代码 |
+| 加载按锚点复原（宿主由 attach 关系给出），**不重新射线** | `PostRegisterAllComponents` |
+| `PostEditUndo` | 撤销后按锚点重登记 + 吸附 |
+| 裁决回推 + 吸附 | `FCSMarkerWindow::Marker` 反引 + `CurrentFeatureVerdicts` + `NotifyMarkersRebuilt()` |
+| 尺寸从网格包围盒取 | `ACSWindowMarker::GetDemandSize`（`bAutoSizeFromMesh`，没挂网格退回手填值） |
+| **默认窗框资产已接** | `decorators_window_cottage_1x1`（78 × 17 × 160、32 三角）+ 网格组件 −90° yaw（资产进深在 Y、本类约定 +X 是墙内法线）；材质随资产 `MI_window_colors_layer00`（`M_TG_Texture` 实例、DefaultLit + Opaque）**零工作量** |
+| 新单测 `House.WallAnchor` | 近角选择 / 往返 / **拉尺寸后世界位置不动**（含"绝对弧长会滑 100"的反证）/ 夹取 / 不动点 |
+| `bAnchorPlaced` / `bHasResolvedOnce` 两位 | 挡 spawn 期误吸附，见下面那个坑 |
+
+⚠️ **`House.WindowMarker` 有一条判据被翻面**：原来断言"推到墙角 ⇒ 窗洞掉到 0"，
+现在松手被拒会**弹回最后一个被答应的位置**（计划 D8「回位规则」= TG `DecoratorBackup`），
+所以窗洞留着。"被拒的诉求不撤登记"那一条没变，改由新加的"从未被接受过的标记"那一段来钉。
+同段还新增：吸附到墙面、attach 到宿主、`PushEdge` 之后标记跟着锚点走。
+
+⚠️ **窗框砖 / 窗台盒本轮没退役**（计划 D8 的落地出入表已记）：要与接上预制窗框资产同一轮做，
+否则窗只剩一个光洞。
+
+#### P1 起步：砖层的①②已落地（2026-09-06，默认关）
+
+**关键复用**：砖层 = **一摞包边带**。`CSHouseTrim::BuildBand` 本来就是"沿四条边铺一行砖、按洞把
+行切断"，从房底摞到檐口就是整面砖墙 —— 洞缘四级里的①②因此**一行新算法都没写**：
+
+| 级 | 谁做的 | 说明 |
+| --- | --- | --- |
+| ① 删实例 | `CSHouseTrim::SplitEdge` | 边的 S 区间减去洞在这一行上的**剪影**（见下）。判据带 Z ⇒ 高窗不切勒脚、落地门不切压顶 |
+| ② 水平贴合 | `CSHouseFrame::AppendFlatRun` 的 `SolveRun` | 解一个铺装缩放让整数块砖**正好填满**切出来的段 ⇒ 洞两侧那列砖天然抵住洞缘 |
+| ③ 垂直贴合 | **未做**，在 GPU 侧 | 只服务门拱（窗的洞缘由附属物的预制框盖住） |
+| ④ 逐像素兜底 | **未做**，在 GPU 侧 | |
+
+落地件：`Public/CSHouseBrickWall.h`（`FCourses` / `PlanCourses` / `EstimateBricks` / `BuildWall`，
+纯函数无 world）+ `ACSHouseActor::BuildBrickWallBricks` 家族 + `EPathFamily::BrickWall` 盐
+（**它后面 65536 个值都归它** —— 盐 = `BrickWall + 层号`，好让每层随机序列不同）+
+新单测 `House.BrickWall`（分层铺满不重不漏 / 上界成立 / 洞处无砖 / 洞缘贴合 / 容量截断）。
+
+⚠️ **`bBrickWallEnabled` 默认关**，且开了也**不是**终局形态：两层是"砖底 + 灰泥面"，而灰泥那半
+还没有独立网格（仍是墙板 + 材质假面），现在开 = 在墙板外面再糊一层砖，只用来对观感与量预算。
+计划 D4 的验收门要求"洞缘与改动前**逐像素相同**"，那本来就得两条路并存才比得了 ——
+**这个开关是验收门的一部分，不是临时脚手架**。
+
+#### ①从「包围盒」升级成「剪影」——拱形自己从砖里长出来（2026-09-06）
+
+初版的①按洞的**包围盒**裁行，于是拱洞被切成一个**矩形缺口**：拱顶两侧本该有砖的地方全空了。
+判据换成"这一行上洞**真正**有多宽"：
+
+- `CSHouse_OpeningHalfWidthAtZ(Opening, Z)` —— `CSHouse_ClipKeeps` 的逆解。拱脚以下满宽、
+  以上按椭圆 `HW·√(1−q_y²)` 收窄、洞顶归零；矩形与圆各自的闭式解同在一处。
+- `CSHouse_OpeningSpanForBand(Opening, LowZ, HighZ, …)` —— 取带内**最宽**的高度（三个采样点：
+  两端 + `RefZ`，覆盖"单调"与"中间最宽"两类形状）。少取一点就会在洞里留下半块砖。
+- `CSHouseTrim::BlockedSpan` 换成调它，`SplitEdge` 随之改。
+
+⚠️ **两处边界，各自都会静默出错**：
+- 拱的 clip 场在**拱脚以下无下界**（那是有意的，窗台那截由实心盒承担）。只问 clip 场的话，
+  一扇 `Z0 = 90` 的拱窗会一路裁到地面 —— 画面上只是"墙脚少了一片砖"，没有断言会红。
+  所以先用洞自己的 `[Z0, Z1]` 卡一道。
+- 判据取 **`<=` 不是 `<`**：`|q| == 1` 恰好在洞缘上（矩形洞的 `Z == Z0` 就是）。闭区间把洞算大
+  一丝丝 ⇒ **多删一块砖而不是留一块砖在洞里**，朝安全的方向错。
+
+**对原有两条包边带逐位无影响**（实测回归一条不变）：勒脚落在拱脚以下 ⇒ 剪影就是满宽；
+压顶够不着洞 ⇒ 照旧不挡。演示房砖层 **885 → 906 块**，多出来的正是拱肩上那些砖。
+
+单测 `House.BrickWall` 新增一段拱洞：半宽随高度的四个特征点、抬起的拱窗不裁到自己窗台以下、
+以及**逐层被挡跨度单调不增且真的收窄过**（只断言"不变宽"是句空话 —— 矩形缺口也满足）。
+
+#### ③ 已落地、④ 作废：洞缘全靠**几何贴合**（2026-09-06 用户裁决）
+
+**用户裁决原话口径："砖头适配窗子直接改缩放就行，不需要 clip。"** ⇒ **④ 逐像素裁整个不做**，
+③ 对窗与门拱都开。这条同时消掉了④的**结构性阻塞**：逐像素裁要把 clip 场喂进材质，而材质只看得到
+`PerInstanceRandom` 一个标量、那一格已被 `CullBelowZ` 的负值哨兵占着 —— TG 是靠自定义顶点工厂
+（96 B/实例）解决的，我们要走这条就得扩 `UCSGpuInstancedMeshComponent` 的实例布局。**现在不必了。**
+
+**③ 怎么做的**：①按剪影裁行时切口取"带内最宽的那个高度"，拱圈往上收的那一头于是留了条缝。
+把端头那块砖**剪切**成上宽下窄 —— 顶边朝洞多推 `Shear`、底边不动（底边正落在切口上，动了就把砖
+推进洞里）：
+
+```hlsl
+const float3 AlongS = -normalize(ScaledY);   // 平顶段 +Y 沿 −S（见 CSHouseFrame.usf 文件头）
+ScaledX     += AlongS * Shear;               // 顶 +Shear/2、底 −Shear/2
+LocalOrigin += AlongS * (Shear * 0.5f);      // 再推回来 ⇒ 底不动、顶 +Shear
+```
+
+**逐实例格式一个字节都没加** —— packed 行的前三行本来就是三个任意向量，倾斜高度轴本身就是一次
+剪切。剪切量走逐路常量 **R6 的两个空位**（`ShearAtS0` / `ShearAtS1`），CPU 侧由
+`CSHouse_OpeningTopShear` 从剪影算出（= 带内最宽半宽 − 带顶半宽）。剔除球同步涨 `abs(Shear)`，
+少涨就会在视锥边缘闪掉且只在斜看时出现。
+
+⚠️ 两处如实的限制（都写在代码注释里）：
+- **只处理往上收窄的洞**（拱；矩形恒 0）。往上变宽的（正圆下半）不剪切，保持①的保守阶梯 ——
+  剪切是**平行四边形**，一个自由度救不了上下两头都要动的梯形，硬凑会把砖推进洞里。
+- **一条路只有一块砖、两端又都挨着洞时只应用较大的那个**，同样理由。
+
+⚠️ **残留（已知、有意接受）**：`FrameBrickBloat = 1.1` 让砖比排布槽长 10%，端头那块因此仍会
+**戳进洞里约 1.3 cm**。窗那边由附属物的预制框翻边盖住，门拱那边由门框砖盖住 —— 这正是④本来
+要清的东西，裁决之后交给盖缝件。
+
+⚠️ **P1 验收门随之改口径**：原写"洞缘与改动前**逐像素相同**"，那是以④存在为前提的。
+④ 作废后洞缘由几何决定，两条路本来就不可能逐像素相同 —— 验收改成"砖不越过洞缘（bloat 那 1.3 cm
+除外）+ 砖数在预算内 + 零阻塞不退化"。
+
+#### ✅ 容量已解（2026-09-06 用户裁决：上限拉到 65536）
+
+单测实测：6 × 4 m、檐高 3 m、26 cm 砖 / 20 cm 层高 ⇒ **砖层上界 1110 块**
+（周长 1904 / 26 = 74 列 × 15 层）。而 `FrameReserveCapacity` 默认 **512**，还是
+**门框 / 接缝 / 角石 / 包边 / 砖层五家共用**的那一份 —— 直接开就是一面砌到一半的墙。
+
+**修法：不让用户手算。** 新增 `ACSHouseActor::EffectiveFrameCapacity()`，七处调用点全部改走它：
+
+```cpp
+const int32 Authored = FMath::Max(FrameReserveCapacity, 64);
+if (!bBrickWallEnabled) return FMath::Min(Authored, 65536);
+// 砖层的量级是 footprint 的函数 ⇒ 自己按上界加够，authored 那份原样留给其余四家
+return FMath::Clamp(Authored + GetBrickWallBrickBudget(), 64, 65536);
+```
+
+演示房实测（`House_Road` 600 × 400 × 300）：
+
+| | 容量 | 砖总数 | 其中砖层 | 层数 |
+| --- | --- | --- | --- | --- |
+| 砖层关（基线） | 512 | 163 | 0 | 0 |
+| 砖层开 | **1622**（512 + 1110） | 1048 | **885** | 15 |
+
+885 < 1110 是对的：洞吃掉一些、不足半块砖的碎段直接不出。**没有截断。**
+
+⚠️ 两条一起记住：
+- **只截断不扩容**。`FrameReserveCapacity` 原注释末句"Growth still happens…"**是错的**，已订正 ——
+  `AppendFlatRun` 里那句 `Count = Min(Count, MaxBricks - Cursor)` 就是全部。
+- **容量是注册期一次付清的**，所以**把房子拉大到超出注册时算出的量，砖层会被截断而不是扩容**。
+  新增的两条 Warning（单家 / 五家合计）是唯一提示；`RebuildFrame` 那条会把砖层的数一并报出来。
+
+#### 窗退出框砖产线，门留着（2026-09-06） — 正文已并入 [TinyGladeWindow.md](TinyGladeWindow.md#窗退出框砖产线门留着2026-09-06)
+
+#### 三件网格 + 蓝图分层已落地（2026-09-06 用户裁决） — 正文已并入 [TinyGladeWindow.md](TinyGladeWindow.md#三件网格--蓝图分层已落地2026-09-06-用户裁决)
+
+#### 🐛 spawn 期的误吸附会**自我固化**（本轮被 demo 回归抓住，已修）
+
+第一次跑回归，`demo_house_window` 的标记那一段四条全红：`markers=0`、`reject=SILL_TOO_LOW`、
+`host=House_Pillar` —— 标记咬上了 **11 m 外的另一栋房**。逐步探针（位置 / 朝向 / 宿主 / attach
+逐步打印）读出来的因果链是**两个坑叠在一起**：
+
+1. **`GEditor->AddActor` 先落位、后应用旋转**，而它在 spawn 之后立刻补的那次
+   `PostEditMove(bFinished=true)`（基类纪律 ③ 把它降级成非最终裁决，但**照样会去打射线**）
+   正落在两者之间 —— 那一刻朝向还是默认的 **+X**，射线于是打中背后的 `House_Pillar`
+   （边 3、S=176、局部 Z=0 ⇒ `SILL_TOO_LOW`，逐个数都对得上）。
+   **这一条是既有行为、本身无害**：下一次解析朝向就对了，会自己纠正。
+2. **致命的是本轮新增的吸附**：`PostRegisterAllComponents` 会跑**不止一次**，第二次跑到时锚点
+   已被①填上、attach 也挂上了 ⇒ 「锚点有效且已 attach ⇒ 这是从存档复原」这个判据当场失灵，
+   标记被 `SnapToAnchor` **搬到那面错墙上**（实测 `(1500,1600,150)` → `(1895,1600,205)`）。
+   从此每次重解析都从错墙出发、再次确认错墙 —— **错误自我固化**。
+
+**修法（用户裁决 2026-09-06：不许加「审批完 actor」这种状态位）**：不打补丁挡症状，直接修根因 ——
+`PostRegisterAllComponents` **只服务「从存档加载」**（判据 `HasAnyFlags(RF_WasLoaded)`），
+spawn 出来的一概不碰；spawn 的正确入口是 `PostEditMove`，那时变换已经应用完。
+一度加过的 `bAnchorPlaced` / `bHasResolvedOnce` 两位标志**已全部删除**。
+
+**用户给的模型（照此实现）**：*窗子 actor 是拖上去的，**只有这段期间需要打射线**；一旦 attach
+到宿主，它就切换成「按锚点记录位置」的模式。* 射线因此只出现在 `OnHandleDrag`（拖拽事件的
+唯一执行面），**加载 / 房子重建 / 撤销三条路一律只读锚点，不打射线**。
+
+⚠️ **教训（推广到所有会回写 transform 的抓手）**：程序回写 actor 变换**只在最终裁决时做**。
+中途回写会把一次本来能自愈的误判变成不可逆的锁定 —— 因为下一次判据的输入正是你刚写进去的那个错值。
+
+⚠️ **合成事件本身也已根除（同日稍晚）**：一度以为"让基类忽略那次合成事件会动到拉尺寸抓手"，
+**核实是错的** —— `ACSHouseResizeHandleActor` 是 `UCLASS(NotBlueprintable, NotPlaceable)`，
+且只由房子在 `EnterResizeMode` 里用 `World->SpawnActor` 生成（`CSHouseActor.cpp`），
+**从来收不到 `AddActor` 的合成事件**；纪律 ③ 实际上只有窗标记会走到。
+于是基类 `PostEditMove` 直接从"降级"改成"**跳过**"：
+
+```cpp
+const bool bSynthetic = bFinished && !bHasBeenPlaced;
+bHasBeenPlaced = true;
+if (bSynthetic) return;        // 旋转还没应用，拿它解析会咬错宿主
+HandleDrag(bFinished);
+```
+
+跳过是安全的：真正的放置一定还会来事件 —— 拖入视口时后续的悬停移动会发 `PostEditMove(false)`，
+无头脚本则显式调 `HandleDrag`。探针实测：`SPAWN` 那一行现在是 `host=None attach=None edge=-1`，
+误 latch 彻底消失；`AFTER-RESOLVE` 仍是 House_Road / cut=True / `markers=1 windows=2`。
+
+#### 回归的既存基线红（**不是**本轮造成的）
+
+`passed=228 failed=3`，三条全在门/拱段，与标记这条路无关：
+`road across the house opens 6 arches doors=2` / `frame brick count is in the right ballpark bricks=144` /
+`adjacent arches leave pier spans piers=0`。⚠️ 与记忆里那条"两条失败 + 提前中止"的旧基线**对不上**
+（现在是三条、且不再提前中止）——本轮没有去查它们的成因，只确认了修改前后这三条一模一样。
+- 预制框翻边宽度是否盖得住④逐像素切口的锯齿 —— TG 的 `window_cottage_1x1` 是 78×17×160 的框板，对 26 cm 砖应当够，P1 出图验。
+
+
 ### 验收门
 
 ```bash
@@ -953,15 +2387,20 @@ DF/RT 表示**，所以房子在屏幕内时已经在给 Lumen 贡献遮挡与�
 "D:/UE-SourceCode-5.7.4/Engine/Build/BatchFiles/Build.bat" UETest574Editor Win64 Development \
   -Project="D:/MyProject/UnrealProject/UETest574/UETest574.uproject" -WaitMutex
 
-# 单测 61/61；回归 passed=95 failed=0；七条 flushes=0
+# 单测：2026-08-31 岩壳体积那一轮实测 Result={Success} × 103、Result={Fail…} × 0
 "D:/UE-SourceCode-5.7.4/Engine/Binaries/Win64/UnrealEditor-Cmd.exe" <uproject> \
   -ExecCmds="Automation RunTests PCGPlugins; Quit" -unattended -nopause -nosplash -abslog=<独立日志>
 
-# 演示回归（S1 加了 demo_gpu_stairs 一节）
+# 演示回归（S1 加了 demo_gpu_stairs 一节）：同轮实测 passed=225 failed=0、REGRESS OK
+# ⚠️ -ExecutePythonScript 的相对路径是相对 **Engine/Binaries/Win64** 解析的，不是项目目录 ——
+#    写相对路径会得到 "Could not load Python file"（实测）。给绝对路径。
 "D:/UE-SourceCode-5.7.4/Engine/Binaries/Win64/UnrealEditor-Cmd.exe" <uproject> \
-  -ExecutePythonScript="Plugins/PCGPlugins/Scripts/TinyGladeDemoRegression.py" \
+  -ExecutePythonScript="D:/MyProject/UnrealProject/UETest574/Plugins/PCGPlugins/Scripts/TinyGladeDemoRegression.py" \
   -unattended -nopause -nosplash -abslog=<独立日志>
 ```
+
+⚠️ 上面两条的 **`-abslog=<路径>` 实测不写文件**（`-nosplash -unattended` 下试过绝对路径、
+目录已存在）。要拿到日志就 `-stdout -FullStdOutLogOutput` 再把 stdout 重定向到文件。
 
 按**日志断言**判定（`REGRESS OK` / `Result={Success}` 计数），**不信退出码**。
 
@@ -1081,7 +2520,7 @@ DF/RT 表示**，所以房子在屏幕内时已经在给 Lumen 贡献遮挡与�
 
 #### 提取资产：网格几乎不缺，缺的是材质
 
-`Content/TinyGlade/Meshes/` 实有 **474 个** StaticMesh。窗户全家桶（cottage/gothic × rank1-3）、
+`Content/HouseTest/TinyGladeAsset/Meshes/` 实有 **474 个** StaticMesh。窗户全家桶（cottage/gothic × rank1-3）、
 `setdressing_window_sill/lintel`、58 个 clutter、`ivy_branch/leaf/flower` 全在。
 
 只缺 7 个，且全是**导入器会丢的退化网格**：6 个 `window_cottage_*_flowerbed_locations`
@@ -1122,6 +2561,7 @@ DF/RT 表示**，所以房子在屏幕内时已经在给 Lumen 贡献遮挡与�
 | unity 构建掩盖缺失 include | 全量过、`-SingleFile` 挂 | 新 TU 的 file-local helper 加模块前缀；改完用 `-SingleFile` 验 |
 | CDO 默认值不传播到已存在实例 | 脚本设了参数却"没生效" | 实例上必须再写一份 |
 | 笔刷是 3D 球 | 坡面上整段落空，像"路没画上" | 脚本落笔必须自己 `SampleHeight` 贴地 |
+| **派生链的重建判据只看了"另一样东西"** | 岩壳/石阶/摆件停在陈旧位移上：碎石长在地图另一头，而 `SampleHeight` 正常、演示回归全绿（回归在量之前先画路，把它治好了；三条断言又都是相对塑形物自身位置分类的） | `RefreshHeightsInRegion` 的 `!bChanged` 早退门必须放三条派生链过去 —— 它们各有幂等守卫，空转不要钱。加载时序是「塑形物先注册、后落变换」，别假设注册那一刻拿到的是最终变换 |
 | **弧长比例 ≠ 样条参数** | 块沿曲线**疏密不均**：密处互相穿插只露一条薄片（看着像"朝向错了/有透明"），疏处留大洞 | `ScatterGroundStepsCS` 把 `Rec.x` 当**均匀 B 样条参数**用，只有控制点等弧长时才等价于弧长比例。地形石阶的等角圆环天生满足，门框的「门樘→拱→门樘」不满足（实测控制点间距比 **16.9:1**，17/19 块砖挤在拱上、间距 10.9 cm 而砖长 26 cm）。**喂控制点前必须先重采样成等弧长**（`CSShaperSteps::ResampleUniform`），契约已写进 `FCurve` |
 
 ---
@@ -1151,7 +2591,7 @@ DF/RT 表示**，所以房子在屏幕内时已经在给 Lumen 贡献遮挡与�
 | `[PATH]` | `D:/MyProject/Tiny Glade/tmp/pdb_paths.txt` |
 | `[GLSL]` | `D:/MyProject/Tiny Glade/tmp/shaders/` 反编译产物 |
 | `[资产]` | `D:/MyProject/Tiny Glade/assets/` 实测 |
-| `[UE资产]` | `Content/TinyGlade/` 实测 |
+| `[UE资产]` | `Content/HouseTest/TinyGladeAsset/` 实测 |
 | `[代码]` | 本仓 `Source/ComputeShaderGenerator/` |
 | `[分析]` | `MESH_GENERATION_ANALYSIS.md` |
 
@@ -1480,9 +2920,17 @@ construct_brick_columns`、`util_cross_brick_pillar::construct_crossbrick_pillar
 
 #### 3.1 交互设施：零
 
-全 `Source/` 树 0 命中：`ResizeHandle` / `CSHouseResizeHandleActor` / `OnResizeModeChanged` /
-`SelectionWatcher` / `EnterResizeMode` / `ExitResizeMode` / `NotifyHandleDragged` /
-`HHitProxy` / `UGizmo` / `InteractiveGizmo`。计划 D5 是**纯白纸**。
+~~全 `Source/` 树 0 命中：`ResizeHandle` / `CSHouseResizeHandleActor` / `OnResizeModeChanged` /
+`SelectionWatcher` / `EnterResizeMode` / `ExitResizeMode`。计划 D5 是**纯白纸**。~~
+
+> ✅ **本节 2026-09-05 整条作废：D5 三层全部落地。** 机制层（`CSHouseResize.h` + `PushEdge`）
+> 2026-08-31，交互层（`ACSHouseResizeHandleActor` + `EnterResizeMode` / `ExitResizeMode` /
+> `OnResizeModeChanged` + `FCSHouseResizeSelectionWatcher`）2026-09-05。
+> `NotifyHandleDragged` 仍是 0 命中，但那个名字**从未存在过** —— 机制入口叫 `PushEdge`。
+>
+> **仍然成立的是 `HHitProxy` / `UGizmo` / `InteractiveGizmo` 三个 0 命中**，而且这是用户裁决的
+> 结果而非空白：抓手是真 actor，点选 / 框选 / 多视口全部白拿编辑器原生能力，不写一行 gizmo 代码。
+> 零阻塞纪律也已在这条路上验过（`push_edge` 拖 12 帧 flush = 0）。
 
 已有的边角料：`FCSBrushEdModeBase`（`PCGEditorProcess/Private/CSBrushEdModeBase.h:55`，
 三个笔刷子类，且 `:71-74` **主动关掉 transform widget**）；
@@ -1670,10 +3118,10 @@ TG 对位物：`generate_roof_stone_floor_and_roof_bottom` + `_nani_roof_floor` 
 - **部件身份走顶点色 R**：`ECSHousePart { Wall=0, Roof=1, Gable=2, Frame=3, Pillar=4 }`
   （`CSHouseActor.h:21-30`；通道字典在 `:48-67`，自称"全项目唯一仲裁点"）。
   **角柱应取 5**。
-- **砖资产已在**：`/Game/TinyGlade/Meshes/brick/StaticMeshes/brick`（100³ 中心立方，`[UE资产]`），
+- **砖资产已在**：`/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/brick`（100³ 中心立方，`[UE资产]`），
   已经是 `FrameBrickMesh` 的默认目标；`EnsureFrameComponent`（`:889-898`）已从它的 bounds
   推 `BlockSize`。**角柱 / 裙砖零新资产。**
-- **`Content/TinyGlade/` 里同样没有任何角柱 / 护角 / 墙裙 / 脊瓦 / 收边预制件**
+- **`Content/HouseTest/TinyGladeAsset/` 里同样没有任何角柱 / 护角 / 墙裙 / 脊瓦 / 收边预制件**
   （474 个网格 grep 过 `pillar|column|quoin|plinth|skirt|trim|coping|capping|merlon|stitch|pier|post|block|base`，
   全部 0；`corner` 的 24 个命中全是 UI 箭头 / 旗杆 / 绕角窗）。与 TG 一致 —— **本来就该用砖砌**。
   勉强可用的线性件：`roof_support_beam`、`wooden_plank_straight`；capping 形状最近的是
@@ -1776,13 +3224,18 @@ TG 的 `flags&4` 分支给砖沿墙 / 穿墙 ×1.045、竖直 ×0.95（§1.3）�
 <a id="a7"></a>
 #### A7 —— 转角护角砖（D7 的"墙自身转角"部分，**不依赖任何接缝设施**）
 
+> ✅ **已落地（2026-08-31）** —— `CSHouseQuoin.h`，见卷零「转角角石已落地」。落地时抓到并修掉了
+> 一个真缺陷（`Seed ^ (Index*K)` 在 `Index==0` 时是恒等映射）。
+>
+> ⚠️ **本条的措辞已被[卷五 A11](#vol-5) 订正**（2026-08-31）：转角砖不只是「和门框砖共用一路」，它和垛口、勒脚、门框墩在 TG 里**共用同一个排布求解器** —— 落地时并进 `SolveBlockLayout`，别另起一套。
+
 **工作量：中（约 100 行，复用 `BuildFramePlan` 形态）** · **风险：低**
 
 对位 TG 的 `wall_corners::add_wall_corners`。在四个角各立一根**叠砖角柱**，
 从 Z=0 砌到 `WallHeight`（或到起拱线），截面略大于 `WallThickness` 以盖住
 §4.1 的 UV 岛断裂与硬棱。
 
-- **资产零新增**：`/Game/TinyGlade/Meshes/brick/StaticMeshes/brick`，
+- **资产零新增**：`/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/brick`，
   链路 `CSShaperSteps::{FCurve, ReserveCapacity, EnsureCapacity, Scatter}` +
   `UCSGpuInstancedMeshComponent` —— **与门框砖同一条**（`RebuildFrame` / `BuildFramePlan`
   `CSHouseActor.cpp:1066-1105` / `:935-1064` 是可逐行照抄的模板）。
@@ -1796,6 +3249,9 @@ TG 的 `flags&4` 分支给砖沿墙 / 穿墙 ×1.045、竖直 ×0.95（§1.3）�
 
 <a id="a8"></a>
 #### A8 —— 墙裙（`add_skirts` 的对位物）
+
+> ✅ **已落地（2026-08-31）** —— `CSHouseTrim.h`，做成了**两条带**（墙顶压顶 + 墙脚勒脚），
+> 见卷零「包边石已落地」。勒脚按洞切段，判据是段数不是砖数。
 
 **工作量：中（约 80 行）** · **风险：中（与 D9 承重柱的归属要划清）**
 
@@ -1841,9 +3297,13 @@ TG 的顺序是**先开洞、再缝砖**（§2.2），
 <a id="c-d5-1"></a>
 #### C-D5-1：TG 的屋脊是**连续脊长**，本项目是**离散翻轴 + 滞回**
 
-- 本项目：`RidgeAxis`（`ECSRidgeAxis`，`CSHouseActor.h:112-113`，`NonTransactional`）+
+> ✅ **本冲突已于 2026-08-31 关闭：用户选 TG 侧（连续），裁决四作废。** 下面「本项目」那一栏
+> 描述的是**已删除的旧实现**，现行是 `FCSRoofDesc::bRidgeAlongX()` 派生脊向 + 四坡屋顶。
+> 留档在此是为了看懂当时的三个选项，别照着实现。
+
+- ~~本项目：`RidgeAxis`（`ECSRidgeAxis`，`CSHouseActor.h:112-113`，`NonTransactional`）+
   `RidgeSwitchRatio = 1.15`（`:116-117`）+ `CSHouseRoof_ChooseRidgeAxis` 滞回 +
-  一条钉死"连续单边推拉扫过穿越点全程恰好翻一次"的单测。
+  一条钉死"连续单边推拉扫过穿越点全程恰好翻一次"的单测。~~（整套已删）
 - TG：`roof_shape::ridge_length_01_from_rectangle_ratio`（`[PDB]`）—— **脊长是矩形长宽比的
   连续函数**，接近正方形时脊长 → 0，gable 连续退化成 pyramid/hip。
   **「脊朝哪」这个问题在 TG 里根本不出现**，所以既不需要滞回，也不需要那条单测。
@@ -1974,7 +3434,7 @@ spawn_stitch_bricks           3 参：InterShapeBrickStitches + AssetSsboLibrary
 | `[PATH]` | `D:/MyProject/Tiny Glade/tmp/pdb_paths.txt` 里的 `crates/**/*.rs` 源码树 |
 | `[GLSL]` | `D:/MyProject/Tiny Glade/tmp/shaders/`（272 个反编译着色器） |
 | `[资产]` | `D:/MyProject/Tiny Glade/assets/meshes/**.json` 逐顶点实测（TG 单位为米） |
-| `[UE资产]` | `D:/MyProject/UnrealProject/UETest574/Content/TinyGlade/` 实际文件清点 |
+| `[UE资产]` | `D:/MyProject/UnrealProject/UETest574/Content/HouseTest/TinyGladeAsset/` 实际文件清点 |
 | `[代码]` | 本仓 `Source/ComputeShaderGenerator/` |
 | `[分析]` | `D:/MyProject/Tiny Glade/MESH_GENERATION_ANALYSIS.md` |
 
@@ -1988,327 +3448,31 @@ spawn_stitch_bricks           3 参：InterShapeBrickStitches + AssetSsboLibrary
 
 ### 一、窗户不是门那套机制 —— 两边都不是，而且本项目其实更强
 
-这是本文最重要的一条：**TG 的窗洞与门拱走的是两条完全不同的路，而本项目今天已经落地的
-逐像素 clip 场比 TG 的强一档，窗户不需要任何新机制**。
-
-#### 1.1 TG 墙砖的逐像素裁剪只有**一个下界**，表达不了窗【确凿】
-
-`[GLSL] _wall_wall_brick_lod0.raster...b903e43f.ps_main.glsl` 全文只有**两处** `discard`（L157 / L172），
-且是同一个判据的正反两支：
-
-```glsl
-if (拱圈石标志 && world_y < 拱高) discard;   // 普通墙砖：拱线以下丢掉 → 挖出拱洞
-else if (反向标志 && world_y > 拱高) discard; // flags&8 拱圈石：拱线以上丢掉
-```
-
-`world_y` 是世界高度、`拱高` 是 VS 从每砖 `vec3 global_arch_height_vals` 三点插值出来的**一维曲线**
-（`[分析]` §1.4 / §1.6 已给出结构）。**这是一条只有下界的高度阈值** —— 它能挖出「从地面到拱顶」
-的门，**在结构上不可能挖出「有窗台又有窗楣」的窗**（那需要同时给上下两条边界）。
-
-⇒ **「TG 的窗户也是 analytic clip」这个假设可以直接排除。**
-
-#### 1.2 TG 的窗洞是 **CPU 裁砖**，洞缘由预制窗框盖住【确凿 + 局部推测】
-
-窗洞进的是同一张 `WallHoles` 表，但消费方式不同：
-
-- `[PDB]` L9100（**`decorator_visual::maintain_visual_entities`**，按参数匹配【推测】，
-  但它是全仓唯一同时握 `WallHoles` 与 `WindowAutoClutterCandidates` 的系统）：
-
-  ```text
-  写: DecoratorVisualState · WallHoles · RaycastWorld · DecoratorPhysicsColliders
-      · WindowAutoClutterCandidates · WallAttachedDecoTracker<ChimneyAssemblyParams>
-      · WallAttachedDecoTracker<DoorStairsAssemblyParams>
-  读: DecoratorBlueprints · PrevDecoratorBlueprints · AssetMesh/Shader/TextureLibrary
-  听: OnWallDeleted
-  ```
-
-  ⇒ **装饰物装配系统确实写洞表**。这把 `[分析]` §1.3 里「窗 decorator 产洞为【合理推测】」
-  提升到【推测（强）】—— 仍差一条「`generate_cottage_wall_windows` 调用了 `WallHoles::add`」的调用边，
-  PDB 只给符号名。
-- 洞表的消费者是 CPU 排砖：`[PDB]` `utils::trim_rows::{RowTrimmerSink, TrimmedRow, above_to_below,
-  below_to_above}` + `utils::resolve_hole_overlap` + `WallConstructor::from_curve::normalize_holes`。
-  `above_to_below` / `below_to_above` 这对名字说明**修剪器要处理「砖排从洞上方走到洞下方」的过渡**
-  ⇒ 洞有上下两条边界【推测，推理链即这两个函数名 + 窗必须有窗楣这一常识】。
-- 灰泥墙也吃洞：`plaster_systems::mirror_holes_as_needed` `[PDB]`。而 `[GLSL] _nani_plaster...ps_main`
-  的两处 `discard` 是**灰泥剥落 alpha**（`smoothstep` + 噪声），**不是洞** ⇒ 灰泥的洞是真几何。
-- 洞缘的观感由**预制窗框网格**兜底，不是靠切得准：`window_cottage_1x1` 是 78×17×160 cm 的
-  一块薄框板，覆在裁出来的洞口上 `[资产]`。
-
-⇒ **TG 的窗 = CPU 裁砖出一个粗洞 + 一块预制框盖住洞缘。**
-
-#### 1.3 窗楣／窗台：cottage 是预制件，gothic 是**整条拱带被三骨点掰弯**【确凿】
-
-这条直接回答「窗台/窗楣是不是也和门框一样用砖块沿曲线摆」——**都不是**。
-
-| 样式 | TG 的做法 | 证据 |
-| --- | --- | --- |
-| cottage 窗楣 | `cottage_wall_window::add_lintels` 摆**预制过梁件** `setdressing_window_lintel`（125×65×15 cm） | `[PDB]` + `[资产]` |
-| cottage 窗台 | 预制 `setdressing_window_sill`（78.1×38×12 cm）；转角窗自带 `window_cottage_corner_1x1_sill` | `[资产]` |
-| gothic 窗楣 | **一整块作者建好的拱带 `window_gothic_*_hat`**，用 3 个骨点在 VS 里掰弯贴合墙 | `[GLSL]` + `[资产]` |
-
-gothic 那条值得展开，因为它最容易被误读成「沿曲线摆砖」：
-
-`[GLSL] _nani_gothic_window_bricks.raster...vs_main.glsl` 的实例结构是
-
-```glsl
-struct InstanceData {
-    Affine3Packed xform;  int seed;  int _wall_id;
-    uint wallspace_x_range_packed;   uint _is_wooden;
-    vec3 bone_0_pos; uint bone_0_normal_packed;   // 左
-    vec3 bone_1_pos; uint bone_1_normal_packed;   // 中
-    vec3 bone_2_pos; uint bone_2_normal_packed;   // 右
-};
-```
-
-顶点流是 `Vertex_Position / Normal / UV / is_bevel / brick_id / bbx_x`。VS 拿逐顶点的
-`bbx_x ∈ [0,1]`（顶点在拱带包围盒里的归一化横坐标）做二段线性蒙皮：`bbx_x < 0.5` 在
-bone0→bone1 之间插值、`≥ 0.5` 在 bone1→bone2 之间插值，法线同插值后用来搭截面朝向基。
-
-关键实测：`window_gothic_1x1_hat.json` **236 个三角形、`brick_id` 全为 0、`bbx_x` 满量程 0..1** `[资产]`
-⇒ **整条拱带是一个 nani 实例，不是 N 块砖**。3 个骨点存在的唯一理由是 **TG 的墙是曲线**，
-一整块直的拱带要能贴到弯墙上。
-
-- 三个 hat 的实测尺寸（UE cm，宽×深×高）：`gothic_1x1_hat` 94.2×68.1×93.0、
-  `gothic_3x1_hat` 192.0×68.1×177.3、`gothic_1x1_hat_full` 95.1×68.1×221.6 `[资产]`。
-- 全部 11 个带 `bbx_x`/`brick_id` 的资产都是 `*_hat` `[资产]`。
-
-**⇒ `flags&32`（拱压扁 + 三平面 UV + 免拱裁剪）对窗户不成立【确凿】。**
-`flags` 是**墙砖专用管线**的位域（`[分析]` §1.7），而
-`GothicWindowBricksInstanceData` **根本没有 flags 字段**，走的是另一套 nani subset
-（`_nani_gothic_window_bricks.raster`，`[分析]` §1.4 已点名「窗框砖不走此管线」）。
-把 `flags&32` 的语义外推到窗户是一次误读。
-
-#### 1.4 本项目的裁剪场比 TG 强一档 —— 窗户零新机制【确凿】
-
-`FCSOpeningClipField` `[代码] CSHouseProfile.h:224-297` 存的是**二维** `q = ((S−Cs)·invHW, (Z−RefZ)·invSZ)`，
-三种形状各自封闭判据：
-
-```text
-Arch   q.y ≤ 0 ? |q.x| < 1 : dot(q,q) < 1
-Rect   max(|q.x|, |q.y|) < 1
-Circle dot(q,q) < 1
-```
-
-`Rect` 与 `Circle` **上下都有界** ⇒ **矩形窗与圆窗今天就能被逐像素切出来，一行 shader 都不用加**。
-`Arch` 在拱脚以下无下界是**故意的**（`CSHouseProfile.h:212-215` 已写明理由：窗台那一截由
-`RebuildBodyMesh` 生成的实心盒承担，判据因此只要两个 float）。
-
-而 `RebuildBodyMesh` `[代码] CSHouseActor.cpp:562-577` 的 `AddPanel(SA, SB, Z0, Field, Tag)` **已经**
-在 `Z0 > 0.5` 时另砌一块实心窗台盒：
-
-```cpp
-Writer.AddBox(Start + U*SA + Up*Z0, U*(SB-SA), In*T, Up*(H - Z0), SlotWall);   // 带 clip 的洞板
-if (Z0 > 0.5f) { /* 无 clip */ Writer.AddBox(Start + U*SA, U*(SB-SA), In*T, Up*Z0, SlotWall); }  // 窗台
-```
-
-`BuildFramePlan` `[代码] CSHouseActor.cpp:1050-1058` 也**已经**有窗台砖分支：
-
-```cpp
-bool bAnySill = false;
-for (const FCSOpeningProfileSample& S : Samples) bAnySill |= S.ZLow > 1.0f;
-if (bAnySill) { /* 沿下边界再铺一条砖 */ EmitCurve(Path, CentreLocal, -In, Salt | 0x10000); }
-```
-
-⇒ **「窗户复用已有的 opening + per-pixel clip 设施」这条计划口径完全成立，
-而且底层三处（clip 场 / 墙板 / 门框砖）全都预留好了窗的分支，一行都不用改。**
-缺的全部在**上层**（谁来提诉求、拿什么形状、怎么让位），见第三、第四节。
-
-一条口径订正提给计划：D8 那一节写「D8 窗户沿用同一形态」并把逐像素 clip 描述成
-「Tiny Glade 的做法……作为可选优化留在 D14」`[计划:10]`。事实是：**TG 的门拱确实用逐像素 clip，
-但 TG 的窗户不用**；本项目让窗户也走 clip 是**自有改进**，比 TG 更省几何、洞缘精度更高。
-措辞值得订正，做法不必改（同门拱那条「不是依据 TG」的订正）。
+> **本节正文已迁出到 [`TinyGladeWindow.md`](TinyGladeWindow.md#一窗户不是门那套机制--两边都不是而且本项目其实更强)**（2026-09-06 文档重组）。含 1.1 / 1.2 / 1.2b / 1.2c / 1.3 / 1.4 六个子节。
+> 搬过去的是**正文**，证据等级标注【确凿】/【推测】、表格、代码块、删除线作废段一字未改。
+> 别处引用的「卷二 §1.2」「卷二 §1.3」「§1.4」落点都在那篇里。
 
 ---
 
 ### 二、窗户的触发规则：**玩家手放**，不是墙面剩余空间自动填充【确凿】
 
-这条与门那条（拱由墙自身折线分段驱动、与道路无关）对照着看很重要：**TG 的门与窗触发方式完全不同**。
-门是墙的派生物；窗是**玩家显式放置的、可序列化、可撤销的实体**。
-
-#### 2.1 创建链全部在 UI 系统里【确凿】
-
-`[PDB]` L9344 = `ui_place_decorator`（按 `PlaceDecoratorInteractionState` 唯一匹配）：
-
-```text
-读:  RaycastWorld · CursorPositionSS · Modifiers · UiState · AppMode · Time
-     PublicWalls · Query<&Roof> · TerrainHeightsData · GladeBorder · WallColorIds
-     DeferredDecoratorOpEvents · CachedDecoratorTransforms · DecoratorAffordanceDispatcher
-写:  DecoratorStorage · DecoratorArchivist · DecoratorIdGen · DecoratorBackup
-     StairsState · StairsRemovedSupports · MoveDecoratorDeltaPositions
-     DeferredDecoratorEditHistory · PlaceDecoratorInteractionState
-听:  EvInitPlaceDecoratorInteractionState · InstaCreateDeco · InstaCreateStairPoint
-```
-
-配套 `[PATH]`：
-`ui_systems/{ui_place_decorator, ui_move_decorator, calculate_decorator_dst,
-calculate_decorator_grab_offset, decorator_interaction_intent, ui_decorator_affordance_dispatch}.rs`。
-
-**决定性的一条**：`calculate_decorator_dst::convert_raycast_hit_to_decorator_dst` `[PDB]` ——
-**放置目标由一次光标射线命中转换成 `DecoratorDst`**，而 `DecoratorDst` 是
-`{ WallAttachment | RoofAttachment | StairAttachment | TerrainAttachment }` 四选一 `[PDB]`。
-
-⇒ 与本项目 D8「射线检测命中房子 → attach → 吸附到命中墙面」**逐条同构**。
-
-#### 2.2 拖拽链：TG 的形态与 D8 的裁决逐条对得上【确凿】
-
-`[PDB]` L8712 = `ui_move_decorator`（按 `CacheDecoclutterRotationOnGrab` + `MoveDecoratorDeltaPositions` 匹配）：
-
-| D8 的裁决 `[计划]` | TG 的对位物 `[PDB]` | 对得上吗 |
-| --- | --- | --- |
-| 拖拽期间逐 tick 解析宿主 | `CameraCursorRay` + `CursorPositionSS` + `RaycastWorld` 每帧 | ✅ |
-| 房子是参数化 OBB，用解析求交不用引擎 trace | `Query<&WallTriggerVolume>` / `Query<&RoofTriggerVolume>`；`WallTriggerVolume::{recompute, recompute_quads, get_position_from_mesh_uv}` | ✅ 形态同构（TG 是每墙一个 quad 触发体） |
-| 松手时被拒则弹回 `LastAcceptedWorld` | **`ResMut<backup::DecoratorBackup>`** —— 拖拽前先备份 | ✅ **同名同义** |
-| 换宿主：旧宿主注销 + 新宿主登记 | `EventWriter<ReanchorDecorators>` + `move_decorators_following_anchors` `[PATH]` | ✅ |
-| 越界不生成 | `GladeBorder` + `DisplayOutOfBorder` / `FeedbackInputOutOfBorder` | ✅ |
-| 编辑器里要区分「已生成 / 被拒（附原因）」 | `NotifyHintSystemWindow`（onboarding 提示）+ `decorator_cursor_icon` / `show_decorator_icon` | 部分（TG 用光标图标 + 引导提示，不是线框变色） |
-
-#### 2.3 「房子裁决」的对位物：`validate_blueprints`【推测（强）】
-
-`[PDB]` L8815：
-
-```text
-读: DecoratorStorage · PublicWalls · TerrainHeightsData · WaterRaster · ActiveSession
-写: DecoratorBlueprints
-```
-
-一个「拿墙 + 地形 + 水面复核已存储的装饰物、产出（或不产出）蓝图」的系统 ——
-`[PATH]` 里正好有 `blueprint::validate_blueprints` 且 `[PDB]` 有
-`validate_blueprints::closure$0::closure$0`。**这就是本项目 `QueryFeaturePlacement` 的对位物**：
-存储层保留玩家的诉求，蓝图层每帧重新裁决要不要出。
-
-配套三条【确凿】：
-
-- `blueprint::{clear_blueprints, copy_blueprints_to_prev, iter_maybe_modified}` + `PrevDecoratorBlueprints`
-  ⇒ 蓝图是**每帧重建的派生物 + 上帧差分**，与本项目「声明式重求值 + 哈希短路」同形。
-- `DecoratorStorage` 带 serde `serialize/deserialize` `[PDB]`
-  ⇒ **诉求持久化，派生物不持久化** —— 与本项目「标记 actor 持参数、openings 表 `Transient`」逐条同构。
-- `cull_oob_decorators` / `decorator_on_{wall_height_changed, rectangle_edited, move_shape,
-  freehand_wall_edited}` `[PATH]` ⇒ 墙一变就重判，墙没了就剔掉，与 D8「宿主被删 → 标记自毁」同形。
-
-#### 2.4 唯一的「自动」成分：rank + 合并/拆分，**不是**填满剩余空间【确凿】
-
-- `DecoratorRank` + `DecoratorType::max_rank` `[PDB]`；资产实测 rank ∈ {1,2,3}：
-
-  | 资产 | 宽 (UE cm) | 深 | 高 | 局部 Z 范围 |
-  | --- | --- | --- | --- | --- |
-  | `window_cottage_1x1` | 78.0 | 17.0 | 160.0 | [−80, +80] |
-  | `window_cottage_2x1` | 143.5 | 18.0 | 160.0 | [−80, +80] |
-  | `window_cottage_3x1` | 213.0 | 53.8 | 170.0 | [−85, +85] |
-  | `window_gothic_1x1` | 69.4 | 20.7 | 203.6 | [−95.3, +108.3] |
-  | `window_gothic_2x1` | 117.2 | 20.7 | 248.1 | [−95.3, +152.8] |
-  | `window_gothic_3x1` | 151.9 | 20.7 | 295.4 | [−95.3, +200.1] |
-  | `window_cottage_corner_1x1` | 113.9 | 29.6 | 160.0 | [−80, +80] |
-  | `arrow_slit_1x1` | 50.0 | 56.0 | 50.0 | [−25, +25] |
-  | （参照）`door` | 120.0 | 75.0 | 250.0 | [−125, +125] |
-
-  两条读法：① cottage 的**窗台高固定**（三个 rank 的 Z 都居中，rank 只加宽）；
-  ② gothic 的**下沿固定在 −95.3、上沿随 rank 长高**（尖拱越宽越高）——
-  这正是「rank 越大拱越高」的作者制表现，不是程序算的。
-- `merge_proposal_wall_decorators::{find_best_wall_decorator_merge_position,
-  propose_wall_decorator_merge_position_inner}` `[PDB]` ⇒ 拖一扇窗靠近另一扇时，
-  **提议一个合并位置**（两扇 1x1 合成一扇 2x1）。
-- `ui_systems::handle_splitting_wall_decorators::{display_decorator_wall_parts_and_get_hovered_part_id,
-  handle_moving_out_wall_decorator_part}` `[PDB]` ⇒ 从合并体里**拖一块出来**再拆开。
-- `onboarding/hint_unlink_windows.rs` `[PATH]` ⇒ 游戏专门教这个操作。
-
-⇒ 这是**在玩家手放的基础上做吸附与合并**，不是「墙剩下多少就填多少」。
-
-#### 2.5 全仓找不到任何「剩余空间自动填窗」的系统【确凿（否定式，含边界）】
-
-把 `[PDB]` 里所有含 `DecoratorStorage` / `DecoratorBlueprints` 的系统签名解出来，
-产出装饰物的只有四类：① UI 放置/移动；② `validate_blueprints` 复核；③ 墙变化时的重锚/剔除；
-④ `add_preplaced_autoclutter`（读 `PreplacedAutoClutter`，只在 `NewSessionStartedCmd` /
-`SessionLoadedCmd` 触发，是**开局预置存档**，不是运行时填充）。
-
-**没有任何系统读墙长度或 `WallPathSegmentationMasks` 去分配窗位。**
-（对比：门那条链是 `construct_gates` ← `ArchSegments` / `LintelSegments` /
-`WallPathSegmentationMasksMinusStairs`，见状态文件的门洞小节 —— 窗这条链**一个 segmentation 都不读**。）
-
-⚠️ 否定式结论的边界：PDB 只能证明「没有这样一个 **Bevy 系统**」。若 TG 把它写成
-被别的系统内联调用的自由函数，符号名里也不会出现「auto place window」这类词。
-要彻底确证需要反编译 `validate_blueprints` 与 `instantiate_blueprints` 的函数体。
+> **本节正文已迁出到 [`TinyGladeWindow.md`](TinyGladeWindow.md#二窗户的触发规则玩家手放不是墙面剩余空间自动填充确凿)**（2026-09-06 文档重组）。含 2.1 / 2.2 / 2.3 / 2.4 / 2.5 五个子节。
+> 搬过去的是**正文**，证据等级标注【确凿】/【推测】、表格、代码块、删除线作废段一字未改。
 
 ---
 
 ### 三、`FCSWallOpening` 够不够表达窗户：够挖洞，不够摆框
 
-`[代码] CSHouseProfile.h:56-120` 的现状字段：
-`Type / Shape / EdgeIndex / CenterS / Width / Z0 / Z1 / AxisUS / Skew / SourceId / Tag`。
-
-**挖洞这一半已经够了**：`ECSOpeningType::Window` 与 `ECSOpeningShape::{Arch, Rect, Circle}` 都在，
-`Z0` 表达窗台、`Z1` 表达窗顶，`CSHouse_ComputeClipField` 三种形状全覆盖。
-
-**缺的是「洞之外」的六件事**（按落地代价排序）：
-
-| # | 缺什么 | 为什么现有字段顶不上 | 建议形态 |
-| --- | --- | --- | --- |
-| W1 | **裁决回执** | 计划 D8 要求把结果回写标记（`bCausesCut` + 拒绝原因），`QueryFeaturePlacement` 现在**只返回 bool** `[代码] CSHouseActor.h:330` | 改签名返回 `FCSFeaturePlacement{ bAccepted, Reason, SnappedWorld }`（计划已给结构体，只是没落地）。**纯加法，无裁决冲突** |
-| W2 | **窗框资产引用** | 洞只描述空气，窗扇/玻璃/框是实体。TG 一扇窗 = 一组 mesh（主体 + `_glass` + `_collision` + `_interaction` + `_outline` + `_flowerbed_locations`）`[资产]` | 不进 `FCSWallOpening`（它是纯几何契约）；放标记 actor 上，由房子在 `RebuildFrame` 之外另开一条实例通路 |
-| W3 | **样式/rank 枚举** | TG 有 cottage/gothic × rank1..3 × 转角/老虎窗四个维度；本项目 `Shape` 只有三种**纯几何**原型 | `ECSOpeningShape` 加 `PointedArch`（尖拱，gothic 的洞形），样式与 rank 留在标记 actor 上不进洞 |
-| W4 | **跨边转角窗** | `EdgeIndex` 是单个 int，`CenterS` 是单边弧长 —— `window_cottage_corner_*` 那种**骑在墙角上**的窗表达不了 | 与 D6「跨转角的洞正是 `AxisUS` 的第一个非楼梯场景」是同一件事，一并设计；**触碰计划 D6 的转角墩一节，需拍板** |
-| W5 | **`Tag` 已被门占满** | `Tag` 现在写的是门的 `Slot & 0xFF` `[代码] CSHouseActor.cpp:301`，进顶点色 G 通道做悬停高亮；窗要区分「门/窗/被拒」得抢同一个字节 | D14 的通道字典问题，先记账 |
-| W6 | **`Z0` 没有下限守卫** | `QueryFeaturePlacement` 只判 `Z0 < 0` `[代码] CSHouseActor.cpp:353`；窗台压在地面上（`Z0` 极小）时几何合法但观感荒唐 | 加 `csh.WindowMinSillZ`；**纯加法** |
-
-⚠️ **不缺**的两样，别顺手加：`AxisUS` 与 `Skew` 对普通窗恒为 `(0,1)` 与 `0`
-（`CSHouseProfile.h:57-64` 的注释已写明它们是为楼梯与转角洞预留的），
-窗户**不要**去用它们，否则 W4 真做时语义会打架。
+> **本节正文已迁出到 [`TinyGladeWindow.md`](TinyGladeWindow.md#三fcswallopening-够不够表达窗户够挖洞不够摆框)**（2026-09-06 文档重组）。含 W1–W6 那张表（包括已作废的 ~~W4 跨边转角窗~~）与「不缺的两样」。
+> 搬过去的是**正文**，证据等级标注【确凿】/【推测】、表格、代码块、删除线作废段一字未改。
+> 别处引用的「卷二 W2」「卷二 W4」落点都在那篇里。
 
 ---
 
 ### 四、`CSHouse_OpeningCell` / `SolveBlockLayout` 要怎么给窗户让位
 
-#### 4.1 现状排布逻辑：一块面板一个 clip 场，洞按 `Cursor` 单调推进【确凿】
-
-`RebuildBodyMesh` `[代码] CSHouseActor.cpp:576-593` 的循环：
-
-```cpp
-float Cursor = 0;
-for (const FCSWallOpening& O : Openings)   // 已按 CenterS 排序
-{
-    CSHouse_OpeningCell(O, PierWidth, CellMin, CellMax);        // 半宽 + 半个墩
-    CellMin = FMath::Clamp(CellMin, Cursor, F.Len);
-    CellMax = FMath::Clamp(CellMax, CellMin, F.Len);
-    if (CellMax - CellMin < O.Width) continue;                  // 装不下 → 这个洞被丢弃
-    AddPanel(Cursor, CellMin, 0.0f, {}, 0);                     // 实心段
-    AddPanel(CellMin, CellMax, O.Z0, ComputeClipField(O), O.Tag);
-    Cursor = CellMax;
-}
-AddPanel(Cursor, F.Len, 0.0f, {}, 0);
-```
-
-三条硬约束由此而来：
-
-1. **一块面板只能带一个 clip 场** ⇒ 同一段 S 区间上不能有两个洞。
-2. **`Cursor` 单调** ⇒ 洞必须沿 S 无重叠且有序。
-3. **`CSHouse_OpeningCell` 恒占 `HalfWidth + PierWidth/2`**，与洞的 Z 无关
-   `[代码] CSHouseProfile.h:300-305`。
-
-#### 4.2 让位的四个真问题
-
-| # | 问题 | 症状 | 建议改法 | 触碰的裁决 |
-| --- | --- | --- | --- | --- |
-| P1 | ~~**高窗与低门在同一 S 上会互相吃掉面板**~~ —— **已收口（2026-08-30）** | 曾经：`QueryFeaturePlacement` 判**二维** `(S,Z)`（`CSHouse_OpeningsOverlap`），而 `RebuildBodyMesh` 的 cell 是**一维 S 区间**，第二个洞会因 `CellMax - CellMin < Width` 被 `continue` 静默丢弃 | **用户裁决 C1 选甲**：判据降成同边一维 S 区间（比的是**面板格**，`Z` 不参与），谓词与扫掠同维，那条 `continue` 对过了谓词的洞已不可达。代价是永久放弃"门上开窗" | 已按 D8「谓词是唯一真源」纪律收口 |
-| P2 | **窗被门整条边挤掉** | `ComputeDoors` `[代码] :312-317` 是「门先全部落位 → 窗逐条过谓词」。一面墙被道路点亮成连拱时，`SplitEdgeIntoSlots` 会把整条边切满，窗**永远放不进去** | 这是 D6「门拱优先于特征标记」的**预期行为**，不是 bug。但用户会看到「窗放上去就消失」，W1 的拒绝原因回执因此从「锦上添花」升级成**必需品** | 无（W1 是加法） |
-| P3 | **`PierWidth` 对窗过宽** | 门要留砖墩（40 cm），窗之间不需要 —— 两扇窗按 `PierWidth` 各让 20 cm，一面 4 m 的墙最多摆 3 扇 78 cm 的窗 | `CSHouse_OpeningCell` 加一个按 `Type` 分流的墩宽（门 `PierWidth`、窗 `csh.WindowPierWidth` 默认 0）。**注意它是 `inline` 头函数、被墙板与谓词两处调** —— 改签名要同步 | 无 |
-| P4 | **窗的 `SourceId` 排序与门的 `Tag` 冲突** | `CurrentOpenings.Sort` 按 `(EdgeIndex, CenterS)` `[代码] :318`，`SourceId` 只在谓词里用来「自己不与自己冲突」。窗是 GUID、门是 `(边,子段)`——两扇窗 `CenterS` 相同时排序不稳定 | 排序键末位加 `SourceId`（GUID 有全序）。**这是幂等短路的正确性条件**，与楼梯对照第二节「pull 不能 push」是同一条纪律 | 无 |
-
-#### 4.3 `SolveBlockLayout` / `BuildFramePlan` **不需要为窗改一行**【推测】
-
-`BuildFramePlan` 对每个洞发两条曲线（上边界+门樘、下边界仅当 `Z0>0`）
-`[代码] CSHouseActor.cpp:1032-1058`，两条都走 `ResampleUniform` + `SolveBlockLayout` + `Scatter`。
-窗只是「`Z0 > 0` 的 Arch/Rect」，两条曲线自动都成立。
-
-**推理链**：直读 `BuildFramePlan` 的 `for (const FCSWallOpening& O : CurrentOpenings)` 循环，
-它不看 `O.Type`；`bAnySill` 分支恰好就是窗台。标【推测】而非【确凿】是因为**没有跑过**：
-确证方式 = 手工往 `CurrentOpenings` 塞一个 `Type=Window, Shape=Rect, Z0=90, Z1=250` 的洞，
-看墙板与两条砖带是否都出。
-
-⚠️ 一条要提前想清楚的：`Rect` 洞的上边界折线只有**两个样本**
-（`CSHouse_SampleOpeningProfile` 的 `Rect` 分支只 `Emit` 两次，`CSHouseProfile.h:161-165`），
-而 `EmitCurve` 要求 `Even.Num() >= 3` 且两端各外延一格 —— **矩形窗的框砖会走进
-`ResampleUniform(2 点, N)` 这条从没被走过的路**。`ResampleUniform` 对两点输入是安全的
-（线性插值），但 B 样条把一条直线的两端各抹掉一截、门樘顶角会被抹圆。
-**矩形窗的框建议不走曲线铺砖，直接摆四条直边**（三个 quad 的事），别硬套拱的那套。
+> **本节正文已迁出到 [`TinyGladeWindow.md`](TinyGladeWindow.md#四cshouse_openingcell--solveblocklayout-要怎么给窗户让位)**（2026-09-06 文档重组）。含 4.1 / 4.2（P1–P4）/ 4.3（标题带删除线的作废整节，保留）。
+> 搬过去的是**正文**，证据等级标注【确凿】/【推测】、表格、代码块、删除线作废段一字未改。
 
 ---
 
@@ -2484,7 +3648,7 @@ TG 包围盒 X[−0.5, 1.0] Y[0, 1.0] Z[−0.866, 0.866] `[资产]` ——
 | # | 不合缝 | 根因 | 代价 |
 | --- | --- | --- | --- |
 | V1 | **`SolveBlockLayout` 把弧长切成整块** | 它是给「固定长度的砖」用的一维打包器（楼梯对照 `[二轮] L1071` 已定「原地不动」）。藤蔓的段长由**生长**决定，不是打包出来的 | 藤蔓**不该走** `SolveBlockLayout`；直接自己填 `RecordsByMesh`（`alpha` = 段中点参数、`lengthScale` = 段长/基础长）即可，`Scatter` 那一层照用 |
-| V2 | **`ivy_branch` 的长度轴是 UE +Z，不是 +Y** | kernel 轴约定是「X 面内径向 / Y 沿曲线 / Z 平面法线」（`CSGroundShaperSteps.h` 头注释）；`ivy_branch` 的长度在 TG 的 +Y ⇒ 换轴后落在 **UE +Z** `[资产]` | 要么导入期加一次 −90° 旋转，要么在 `BlockSize` 之外加一个基础网格旋转。**【推测】**：这是按 TG→UE 换轴规则推的，确证方式 = 在编辑器里读 `/Game/TinyGlade/Meshes/ivy_branch/StaticMeshes/ivy_branch` 的实际包围盒 |
+| V2 | **`ivy_branch` 的长度轴是 UE +Z，不是 +Y** | kernel 轴约定是「X 面内径向 / Y 沿曲线 / Z 平面法线」（`CSGroundShaperSteps.h` 头注释）；`ivy_branch` 的长度在 TG 的 +Y ⇒ 换轴后落在 **UE +Z** `[资产]` | 要么导入期加一次 −90° 旋转，要么在 `BlockSize` 之外加一个基础网格旋转。**【推测】**：这是按 TG→UE 换轴规则推的，确证方式 = 在编辑器里读 `/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/ivy_branch` 的实际包围盒 |
 
 #### 6.4 但本项目 D13 已经裁决**不接**这条路【确凿】
 
@@ -2528,7 +3692,7 @@ SurfaceActor->GetComponents<UStaticMeshComponent>(MeshComponents);
 
 #### 7.1 布局与总量（先纠正一个常见误读）
 
-`Content/TinyGlade/Meshes/` 有 135 个**顶层条目**，但其中两个是**容器目录**：
+`Content/HouseTest/TinyGladeAsset/Meshes/` 有 135 个**顶层条目**，但其中两个是**容器目录**：
 
 | 范围 | 数量 |
 | --- | --- |
@@ -2540,61 +3704,23 @@ SurfaceActor->GetComponents<UStaticMeshComponent>(MeshComponents);
 统一路径形态（474/474 成立）：
 
 ```
-Content/TinyGlade/Meshes/<name>/StaticMeshes/<name>.uasset
-Content/TinyGlade/Meshes/{clutter|decorators}/<name>/StaticMeshes/<name>.uasset
+Content/HouseTest/TinyGladeAsset/Meshes/<name>/StaticMeshes/<name>.uasset
+Content/HouseTest/TinyGladeAsset/Meshes/{clutter|decorators}/<name>/StaticMeshes/<name>.uasset
 ```
 
-UE 对象路径例：`/Game/TinyGlade/Meshes/decorators/window_cottage_1x1/StaticMeshes/window_cottage_1x1`。
+UE 对象路径例：`/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/window_cottage_1x1`。
 `Meshes/` 下**没有任何 `Materials/` / `Textures/` 子目录**。
 四处多嵌一层的例外：`sheep_animation/{1..30,delighted}`、`terrain_rt/{chunk_0..31}`、
 `wooden_gate/{door_handle_circle, ladder}`，以及上面那两个容器。
 
 #### 7.2 窗户可用资产：**基本齐全**
 
-`/Game/TinyGlade/Meshes/decorators/` 下按前缀（UE 数 / 源数）：
-
-| 组 | UE | 源 | 缺 |
-| --- | --- | --- | --- |
-| `window_cottage_*` | 49 | 55 | 6 |
-| `window_gothic_*` | 42 | 42 | 0 |
-| `arrow_slit_*` | 18 | 18 | 0 |
-| `balcony_door_*` + `gothic_balcony_door_*` | 34 | 34 | 0 |
-| `setdressing_*` | 14 | 14 | 0 |
-| `lantern_*` / `flag_*` / `trap_door_*` / `chimney_*` / `vent_pipe*` / `door` | 50 | 50 | 0 |
-| `outline_*` | 14 | 15 | 1 |
-| **合计** | **221** | **228** | **7** |
-
-一扇 cottage 窗的完整件（全部已导入，路径前缀 `/Game/TinyGlade/Meshes/decorators/<n>/StaticMeshes/<n>`）：
-
-```
-window_cottage_1x1                       78 × 17 × 160 cm   96v/32t   Pos,Normal,Color,UV,tangent,bitangent
-window_cottage_1x1_glass                 78 × 1.7 × 160     1056v/352t  + is_glass 流
-window_cottage_1x1_collision             78 × 8.5 × 160     8v/12t    Pos
-window_cottage_1x1_interaction / _collision_outline / _corner
-window_cottage_1x1_dormer{,_frame,_glass} / _full_dormer{,_corner,_collision_outline}
-window_cottage_1x1_halfdormer_{collision,frame}
-window_cottage_1x1_glass_broken_0/1/2
-setdressing_window_sill                  78.1 × 38 × 12
-setdressing_window_lintel                125 × 65 × 15
-```
-
-`2x1` / `3x1` 同族齐全；`window_cottage_corner_1x1/2x1/3x1{,_collision,_glass,_interaction}` 齐全
-（`corner_1x1` 另有 `_sill`）；`window_gothic_1x1/2x1/3x1` 的 14 件套（含 `_hat` / `_hat_full`）**全齐**；
-`arrow_slit_1x1/1x2/1x3` 全齐。
-
-⚠️ **重名陷阱**：`window_cottage_1x1` 在**两个路径下各有一份，且是两个不同的网格** `[资产]`：
-
-| UE 路径 | 源 JSON | 顶点/三角 | 尺寸 | 顶点流 |
-| --- | --- | --- | --- | --- |
-| `/Game/TinyGlade/Meshes/window_cottage_1x1/…` | `meshes/window_cottage_1x1.json` | 1704 / 568 | 78 × **85** × 163.8 | Pos, Normal, **Color** |
-| `/Game/TinyGlade/Meshes/decorators/window_cottage_1x1/…` | `meshes/decorators/window_cottage_1x1.json` | 96 / 32 | 78 × **17** × 160 | Pos, Normal, Color, UV, tangent, bitangent |
-
-顶层那个是**装配好的整窗**（框+洞口内壁+窗台，85 cm 深）；`decorators/` 那个是 TG 运行时用的
-**17 cm 薄框板**，靠 `_glass` / `_sill` / `_lintel` 拼出整体。**选哪个要有意为之。**
+> **本节正文已迁出到 [`TinyGladeWindow.md`](TinyGladeWindow.md#72-窗户可用资产基本齐全)**（2026-09-06 文档重组）。含前缀清点表、cottage 全套件清单与「重名陷阱」。
+> 搬过去的是**正文**，证据等级标注【确凿】/【推测】、表格、代码块、删除线作废段一字未改。
 
 #### 7.3 装饰／杂物：**58 个 clutter 一个不缺**
 
-`/Game/TinyGlade/Meshes/clutter/<n>/StaticMeshes/<n>`，与源 `assets/meshes/clutter/` 一一对应：
+`/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/clutter/<n>/StaticMeshes/<n>`，与源 `assets/meshes/clutter/` 一一对应：
 
 ```
 anvil barrel barrel_w_candles barrel_w_food_basket basket basket_w_food bench bench_short
@@ -2613,7 +3739,7 @@ D12 计划里点名的「箱子/水果摊」在这里分别是
 `decorators/setdressing_*`（14）另含 `_flower_pot{,_2,_purple,_red}` / `_flower_pot_hanging_1/2` /
 `_flower_bed` / `_cloth` / `_clothline_*` 五件。
 
-顶层植被/道具（全在，路径 `/Game/TinyGlade/Meshes/<n>/StaticMeshes/<n>`）：
+顶层植被/道具（全在，路径 `/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/<n>/StaticMeshes/<n>`）：
 `garden_stone flowery_lavender lavender lowpoly_flower plant_leafy plant_thistle bush bush_body
 bush_flowers umbrella tree_log tree_stump path_pebble water_stones reed reed_autumn
 garden_flower_01_lavender garden_flower_02 meadow_lowpoly_flowers clover clover_flowers
@@ -2623,9 +3749,9 @@ lilypad lilypad_flower fallen_leaves fallen_petals fallen_tree olden_glade_rock`
 
 | UE 路径 | 顶点/三角 | UE 尺寸 (cm) | 顶点流 |
 | --- | --- | --- | --- |
-| `/Game/TinyGlade/Meshes/ivy_branch/StaticMeshes/ivy_branch` | 12 / 6 | 150 × 173.2 × 100（长度轴 = **+Z**） | **只有** `Vertex_Position` |
-| `/Game/TinyGlade/Meshes/ivy_leaf/StaticMeshes/ivy_leaf` | 9 / 8 | 66.7 × 70.0 × 21.5（长度轴 = +Y） | Pos, Normal, UV |
-| `/Game/TinyGlade/Meshes/ivy_flower/StaticMeshes/ivy_flower` | 30 / 42 | 76.0 × 78.0 × 38.4 | Pos, Normal, UV |
+| `/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/ivy_branch` | 12 / 6 | 150 × 173.2 × 100（长度轴 = **+Z**） | **只有** `Vertex_Position` |
+| `/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/ivy_leaf` | 9 / 8 | 66.7 × 70.0 × 21.5（长度轴 = +Y） | Pos, Normal, UV |
+| `/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/ivy_flower` | 30 / 42 | 76.0 × 78.0 × 38.4 | Pos, Normal, UV |
 
 `ivy_branch` 没有法线也没有 UV ⇒ 它**只能配一个自己算法线/UV 的着色器**，
 直接扔给通用材质会全黑。这与 TG 的用法一致（VS 里现搭截面基）。
@@ -2646,7 +3772,7 @@ Niagara 式发射点云），与本文三个议题无关。
 
 #### 7.6 真正的缺口是**材质**，不是网格
 
-`/Game/TinyGlade/Materials/` 只有 8 个母材质：
+`/PCGPlugins/HouseTest/TinyGladeAsset/Materials/` 只有 8 个母材质：
 `M_TG_Bark · M_TG_Canopy · M_TG_CanopyInner · M_TG_CanopyOpaque · M_TG_Floor ·
 M_TG_LeafCards · M_TG_Texture · M_TG_VertexColor`。
 
@@ -2656,14 +3782,14 @@ M_TG_LeafCards · M_TG_Texture · M_TG_VertexColor`。
 - 窗户侧的实例齐全：`MI_window_0 · MI_window_glass · MI_window_sill_normal ·
   MI_window_colors_layer00..08`（9 个）+ `color_icon/windows/MI_*`（10 个配色）。
 
-`/Game/TinyGlade/MaterialInstances/` 459 个，与 `/Game/TinyGlade/Textures/` 459 个一一对应。
-唯一的地图是 `/Game/TinyGlade/Maps/TinyGladeGallery`。
+`/PCGPlugins/HouseTest/TinyGladeAsset/Materials/` 459 个，与 `/PCGPlugins/HouseTest/TinyGladeAsset/Textures/` 459 个一一对应。
+唯一的地图是 `/PCGPlugins/HouseTest/TinyGladeAsset/Maps/TinyGladeGallery`。
 
 #### 7.7 引用现状：474 个网格里 **473 个是孤儿**
 
 全仓 grep（`.cpp .h .usf .ush .py .md .json .ini`）唯一活的资产引用是
 `Scripts/TinyGladeSetupFrame.py:12` 的
-`BRICK = "/Game/TinyGlade/Meshes/brick/StaticMeshes/brick"`；
+`BRICK = "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/brick"`；
 `CSHouseActor.h:223` 是同一路径的注释。
 其余命中全是逆向文档里的中文叙述（描述 TG 的 Rust 模块，不是 UE 资产）。
 
@@ -2698,9 +3824,8 @@ D12 现在只写了「边界翻转 churn……不可接受再给已存在实例�
 
 #### C4 D8 计划里「逐像素 clip 是 Tiny Glade 的做法」这句对窗户不成立
 
-第 1.4 节。TG 的门拱用逐像素 clip、**窗户不用**（用 CPU 裁砖 + 预制框）。
-本项目让窗户也走 clip 是**更强的自有做法**。措辞订正，做法不改。
-（与状态文件里门洞那条「不是依据 TG」的订正同型 —— 建议一起改，避免第三次踩同一个坑。）
+> **本节正文已迁出到 [`TinyGladeWindow.md`](TinyGladeWindow.md#c4-d8-计划里逐像素-clip-是-tiny-glade-的做法这句对窗户不成立)**（2026-09-06 文档重组）。
+> 搬过去的是**正文**，证据等级标注【确凿】/【推测】、表格、代码块、删除线作废段一字未改。
 
 #### C5 `Tag` 字节已被门占满
 
@@ -2716,8 +3841,8 @@ D12 现在只写了「边界翻转 churn……不可接受再给已存在实例�
 | U1 | `generate_cottage_wall_windows` / `generate_gothic_wall_windows` 确实调 `WallHoles::add` | 反编译 `[PDB]` L9100 那个系统的函数体，找调用边。目前只有「同一系统同时握洞表与窗候选表」这条间接证据 |
 | U2 | TG 是否真的没有「剩余空间自动填窗」 | 反编译 `validate_blueprints` / `instantiate_blueprints` 函数体。PDB 只能证明没有这样一个**系统** |
 | U3 | `HoleType` / `HoleOrigin` 的枚举变体（窗是不是一个独立 HoleType） | PDB 只有类型名。需反编译或找 `.ron` 序列化样本（与楼梯对照 U3 同一条） |
-| U4 | `WallAttachment` / `WindowDecoratorInfo` 的字段构成 | PDB 只给类型名。这决定「TG 用什么参数化窗在墙上的位置」，直接影响 W4（转角窗）的设计 |
-| U5 | `ivy_branch` 在 UE 里的实际长度轴 | 编辑器里读 `/Game/TinyGlade/Meshes/ivy_branch/StaticMeshes/ivy_branch` 的包围盒。本文的 +Z 结论是按换轴规则推的 |
+| U4 | `WallAttachment` / `WindowDecoratorInfo` 的字段构成 | 09-05 曾因 W4 作废而关闭，**09-06 重新有下游**：锚点「与 TG 一致」。PDB 只给类型名 `WallAttachmentAnchor` / `WallAttachmentSide` / `WallCornerAttachment{rectangle_corner_id}`；字段名拿不到，只能按性质对齐（权威 / 派生 / 拓扑）。**不阻塞** |
+| U5 | `ivy_branch` 在 UE 里的实际长度轴 | 编辑器里读 `/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/ivy_branch` 的包围盒。本文的 +Z 结论是按换轴规则推的 |
 | U6 | 第 4.3 节「框砖对窗零改动」 | 手工塞一个 `Type=Window, Shape=Rect, Z0=90, Z1=250` 的洞跑一次，看墙板 + 上下两条砖带是否都出、矩形窗的两点剖面会不会把门樘顶角抹圆 |
 | U7 | `GladeSettings` 里到底有没有藤蔓密度项 | `assets/glade/*/settings.json` 只有 `{"butterflies": true}`，说明 `GladeSettings` 不是主题文件而是运行时设置。需从 exe 字符串或反编译取 |
 | U8 | 顶层 `window_cottage_1x1`（85 cm 深）在 TG 里的用途 | 它不在 `decorators/` 里、带 `Vertex_Color` 不带 UV ⇒ 疑似另一条管线（toolbar 预览？`decorator_test`？）。需在 exe 字符串里找引用点 |
@@ -2730,20 +3855,20 @@ D12 现在只写了「边界翻转 churn……不可接受再给已存在实例�
 
 | 序 | 事项 | 预估改动范围 | 触碰的既有裁决 |
 | --- | --- | --- | --- |
-| **A1** | **订正两处「依据 TG」的措辞**：① D8 里「逐像素 clip 是 TG 的做法」→ 改成「TG 只对门拱用，窗户走 CPU 裁砖；本项目让窗也走 clip 是自有改进」；② D12 的复杂度场标注为自有设计 | 文档两句话 | 无 —— 这是**消除**误述，不是新裁决（C4 / C2） |
+| ~~**A1**~~ | ~~订正两处「依据 TG」的措辞~~ **①已被 2026-09-05 的两层重写吸收**（计划不再宣称「clip 是 TG 的做法」，且已如实记下 TG 的四级洞缘）；②D12 复杂度场标注为自有设计**仍待做** | 文档一句话 | 无 |
 | **A2** | **`QueryFeaturePlacement` 返回 `FCSFeaturePlacement`**（`bAccepted` + `Reason` + `SnappedWorld`）。计划已给结构体，只是没落地；P2 让拒绝原因从锦上添花变必需品 | `CSHouseActor.h/.cpp` ~40 行 + 单测；调用点只有 `ComputeDoors:316` 一处 | 无（纯加法，计划已裁决过形态） |
 | **A3** | **`CSHouse_OpeningCell` 按 `Type` 分流墩宽**（门 `PierWidth`、窗 `csh.WindowPierWidth` 默认 0）+ `csh.WindowMinSillZ` 下限守卫 | `CSHouseProfile.h` ~10 行 + 两处调用点同步 + 单测 | 无（W3/W6/P3） |
 | **A4** | **`CurrentOpenings.Sort` 末位加 `SourceId`**，让同 `(EdgeIndex, CenterS)` 的两个洞有全序 —— 幂等短路的正确性条件 | 1 行 + 一条单测 | 无（P4；与楼梯对照第二节「pull 不 push」同一条纪律） |
-| **A5** | **窗洞冒烟测**（U6）：往 `CurrentOpenings` 手工塞一个 `Rect` 窗跑一遍，确认墙板 + 窗台盒 + 上下两条框砖都出。**这一步先于任何标记 actor 的代码** | 一个单测 / 一段演示脚本 | 无 |
+| ~~**A5**~~ | ~~窗洞冒烟测~~ **已做**（`House.WindowPredicateMatchesGeometry` / `House.FrameWindowSill` + `demo_house_window`）。⚠️ 判据里的「墙板 + 窗台盒」两项会随 2026-09-05 的两层重做失效，届时改判「砖层洞缘贴合 + 灰泥覆盖度」 | — | — |
 | **A6** | **`ACSHouseFeatureMarker` + `ACSWindowMarker`**（D8 主体）。TG 侧形态已逐条对上（第 2.2 节），照计划实现即可；`DecoratorBackup` 印证了「弹回最后被答应位置」的做法 | 新 actor ~350 行 + 编辑器 tick 那几个坑（计划已列全） | 无（**C1 已于 2026-08-30 拍板选甲**，前置裁决已解除） |
 | ~~**A7**~~ | ~~**面板垂直细分**（C1 的乙案）：同一 S 区间上下两块面板各带一个 clip 场~~ **作废** —— C1 于 2026-08-30 拍板选甲（谓词降维），不做垂直细分 | — | — |
-| **A8** | **矩形窗的框不走曲线铺砖**，改摆四条直边 | `BuildFramePlan` 加一个 `Shape == Rect` 分支，~40 行 | 无，但要确认「门框砖建在将被删除的设施上」那条冲突的最终裁决（状态文件「待用户拍板」第二条）——**它会决定这段代码写在哪** |
-| **A9** | **窗/玻璃母材质**（`M_TG_Window` + `M_TG_Glass`），消费 `is_glass` 流与 `MI_window_*` / `MI_window_colors_layer00..08` | 材质，无 C++ | 无。**这是 D14 的活**，但窗户没有它就是一块灰板 |
+| ~~**A8**~~ | ~~矩形窗的框不走曲线铺砖，改摆四条直边~~ **已做**（`CSHouseFrame.cpp:119` 的 `Rect` 分支），**且已被 2026-09-05 两层裁决吸收**：框砖并入砖层，矩形洞的四条直边就是砖层里被贴合过的那几列砖 | — | — |
+| ~~**A9**~~ | ~~窗/玻璃母材质~~ **作废**（2026-09-06 用户裁决：**窗不需要玻璃材质，TG 里它也不是透明的**）。实测四个候选 `MI_cottage_window` / `MI_window` / `MI_window_sill_normal` / `MI_window_glass` **全是** `M_TG_Texture` 的实例、`MSM_DefaultLit` + `BLEND_Opaque` ⇒ 窗框资产自带的 `MI_window_colors_layer00` 直接就是受光不透明的，**材质零工作量** | — | — |
 | **A10** | **硬编 `_flowerbed_locations` 坐标表**（6 组，第 5.2 节已给全）。它们导不进 StaticMesh，但 D12 的「花箱挂窗台」要用 | 一张 C++ 常量表 ~20 行 | 无，**依赖 C2 拍板**（叠加案才需要） |
 | **A11** | **D12 的锚点层**（C2 的③叠加案）：在复杂度场之外加一条「已放窗 → 花箱候选点」的通路，照 `add_autoclutter_on_windows` 的形态 | 依赖 D12 主体先落地 | **触碰 C2**，必须先拍板 |
 | **A12** | **`SuppressedDerived` 抑制口**（C3）。TG 侧现在有**两个**实证（`StairsRemovedSupports` + `DeletedAutoClutter`），比楼梯对照 A6 写时又强了一档 | 形状与代价见楼梯对照 A6 | **触碰**「派生物纯函数、不序列化」。**与楼梯 A6 是同一次裁决，建议合并** |
 | **A13** | **D13 的房子→点集通路**：新写「墙矩形拒绝采样 → 填 `GrowTarget` ISM」，并给 `AVineContainer` 开一个「直接喂点集」的公开入口 | ~150 行；`VineScatter::FillInstances` 已有，只是 `static` | 无。**但必须知道现有 `ScatterTargetsFromSurfaceActor` 对房子返回空**（第 6.5 节），别照它抄 |
-| **A14** | **转角窗 W4** | 与 D6「跨转角的洞」是同一件事 | **触碰 D6 的转角墩一节**。计划已把它排在后面，本文**不建议提前** |
+| ~~**A14**~~ | ~~**转角窗 W4**~~ **作废**（2026-09-05 用户裁决，见 W4 行与计划 D8） | — | — |
 
 **A1–A5 之间没有相互依赖之外的前置，五项合起来就是「让窗户能被砌出来」的最小闭环，且不需要任何新裁决。**
 A6 起要么依赖一次拍板（A7 / A11 / A12），要么依赖别的模块先动工（A9 / A10 / A13）。
@@ -3147,7 +4272,7 @@ GPU 侧几乎零改动，CPU 侧一个新 actor 加一个可单测的纯函数�
 2. **`stair_step` 的 Z 是单边的**（−0.014 → +1.317，中心偏到 +0.651），
    不是居中盒 ⇒ 它的**原点在踏步的一端**，暗示 §4.1 的踏步是从某个锚点（墙侧/栏杆侧）
    向外摆的。**【待确认】**：要确证需读 `construct_stair_steps` 的变换构造，PDB 只给符号名。
-3. UE 侧三张网格**都已导入**（`Content/TinyGlade/Meshes/{stair_step, stairs_step, stairs_pebble}/StaticMeshes/`）。
+3. UE 侧三张网格**都已导入**（`Content/HouseTest/TinyGladeAsset/Meshes/{stair_step, stairs_step, stairs_pebble}/StaticMeshes/`）。
    全仓 grep（`*.cpp *.h *.md *.py *.json *.txt`）对这三个名字**零命中** ⇒ C++ / 文档侧无引用。
    **【待确认】**：是否被某个蓝图默认值引用未查，需要资产引用查看器才能确证。
 
@@ -3684,30 +4809,36 @@ per-instance 布局声明，两份必须放在同一个头文件里，否则「�
 
 | 资产 | BlendMode | ShadingModel | 关键属性 | 图 |
 | --- | --- | --- | --- | --- |
-| `M_TinyGladeWall` | **`BLEND_Masked`** | `MSM_DefaultLit` | `TwoSided` 缺省(false)、`OpacityMaskClipValue` 缺省(0.3333)、`bCastDynamicShadowAsMasked` 缺省(false) | UV1 → Custom 节点 `TinyGladeArchClip`（`CMOT_Float1`，入参 `Q`/`Shape`）→ `MP_OPACITY_MASK`；VertexColor.B → `Shape`；BaseColor 常数 `(0.62,0.58,0.52)`；Roughness `0.85` |
+| `M_TinyGladeWall` | **`BLEND_Masked`** | `MSM_DefaultLit` | `TwoSided` 缺省(false)、`OpacityMaskClipValue` 缺省(0.3333)、`bCastDynamicShadowAsMasked` 缺省(false) | ⚠️ **2026-09-03 重建，下面这一行是新的**：洞那条链没变（UV1 → Custom `TinyGladeArchClip` → `MP_OPACITY_MASK`，VertexColor.B → `Shape`），但 BaseColor / Normal / Roughness 从常数换成了**灰泥剥落**（`_nani_plaster` 的移植）：世界投影 UV → 6 张贴图 + Custom `TGPlasterPeel`（3 倍频世界 3D value noise 的侵蚀场 → `peelM` / `band` / 卷边法线）+ `TGBrickHeight` / `TGWallAlbedo` / `TGWallNormal`。49 个节点、PS 363 指令、7 采样器。参数全在 `MI_TinyGladeWall` 上（房子挂的应是它）。逐条口径见 `Scripts/TinyGladeMakeWallMaterials.py` 文件头 |
 | `M_TinyGladeReveal` | `BLEND_Opaque` | `MSM_DefaultLit` | — | 常数 `(0.34,0.30,0.26)` + Roughness `0.9` |
 | `M_TinyGladeRoof` | `BLEND_Opaque` | `MSM_DefaultLit` | — | 常数 `(0.30,0.16,0.13)` + Roughness `0.9` |
 | `M_TinyGladeBrick` | `BLEND_Opaque` | `MSM_DefaultLit` | **`bUsedWithInstancedStaticMeshes = true`**（全仓唯一） | 常数 `(0.46,0.42,0.37)` + Roughness `0.92` |
 | `M_TinyGladeGround` | `BLEND_Opaque` | `MSM_DefaultLit` | — | UV0（世界平铺，`UVWorldPeriod` 默认 500 cm）采 `grass_patch_summer` / `dirtpath_1`，按 **VertexColor.R = 道路权重** `Lerp`；Roughness `0.95` |
 
 **五个材质全部 `HasPerInstanceCustomData = False`**（AssetRegistry tag 实测）。
+另有一个材质实例 `MI_TinyGladeWall`（父级即 `M_TinyGladeWall`），墙面全部贴图与手感参数的调节面在它上面。
 
 材质的**可读源头是三个 Python 脚本**（材质图本身在 `.uasset` 里不可读）：
 `Scripts/TinyGladeMakeWallMaterials.py`（Wall/Reveal/Roof）、
 `Scripts/TinyGladeMakeGroundMaterial.py`（Ground）、
 `Scripts/TinyGladeSetupFrame.py:29`（Brick，`used_with_instanced_static_meshes = True`）。
 
-**另一套 8 个 `M_TG_*`**（`Content/TinyGlade/Materials/`：`M_TG_Bark`/`Canopy`/`CanopyInner`/
+**另一套 8 个 `M_TG_*`**（`Content/HouseTest/TinyGladeAsset/Materials/`：`M_TG_Bark`/`Canopy`/`CanopyInner`/
 `CanopyOpaque`/`Floor`/`LeafCards`/`Texture`/`VertexColor`）是**提取资产的看图材质**，
-`Content/TinyGlade/MaterialInstances/` 下 176 个 `MI_*` 全部以 `M_TG_Texture`
+`Content/HouseTest/TinyGladeAsset/MaterialInstances/` 下 176 个 `MI_*` 全部以 `M_TG_Texture`
 （`MSM_Unlit` / `BLEND_Opaque`）为父。**全仓没有任何 C++ 或 Python 引用它们**——
 它们不是房子的候选母材质。其中 `M_TG_Canopy` / `M_TG_LeafCards` 是
 `MSM_TwoSidedFoliage` + `BLEND_Masked`，将来接 D13 藤蔓时可以当模板。
 
 **当前光照行为**（由上表直接推出）：
 - 全部 `MSM_DefaultLit` ⇒ **Lambert 漫反射 + GGX 高光**（UE 默认），没有 Burley。
-- 全部无法线贴图、无 AO 贴图、粗糙度是常数 ⇒ **变化全靠顶点色与两张地面贴图**。
-  这一点**恰好与 TG 同构**（TG 也是常数粗糙度 0.8 + 无金属）。
+- ~~全部无法线贴图、无 AO 贴图、粗糙度是常数 ⇒ 变化全靠顶点色与两张地面贴图。~~
+  ⚠️ **这一条被 2026-09-03 的墙面重建推翻了一半**：`M_TinyGladeWall` 现在有法线贴图
+  （砖 `stone_floor_2_normal` + 剥落边的卷边扰动），粗糙度也不是常数（灰泥 0.85 / 砖 0.92
+  按 `BrickMask` 插值）。**仍然成立的是**：AO 贴图一张都没有；其余四个材质照旧。
+  「与 TG 同构」那半句也随之收窄 —— TG 的墙确实是常数粗糙度、无法线贴图，本项目在墙上
+  **有意不同构**（TG 的砖是真几何、法线来自几何；本项目的墙板是实心盒，砖只存在于材质里，
+  不给法线就完全读不出体积）。理由与两处不同构见 `TinyGladeMakeWallMaterials.py` 文件头。
 - `M_TinyGladeWall` 是 Masked ⇒ 阴影通路会为它编译真 PS（`[引擎]`
   `ShadowDepthRendering.cpp` 的 `!bWritesEveryPixelShadowPass` 分支），**洞在阴影里是洞**——
   这条 `[计划]` D14 的表写得对。
@@ -4062,5 +5193,317 @@ A8 起每一项都要先过一次裁决，不应捆进第一步。
 - **`_painterly_*` / `_vermeer_*` 笔触渲染**——照片模式滤镜，与常规观感无关。
 - **风格化 VS 变形**（`[分析]` §1.6 的六步）——那是几何模块的事，`[计划]` D14 末节
   「世界空间 value-noise」已经给了正确的限定（TG 是逐砖刚体平移，连续网格拿不到砖级不连续感）。
+
+---
+
+<a id="vol-5"></a>
+
+## 卷五 · 砖构件对照：门框 / 转角 / 垛口 / 接缝 / 上沿
+
+> 2026-08-31 新增。起因是一个直觉判断：「门框砖、房屋转角砖、房顶砖看上去都是 SplineMesh 排列了各种不同的子砖」。
+> 本卷逐条核这个判断 —— 结论是**排布抽象成立、"SplineMesh" 只在一处成立、"各种不同的子砖"不成立**。
+
+### 证据标注约定（本卷）
+
+| 标注 | 含义 |
+| --- | --- |
+| 【确凿】 | PDB 符号 / 源文件树 / 反编译 GLSL / 资产实测直接给出，不含推理 |
+| 【推测】 | 由确凿证据推理得出，推理链在正文写明 |
+| 【待确认】 | 证据不足以判定，正文写明「需要什么证据才能确证」 |
+| `[PDB]` | `D:/MyProject/Tiny Glade/tmp/pdb_symbols.txt` |
+| `[PATH]` | `D:/MyProject/Tiny Glade/tmp/pdb_paths.txt` —— **本卷的主力证据**，源文件树能证「某个东西不存在」 |
+| `[GLSL]` | `D:/MyProject/Tiny Glade/tmp/shaders/` 反编译产物，逐行 |
+| `[资产]` | `D:/MyProject/Tiny Glade/assets/`（`meshes/` 实测 + `nani_meshes.ron` 逐条） |
+| `[分析]` | `MESH_GENERATION_ANALYSIS.md` |
+| `[计划]` | [`TinyGladeHouse_Plan.md`](TinyGladeHouse_Plan.md) |
+
+⚠️ 一处易误采：`inter_roof_merlons` 是**两个屋顶互相压上**时长出来的雉堞，**不是**单个平屋顶边缘那圈垛口。两者都叫 merlon，机制完全不同。
+
+### 结论速览
+
+| 构件 | 排布归属 | 记录类型 | 实例流 | 绘制管线 | 网格 |
+| --- | --- | --- | --- | --- | --- |
+| 墙身砖 / 门樘 / 拱圈石 | `system_wall_constructor`（那面墙） | `MyBrick` + `flags` | `InstancedWallData` 96 B | 墙砖**专用**（两阶段遮挡剔除 + 7 槽） | `brick` |
+| 转角砖 / 墙裙 / 承重柱 | 同上，**同一个 `Vec<MyBrick>`** | `MyBrick` | 同上 | 同上 | `brick` |
+| 平屋顶边缘垛口 | 墙的顶层砖【推测，见 §4.3】 | `MyBrick` | 同上 | 同上 | `brick` |
+| 接缝砖 / 屋顶间雉堞 | `system_clutter`（不属于任何墙） | `StitchBrick` | `StitchBrickAlloc` | 【待确认】 | `brick` |
+| 门/窗拱缘「帽子」件 | `system_decorator` | `GothicWindowBricksInstanceData` | nani | nani raster | 9 个预制件 |
+| 平屋顶顶面石板 | `system_roof::visual` | `StoneFloorInstanceData` | nani | `_nani_roof_floor` | **运行时生成** |
+| 屋顶瓦片 | `system_roof::visual` | `RoofShingle` | `RoofTileSsbo` | nani external | `roof_tile`×3 |
+
+**三句话**：
+
+1. **前五行是同一个抽象** —— 沿一条路径累积刚体块，全部是同一个 `brick` × 逐实例非均匀缩放。
+2. **"各种不同的子砖"不成立** —— 多样性来自逐实例参数，不是 palette（§1）。
+3. **"SplineMesh" 只有拱缘帽子件成立** —— 那里是真的把一条烘好的多砖网格沿骨点弯过去（§2.2）。
+
+---
+
+### 一、资产层的地基：全库只有一个 `brick`
+
+两条硬约束，本卷后面所有结论都挂在它们上面：
+
+- **`assets/meshes` 实有 138 个网格，砖只有一个**：`brick.glb` / `brick.json`（600 顶点 / 300 三角 / ±0.5 单位盒 /
+  属性 `Vertex_Position`、`Vertex_Normal`、`is_bevel`，384 个倒角顶点）【确凿，`[资产]` 实测】。
+  另有 `garden_stone` / `water_stones`，是花园与水边石，不是砖。
+- **`InstancedWallData` 96 字节里没有 mesh 索引字段**【确凿，`[GLSL]` `_wall_generate_draw_lists...cs_pass1` L66-80】：
+
+  ```glsl
+  struct InstancedWallData {
+      Affine3Packed transform;      // float[12]，3x4 仿射 —— 非均匀缩放**就是**砖尺寸
+      vec4 sin_deform_y;            // 砖四角 Y 位移（CPU BrickRowSine 烘焙，VS 双线性插值）
+      vec3 global_arch_height_vals; // 拱曲线在砖左/中/右的世界高度
+      uint seed;                    // 低 2 位 = 90° 旋转档；参与 UV/颜色哈希
+      uint source_id;               // 通常 = WallId
+      vec2 wallspace_x_range;       // 砖两端沿墙的参数坐标区间
+      uint flags;                   // 位表见下
+  };                                // ← 没有 mesh_id / part_index：想摆"不同的子砖"在数据结构上就不可能
+  ```
+
+⇒ **墙这条路上不存在「多种子砖」。** 差异全部来自逐实例参数。
+
+#### 1.1 多样性的四个来源【确凿，`[GLSL]` `_wall_wall_brick_lod0...vs_main`】
+
+| 来源 | 效果 |
+| --- | --- |
+| 逐实例非均匀缩放 | 砖尺寸 = transform 的列长。同一个单位盒能当薄砖、能当角石、能当柱段 |
+| `seed & 3` × 1.57 rad 绕 Y | 4 种外观白嫖，零成本 |
+| 世界空间 value-noise | 世界坐标 ×0.4（2.5 m 晶格）8 角哈希三线性插值 → XZ ±3 cm。**相邻砖共享同一个场 ⇒ 墙面「歪而不散」** |
+| `flags` 若干位 | 改行为，见下表 |
+
+#### 1.2 `flags` 位表【`[GLSL]` 实证，语义列为推测；`[分析]` §1.7】
+
+| 位 | GLSL 实证效果 | 语义推测 |
+| --- | --- | --- |
+| 1 | 三轴一律 ×1.045（均匀胀） | 特殊砖 |
+| 2 | 查 `roof_color_ids[]` 而不是 `wall_color_ids[]` | 随屋顶配色的砖（雉堞 / 烟囱） |
+| 4 | 启用随机胀大 | 普通墙砖 |
+| 8 | PS **反向**裁剪（保留拱线以下） | 拱圈石 |
+| 16 | 减雪 | 檐下砖 |
+| 32 | 局部 z 按拱高压扁 + 三平面 UV + 免拱裁剪 | 拱内楣 / 门框构件 |
+| 64 | 免编辑高亮 | 非编辑对象 |
+| 128 | 强制 LOD0 | 形变敏感大件 |
+
+⚠️ 胀大那一支的口径以**驱动方复读 GLSL** 为准（`[GLSL]` L160-175），与 `[分析]` §1.6 的表述略有出入：
+
+- `flags & 4` **未置位 ⇒ 缩放恒为 (1,1,1)**，根本不胀 —— 胀大是**有门控的**，不是所有砖都胀。
+- 置位时分两支：`flags & 1` 也置位 ⇒ **三轴一律 ×1.045**；`flags & 1` 未置位 ⇒
+  **水平两轴 ×1.1、竖直 ×1.0**，且有 **10% 概率整块不胀**。
+
+**竖直不胀是有意的**：砖一层层码上去，竖直也胀会让层高漂移、层间可见重叠。本项目的 `FrameBrickBloat = 1.10`
+就是抄的这一支（见**本文卷零**「TG 的砖是故意胀大、互相穿插的」）。
+
+---
+
+### 二、"沿线摆块"成立，但它不是 SplineMesh
+
+#### 2.1 计划书里已经有这句话
+
+`[计划]` D11（`ACSSplineBlockActor`）的实拍参考图注原文：
+
+> 参考实拍（红框：墙顶城齿、转角角石、勒脚石排 —— **同一种「离散块沿线累积」**）
+> 类似 SplineMesh 但**不是弯曲变形** —— 块是刚体，沿样条切向逐个排列。
+
+配图 [`img/tiny-glade-ref-crenellation-trim.jpg`](img/tiny-glade-ref-crenellation-trim.jpg)。
+**这条抽象是对的**，而且 `SolveBlockLayout` 已经是它在本项目侧的落地。
+
+#### 2.2 唯一真正的 SplineMesh：门/窗拱缘的「帽子」件【确凿】
+
+`GothicWindowBricks` subset（`[资产]` `nani_meshes.ron`，9 个网格）：
+
+```text
+decorators/arrow_slit_{1x2,1x3}_hat
+decorators/balcony_door_gothic_rank{1,2,3}_hat
+decorators/window_gothic_{2x1,3x1}_hat
+decorators/window_gothic_{2x1,3x1}_hat_full
+```
+
+`[GLSL]` `_nani_gothic_window_bricks.raster...vs_main`：
+
+```glsl
+struct InstanceData {
+    Affine3Packed xform;
+    int seed; int _wall_id;
+    uint wallspace_x_range_packed; uint _is_wooden;
+    vec3 bone_0_pos; uint bone_0_normal_packed;   // ← 三个骨点
+    vec3 bone_1_pos; uint bone_1_normal_packed;
+    vec3 bone_2_pos; uint bone_2_normal_packed;
+};
+// 顶点输入（L103-108）：Position / Normal / UV / is_bevel / brick_id / bbx_x
+// bbx_x = 该顶点沿件长度轴的归一化位置 0..1；brick_id = 该顶点属于第几块砖
+
+if (bbx_x < 0.5)  pos = mix(bone_0, bone_1,  bbx_x * 2.0);          // L125-129
+else              pos = mix(bone_1, bone_2, (bbx_x - 0.5) * 2.0);   // L136-138
+seed_for_brick = seed + brick_id;                                    // L319 逐砖随机数
+```
+
+⇒ **一整条拱缘是一个烘好的多砖网格，被沿 3 控制点、2 段的折线弯过去；每块砖靠顶点属性 `brick_id` 保留自己的身份。**
+这就是 SplineMesh。
+
+**一个有意思的例外**：`window_gothic_1x1_hat` 与 `1x1_hat_full` 反而在**不弯**的 `SolidVertexColorBricks` subset 里，
+只有 2x1 / 3x1 才进弯曲那条路。【推测】跨度太小，弯了看不出来，省三组骨点上传。
+
+对照组：`_wall_wall_brick_lod0...vs_main` 的顶点输入**只有** `Vertex_Position` / `Vertex_Normal` / `is_bevel`，
+`bone_` / `bbx_x` / `brick_id` **零命中**【确凿】。
+
+#### 2.3 `SolidVertexColorBricks` 是预制装饰件，不是砖【确凿】
+
+12 个网格，全是 `decorators/arrow_slit_*` 与 `decorators/window_gothic_*`（窗体 / 箭孔 / 老虎窗 / 1x1 帽子）。
+ron 里显式写着 `remove: ["bbx_x", "brick_id", "is_bevel"]` —— **源网格带这三个属性但这条路不用**，
+即：不弯、不逐砖抖动。它们是「按尺寸档位（1x1 / 2x1 / 3x1）分的整件窗套」，不是砖的调色板。
+
+#### 2.4 墙砖为什么"看起来"也像 SplineMesh
+
+VS 里三个小量形变把刚体盒串成了连续带【确凿，`[GLSL]`】：
+
+- `sin_deform_y`：砖四角 Y 位移（CPU `BrickRowSine` 烘焙，VS 双线性插值）⇒ 整排砖连续波浪；
+- `flags & 32`：局部 z 按拱高压扁 ⇒ 砖贴着拱曲线走；
+- 共享的世界空间噪声 ⇒ 相邻砖一起歪。
+
+**视觉上是一条弯带，数据上是一堆刚性单位盒。**
+
+---
+
+### 三、逐族拆解
+
+#### 3.1 墙身 / 门樘 / 拱圈石：同一个 `Vec<MyBrick>`
+
+门框砖不是「另一族构件」，是同一批砖上打了位：`flags & 8`（拱圈石，PS 反向裁剪）与
+`flags & 32`（拱内楣 / 门框，沿拱压扁 + 三平面 UV）。
+
+**拱洞的形状由 GPU 逐像素切出**【确凿，`[分析]` §1.6】：CPU 只让跨拱砖携带 3 点拱高
+（`global_arch_height_vals`），VS 分段插值成该像素列的拱高传给 PS，gbuffer PS `if (world_y < 拱高) discard;`。
+depth-only / shadow PS 变体只保留同样的裁剪 ⇒ **阴影里也有拱洞**。
+
+#### 3.2 拱圈石有独立的「轮廓 + 行走」设施【确凿，`[PDB]`】
+
+```text
+construct_arches::profile::create_stone_arch_profile(_impl)   # 出石拱剖面
+construct_arches::profile::ArchFunction::remap_t              # 沿拱重映射参数 t
+arch_walker::ArchWalker::{new, walk}                          # 沿剖面走位摆砖
+```
+
+**这是全 crate 唯一一处真的用「轮廓函数 + 沿线行走」摆砖的地方**，也正是那条直觉最贴的落点。
+本项目 `CSHouseFrame` 的「一线程一砖 + 从拱参数解析推导位置与朝向」是同型的另一种实现（GPU 侧完成）。
+
+#### 3.3 转角 / 墙裙 / 承重柱：同一条路，只是追加时机不同【确凿】
+
+- **墙自身转角**：`utils::wall_corners::add_wall_corners` —— 在切层、切砖、裁洞**之后**往 `Vec<MyBrick>` 追加。
+- **墙裙**：`utils::wall_skirts::add_skirts` —— 墙底与地面之间那一圈。
+- **承重柱**：`construct_elevation_supports/`，**12 个源文件**（`[PATH]`）：
+
+  ```text
+  circle_{bottom_layer, categorize, pillars, turret}.rs
+  rectangle_{bottom_layer, pillars, large_brackets, small_brackets}.rs
+  find_overlap_segments.rs · maintain_stone_column_colliders.rs
+  util_pillar_construction.rs · util_cross_brick_pillar.rs
+  ```
+
+  圆形与矩形各一套、外加托架与十字砖柱两种形态 —— 但产物仍是 `brick`。
+
+#### 3.4 接缝砖 / 屋顶间雉堞：共用一个分配器【确凿】
+
+```text
+[PDB] 行 8854  detect_intra_shape_corners : ... ResMut<WallHoles> · ResMut<IntraShapeCorners> ...
+[PDB] 行 9091  stitch_bricks              : Res<IntraShapeCorners> → ResMut<InterShapeBrickStitches>
+[PDB] 行 8966  spawn_stitch_bricks        : Res<InterShapeBrickStitches> · Res<AssetSsboLibrary> → ResMut<StitchBrickAlloc>
+[PDB] 行 8879  construct_inter_roof_merlons: Res<InterRoofMerlons> · ResMut<InterRoofMerlonBrickCount> · ResMut<StitchBrickAlloc>
+```
+
+屋顶那套与形状接缝那套**共用同一个 `StitchBrickAlloc`**；雉堞砖走 `flags` bit2（取 `roof_color_ids`）。
+记录类型是 `StitchBrick`，不是 `MyBrick` —— 它不属于任何一面墙。
+
+【待确认】`StitchBrick` 最终走的是墙砖专用管线还是 nani。`SolidVertexColorBricks` subset 装的是预制装饰件
+（见 §2.3），所以缝砖多半不在那里，但没有决定性证据。
+
+#### 3.5 屋顶瓦片：唯一一个不属于这个抽象的【确凿】
+
+`system_roof::visual::assemble_roof_tiles` → `SparseInstanceBuffer<RoofTileSsbo>`，实例是 `RoofShingle`
+（`base_position` / 逐瓦 `clipping_plane_` / 四元数 / `animation_t` / `roof_id` / `velocity_rotation`）。
+**不沿曲线摆，是在屋面这个二维参数面上铺。** 独有：铺瓦生长动画、檐口起翘、逐瓦裁剪平面 discard、
+5×5 瓦图集、`_roof_tiles_gravity.cs`（墙升降时的瓦片重力与翻转角）、depth-only PS 里的 `DormerHole` 逐像素开天窗。
+
+⇒ **想做屋顶瓦，别指望复用门框砖那条路。TG 自己就没复用。**
+
+---
+
+### 四、"上沿石头"不存在
+
+#### 4.1 源文件树证明了它不存在【确凿，`[PATH]`】
+
+`wall-constructor` crate 共 **53 个 `.rs`**，`utils/` 下只有 8 个：
+
+```text
+src/utils/{half_timber, resolve_hole_overlap, sine_wave, split_into_random_rows,
+           stairs_signifiers, trim_rows, wall_corners, wall_skirts}.rs
+```
+
+**没有 coping / capping / parapet / crenellation / merlon / top_row 任何一个文件。**
+加上 §1 的两条（全库一个砖网格、实例记录无 mesh 索引）⇒ **上沿在数据上不可能是另一种石头。**
+
+#### 4.2 那它为什么看起来不一样：三条叠加
+
+| 现象 | 机制 |
+| --- | --- |
+| 轮廓最显眼 | `flags & 4` 的胀大是**水平 ×1.1、竖直 ×1.0**，还有 10% 概率整块不胀。墙身里的胀大被邻居挡住看不见，顶排那圈直接压在天空上 |
+| 更亮更"厚" | 砖是 ±0.5 单位盒。墙身每块只露一个侧面，**顶排露侧面 + 顶面两个面**，而顶面是唯一被太阳直射的 |
+| 层高本来就不齐 | `split_into_random_rows` 给的是**随机层高**。顶层砖高与下面几层不同不是特意做大，是每层都在随机 |
+
+再叠 `sine_wave::BrickRowSine`（整排 Y 起伏）与 `utils::perturb_row_ends`（扰动行端），
+顶边与墙端就成了参差的废墟感。
+
+#### 4.3 平屋顶那圈垛口：是墙的顶层砖【推测，理由链完整】
+
+- `FlatRoofRimStyle` 只是**屋顶的一个样式枚举**（`SetFlatRoofRimStyleCmd` + UI `FlatRoofRimTypeToggle`）【确凿】；
+- `system_roof::visual` 全部只有 7 个函数 —— `assemble_roof_tiles` / `generate_roof_stone_floor_and_roof_bottom` /
+  `place_spires` / `place_support_beams` / `roof_animation` / `roof_snow` / `switch_roof_type`
+  —— **没有任何 rim / merlon 产出函数**【确凿】；
+- 而 `construct_walls` 的签名里恰好读 `Query<&Roof>`【确凿，`[分析]` §1.3】。
+
+⇒ 垛口由**墙**产出，与转角砖同一个 `Vec<MyBrick>`。具体在 `WallConstructor::from_curve` 里哪一步交替留空，
+PDB 查不到（私有 / 内联，符号表只暴露 `WallConstructor` 与 `impl`）。
+
+#### 4.4 平屋顶顶面石板：nani，不是砖【确凿】
+
+`system_roof::visual::generate_roof_stone_floor_and_roof_bottom` → `StoneFloorInstanceData` → `_nani_roof_floor`。
+实例参数 `{position, basis0_xz, scale, shape, double_sided, is_roof_bottom, material_id, pattern_id}`；
+网格由 `startup::load_mesh_atlases::generate_roof_floor_meshes` **运行时生成**，不在 `nani_meshes.ron` 里。
+Y 量化 `floor(y*512)/512 + fract(wall_id*1.618)/512` **专门防 z-fighting**。
+
+#### 4.5 「只是删砖吗」——TG 里没有"删砖"这个操作【确凿】
+
+`OnWallChanged` → `construct_walls` → **整墙全量重排**（`[分析]` §1.1：画线进行中与抬笔定稿走完全相同的重建管线，
+砖 SSBO 无任何预览专用变体）。砖在不在，是这一次排布函数的**输出**，不是对上一次结果的编辑
+—— 所以"删除"与"重新放置"都把它当成了两步，实际只有一步。
+
+TG 确实有一条裁砖通路 `utils::trim_rows`（`RowTrimmerSink` / `TrimmedRow`），但它的输入是 `WallHoles`,
+是**按洞裁**（门 `construct_gates` / 楼梯穿墙 `playermade_stairs_add_wall_holes` / 形状相交
+`add_hole_at_shape_intersection`），**不是按顶边裁**。
+
+#### 4.6 拱上方那一段是另一回事【确凿】
+
+`init_wall_height_and_arch_segment_height` —— 系统名字就写着：**墙高与「拱段高」是分别初始化的**。
+拱那一段的墙被单独抬高，所以拱顶上方那几块砖比两侧顶排高。不是顶排的一部分。
+
+---
+
+### 五、待确认（本卷新增三条）
+
+| # | 问题 | 需要什么证据才能确证 |
+| --- | --- | --- |
+| V5-1 | 顶排是否有**专门的排布分支**（例如「最后一层强制用更大的砖长」） | 反编译 `WallConstructor::from_curve`；或游戏内对照实验 —— 连续调墙高，看顶排砖尺寸是否与其它层一样随机跳。**顶排恒定而其它层随机 ⇒ 有特判** |
+| V5-2 | `StitchBrick` 走墙砖专用管线还是 nani | 找 `spawn_stitch_bricks` 里 spawn 的组件类型，或在 `AssetSsboLibrary` 里定位它注册的 buffer |
+| V5-3 | 垛口在 `from_curve` 里的具体交替机制 | 同 V5-1，需要反编译 |
+
+---
+
+### 六、对本项目的行动项
+
+| # | 行动 | 依据 |
+| --- | --- | --- |
+| **A11** ✅ | **（转角角石部分已于 2026-08-31 落地）城齿 / 转角角石 / 勒脚 / 檐口不该各写一套** —— 全部并入 `SolveBlockLayout`，只换驱动曲线。这**修正了本文卷一 A7**「转角护角砖不依赖任何接缝设施」的措辞：它不只是「和门框砖共用一路」，而是和垛口、勒脚、门框墩共用**同一个求解器** | §2.1、§3.3、`[计划]` D11 |
+| **A12** | 拱缘装饰带若要做，**照 hat 件走真 SplineMesh**（一条烘好的多砖网格 + 3 控制点弯 + 顶点 `brick_id`），别逐砖实例 —— 比实例便宜，且跨度变化时天然不露缝。TG 自己就在这儿破了「全部刚体实例」的例 | §2.2 |
+| **A13** | **屋顶瓦不要复用 `CSHouseFrame`。** 它在 TG 是独立实例格式 + 独立 VS + 独立 compute。倒是「屋脊 / 垛口用砖收口」可以直接吃现成的砖路 | §3.5 |
+| **A14** | 若要复刻上沿的观感，**别去建"上沿石头"这个构件** —— 按 §4.2 的三条（水平向胀大、顶面受光、随机层高）调参即可 | §4.1、§4.2 |
 
 ---

@@ -49,11 +49,13 @@ public:
 
 	/** Hand the factory the per-instance SRVs. Must be called before InitResource(); the
 	 *  InstanceVF uniform buffer is built from them in InitRHI. */
-	void SetInstanceStreams(FRHIShaderResourceView* InOriginSRV, FRHIShaderResourceView* InTransformSRV, FRHIShaderResourceView* InLightmapSRV)
+	void SetInstanceStreams(FRHIShaderResourceView* InOriginSRV, FRHIShaderResourceView* InTransformSRV, FRHIShaderResourceView* InLightmapSRV,
+		FRHIShaderResourceView* InCustomDataSRV = nullptr)
 	{
 		InstanceOriginSRV = InOriginSRV;
 		InstanceTransformSRV = InTransformSRV;
 		InstanceLightmapSRV = InLightmapSRV;
+		InstanceCustomDataSRV = InCustomDataSRV;
 	}
 
 	//~ FRenderResource interface
@@ -95,6 +97,7 @@ public:
 	FRHIShaderResourceView* GetInstanceOriginSRV() const { return InstanceOriginSRV; }
 	FRHIShaderResourceView* GetInstanceTransformSRV() const { return InstanceTransformSRV; }
 	FRHIShaderResourceView* GetInstanceLightmapSRV() const { return InstanceLightmapSRV; }
+	FRHIShaderResourceView* GetInstanceCustomDataSRV() const { return InstanceCustomDataSRV; }
 	FRHIUniformBuffer* GetInstanceUniformBuffer() const { return InstanceUniformBuffer.GetReference(); }
 
 private:
@@ -102,6 +105,7 @@ private:
 	FRHIShaderResourceView* InstanceOriginSRV = nullptr;
 	FRHIShaderResourceView* InstanceTransformSRV = nullptr;
 	FRHIShaderResourceView* InstanceLightmapSRV = nullptr;
+	FRHIShaderResourceView* InstanceCustomDataSRV = nullptr;
 
 	TUniformBufferRef<FInstancedStaticMeshVertexFactoryUniformShaderParameters> InstanceUniformBuffer;
 };

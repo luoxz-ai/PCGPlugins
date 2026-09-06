@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "CSGroundCover.h"        // 地被（草 + 花）：FCoverBuffers / FScatterParams
 #include "CSGroundDecor.h"        // 裙边摆件（D12 第五家）：FSite / FShaperRing，规划段共用 CSHouseDecor
 #include "CSGroundRockShell.h"
 #include "CSGroundStairs.h"
@@ -13,6 +14,7 @@ class ACSGroundShaperActor;
 class UCSGpuInstancedMeshComponent;
 class UCSMesh;
 class UCSMeshRenderComponent;
+class UMaterialInstanceDynamic;
 class UMaterialInterface;
 class UStaticMesh;
 
@@ -42,6 +44,155 @@ struct COMPUTESHADERGENERATOR_API FCSGroundMirror
 
 	bool IsInitialized() const { return NumVertsX > 1 && NumVertsY > 1 && Heights.Num() == NumVertsX * NumVertsY && Colors.Num() == Heights.Num(); }
 	int32 VertexIndex(int32 X, int32 Y) const { return Y * NumVertsX + X; }
+};
+
+/**
+ * 地被读镜像顶点色的哪一个通道当遮罩。
+ *
+ * 默认 R —— 它就是笔刷画出来的**道路权重**（`FCSGroundMirror::Colors` 的约定，D6），
+ * 所以"画一笔路"当场就是"这条路上不长草"，不需要再画第二张遮罩。G/B/A 目前没有别的消费者，
+ * 想给某个物种单开一张遮罩时把笔刷的 `PaintChannelMask` 换过去即可。
+ */
+UENUM(BlueprintType)
+enum class ECSGroundCoverMaskChannel : uint8
+{
+	Red     UMETA(DisplayName = "R（道路权重）"),
+	Green   UMETA(DisplayName = "G"),
+	Blue    UMETA(DisplayName = "B"),
+	Alpha   UMETA(DisplayName = "A"),
+};
+
+/**
+ * 一个地被物种（草，或某一种花）。草与花共用这一份结构 —— 两者在 GPU 上跑的是**同一个
+ * kernel**，只差 uniform（密度、遮罩阈值、缩放、盐），分两套参数只会在下一次调参时分叉。
+ *
+ * ⚠️ `MaxInstances` 是**唯一**同时约束显存与 dispatch 规模的旋钮：散布格的格数被它钳住
+ * （`CSGroundCover::MakeGridForDensity`），超预算时**密度自动退让**而不是把编辑器跑挂。
+ * 地面镜像最大 1024² × 50 cm = 512 m 见方，50 株/m² 就是 1300 万线程 —— 没有这个钳位，
+ * 把地面拉大一档就会挂掉整个编辑器。
+ *
+ * 它是**天花板不是预算**：缓冲按实际格数分配，所以默认就顶到上限，让密度在正常尺寸的地面上
+ * 原样生效；只有真的算超了才退让（并打日志说明退到了多少）。
+ */
+USTRUCT(BlueprintType)
+struct COMPUTESHADERGENERATOR_API FCSGroundCoverSpecies
+{
+	GENERATED_BODY()
+
+	/** 基础网格。**为空 = 这个物种整条关掉**（不建组件、不分配显存、不发 dispatch）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover")
+	TObjectPtr<UStaticMesh> Mesh;
+
+	/**
+	 * 材质。⚠️ **必须勾 `bUsedWithInstancedStaticMeshes`** —— 没勾的材质在实例路径上会被引擎
+	 * **静默换成默认材质**，画面一片灰而所有 readback 断言照绿（与裙边摆件同一条陷阱，
+	 * `GetGroundCoverUndrawableReason()` 把它做成了显式判据）。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover")
+	TObjectPtr<UMaterialInterface> Material;
+
+	/** 每平方米几株。TG 满密度实测 ≈ 50 株/m²（tile 2.03 m 见方、≤ 204 叶）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover", meta = (ClampMin = "0.0", ClampMax = "400.0"))
+	float DensityPerSqM = 50.0f;
+
+	/**
+	 * 散布格的**格数天花板**。见结构注释里的 ⚠️。
+	 *
+	 * 默认顶到上限：显存**按实际格数分配**（`Capacity = GridX × GridY`，density 说了算），
+	 * 天花板只在"这块地面按这个密度算出来的格数超了"时才生效 —— 所以调高它在密度用不到的
+	 * 时候一个字节都不多花，只是把"自动退让"的触发点推远。
+	 *
+	 * 触发点参考：1048576 格 ≈ 50 株/m² 铺满 **145 m 见方**；真触发时每 1 万格 ≈ 0.8 MB。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover", meta = (ClampMin = "64", ClampMax = "1048576"))
+	int32 MaxInstances = 1048576;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|Mask")
+	ECSGroundCoverMaskChannel MaskChannel = ECSGroundCoverMaskChannel::Red;
+
+	/** 遮罩 ≤ Start 完全不受抑制；≥ End 完全不长；中间按**概率**拒绝（硬阈值会切出一条直边）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|Mask", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float MaskStart = 0.15f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|Mask", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float MaskEnd = 0.45f;
+
+	/** 遮罩 → 压高比例。TG 在路上把草高乘 (1 − path × 0.7)，路边因此是矮草过渡而不是一刀切。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|Mask", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float MaskShorten = 0.7f;
+
+	/**
+	 * 比这更陡的坡不长草。坡度由**合成后**的高度场中心差分求，与岩壳 mask 同源。
+	 *
+	 * ⚠️ **2026-09-06 由 55° 降到 30°（用户裁决：草默认不要长在斜面上）**。55° 的老默认值让草一路
+	 * 长到 `tan 55° = 1.43` 的坡上 —— 那已经**比岩壳完全铺满的坡（`RockShellSlopeHi = 1.25`）还陡**，
+	 * 于是草直接从石头缝里长出来。参照系：岩壳从 `RockShellSlopeLo = 0.75`（≈ 37°）开始淡入，所以
+	 * 30° 让草在石头露头之前就收干净。想更严往 20~25° 调；想让草与石头正好咬合就调到 37°。
+	 *
+	 * ⚠️ 这一条是**硬阈值**（`CSGroundCover.usf` 的「4) 坡度门控」直接 `return`），而它上面那条遮罩
+	 * 门控是**概率拒绝** —— 理由就写在那里：硬阈值会沿等值线切出一条肉眼可见的直边。阈值挂在 55°
+	 * 时坡本身就少见，这条边基本看不到；降到 30° 之后它落进常见坡度区，直边会明显起来。真被看出来
+	 * 了就把坡度门控也改成概率拒绝（与遮罩共用同一套格身份哈希，边界才不会重扫时闪烁）。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|Mask", meta = (ClampMin = "0.0", ClampMax = "89.0"))
+	float MaxSlopeDegrees = 30.0f;
+
+	/** 落点抖动幅度，格距的比例。0 = 规则网格（会看出格子），1 = 整格随机（默认）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|Shape", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float Jitter = 1.0f;
+
+	/** 均匀缩放区间（乘在基础网格上）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|Shape", meta = (ClampMin = "0.0"))
+	FVector2D ScaleRange = FVector2D(0.85, 1.25);
+
+	/** Z 轴额外抖动（±），只改高矮不改粗细 —— 与均匀缩放共用一个哈希会读成"几种尺寸的同一株"。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|Shape", meta = (ClampMin = "0.0", ClampMax = "0.95"))
+	float HeightJitter = 0.25f;
+
+	/** 最大倾倒角（度，±）。草有（TG 的叶片是歪的），花基本为 0。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|Shape", meta = (ClampMin = "0.0", ClampMax = "80.0"))
+	float LeanDegrees = 12.0f;
+
+	/** 0 = 一律世界上（TG 的草就是这样），1 = 完全贴地形法线。花插在坡上时给一点更自然。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|Shape", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float AlignToNormal = 0.0f;
+
+	/** 根部沉入地表的深度（cm）。整株浮在地表上会读成"掉了个道具"（石子那条的实测结论）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|Shape", meta = (ClampMin = "0.0"))
+	float Sink = 2.0f;
+
+	/**
+	 * 把网格的**包围盒底面**钉到地表（原点抬 −Min.Z × 高度缩放），而不是把网格原点钉到地表。
+	 *
+	 * ⚠️ **默认开是有实测依据的**：TG 提取出来的 `lowpoly_flower`，包围盒离原点 **30 cm 才开始**
+	 * —— 不补这一项，整片花会齐刷刷悬空 30 cm，而剔除球 / 包围盒 / 实例数**全都看不见它**。
+	 * `SM_TG_GrassBlade` 的 Min.Z 恰好是 0，所以草开不开都一样。
+	 *
+	 * 关掉它的场合：网格**本来就该埋一截**（`garden_flower_01_lavender` 的茎向下伸 1 m），
+	 * 坐底会把整根茎顶出地面。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|Shape")
+	bool bSeatOnBase = true;
+
+	/**
+	 * 这个物种投不投阴影。**默认关**（2026-09-06 用户裁决：草和花不要投影）。
+	 *
+	 * 地被是一株一个 instance、满密度 50 株/m²，投影是这条路上最贵的一项：每一株都要进
+	 * 阴影深度 pass 再画一遍，而叶片本身只有几个三角 —— 付的是 draw 侧的固定开销，不是像素。
+	 * 观感上也不缺：TG 的草同样不投影，草地的明暗来自地面自己的阴影与 AO。
+	 *
+	 * ⚠️ 写在**组件**上（`EnsureCoverComponents` 里 `SetCastShadow`），不是材质开关 ——
+	 * 材质那一层关不掉阴影 pass 的 draw。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover|Shape")
+	bool bCastShadow = false;
+
+	/**
+	 * 物种盐。⚠️ **两个物种撞盐会让它们逐格完全相关** —— 每一朵花的位置上必定也有一株草，
+	 * 花因此永远长在草心里，看起来像穿模而不是像野花。默认值刻意各不相同。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cover")
+	int32 Salt = 1;
 };
 
 /**
@@ -178,6 +329,34 @@ public:
 	/** 道路权重阈值：格心的 R 通道过阈才算"路经过这里"。与岩壳的隐藏阈值共用同一个数。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Stairs", meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float StairRoadThreshold = 0.35f;
+
+	/**
+	 * **塑形物峰高低于这个数就整座不出台阶**（cm）。0 = 关掉这条门控。
+	 *
+	 * 2026-09-06 用户裁决：矮包不需要台阶。默认 60 = 2 × `StairStepHeight` —— 一级 30 cm 的
+	 * 落差是个路沿不是楼梯，抬脚就上去了，摆一排石块反而像路障。
+	 *
+	 * ⚠️ 判据是**整座塑形物的峰高**，不是本格的地面高度：按本格高度判会把高包裙边最低那几级
+	 * 也删掉（那里本格高度同样很小），而那几级正是人要踩的。峰高 = `LiftHeight × (1 + 二次抬升
+	 * 系数)`，就是 `GroundShaperEvalOne` 在台顶的取值，落地在 `GroundShaperHeightAtXYTallOnly`。
+	 *
+	 * ⚠️ 高包与矮包重叠的那一片**照旧出台阶** —— 门控问的是「这里有没有够高的包」，
+	 * 高包的裙边只要够得到，台阶就该有。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Stairs", meta = (ClampMin = "0.0"))
+	float StairMinMoundHeight = 60.0f;
+
+	/**
+	 * **掐掉每座最顶上那一级台阶**（2026-09-06 用户裁决）。
+	 *
+	 * 台顶那圈等值线贴着平台边缘走，人踩到它的时候已经站在台上了 —— 那一级不承担上行，
+	 * 只在平台沿上留一道绊脚的坎。
+	 *
+	 * ⚠️ 顶层号由**整座的峰高**推，不是本格高度：`ceil(峰高 / StairStepHeight) − 1` 是最顶那层，
+	 * 上限压到它减一。落地在 `CSGroundStairs.usf` 的层数钳位一段，峰高来自 `GroundShaperPeakAtXY`。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Stairs")
+	bool bStairDropTopStep = true;
 
 	/**
 	 * 沿坡**向上**推进 cm，让踏面扎进坡里（原型 attribwrangle7 的 Noffset）。负值则向外挑出。
@@ -367,7 +546,53 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Rock Shell")
 	bool bRockShell = true;
 
-	/** 岩壳材质。为空退回引擎默认表面材质（壳照样画，只是灰的）。 */
+	/**
+	 * 顶点法线走**全平均**（按静止姿态的重合组，面积加权），而不是逐三角的面法线。
+	 *
+	 * ⚠️ **2026-09-04 改为默认关 = TG 原样**（用户：先按 TG 的方案做一版）。TG 只有一趟，
+	 * `_rocky_terrain_displace.cs:768` 每三角写 `normalize(cross(...))`，全程不平滑；软化完全
+	 * 靠 PS 那条噪声混合。**打开 = 我们比 TG 多的那一层**（带 `RockShellSmoothAngleDeg` 阈值），
+	 * 用来从根上治刻面 —— 这一个勾就是「TG 原样」与「阈值平滑版」的 A/B 开关。
+	 *
+	 * 2026-09-03 曾裁决默认开且不设阈值：面法线给的是"每个三角一个硬边"，盖面在缓坡上被地形
+	 * 弯出来的那点起伏全部读成刻面，用户判为"非常干扰"。那一版的问题是把折痕也一起圆掉了。
+	 *
+	 * ⚠️ **2026-09-04 用户裁决：加回夹角阈值**（`RockShellSmoothAngleDeg`），推翻上面「不设
+	 * 阈值、全平均」那一半。全平滑之后盖裙折痕整个圆掉，材质再怎么画也补不回一道真硬边。
+	 * 当初否掉阈值的理由是「有阈值就得烘逐边邻接、还要两趟比较角度」——**那条不成立**：按
+	 * 面法线夹角判只要逐角的重合组表，而第二趟本来就在读每个入射三角的位置，一行点积、
+	 * 零额外烘焙、零额外 dispatch。
+	 *
+	 * ⚠️ 另一条同日被推翻的：原记「组不跨胞腔 ⇒ 石头之间照旧是硬边」。实测 74,180 条内部边里
+	 * **8,743 条跨胞腔**（11.8%），相邻石头确实共享顶点 —— 阈值一并管住了这里：石头之间的
+	 * 夹角通常远大于阈值，于是自动断开。
+	 *
+	 * 关掉 = 回到面法线。留这个开关是为了调材质时能直接 A/B，不用重编。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Rock Shell")
+	bool bRockShellSmoothNormals = false;
+
+	/**
+	 * 平滑的夹角阈值（度）。入射三角的面法线与本三角面法线夹角超过它就不参与平均 ⇒ 那条边
+	 * 在几何这一层是硬边。默认 30 沿用 Houdini 原型的 `cuspangle=29.9`。
+	 *
+	 * 两端是有意义的调试档：**0 = 只认自己**，等价于关掉 `bRockShellSmoothNormals`（面法线，
+	 * 每三角一道硬边）；**180 = 全平均**，等价于 2026-09-03..09-04 之间的行为。
+	 * 盖裙折痕的二面角远大于 30°，所以它是硬的；盖面被地形弯出来的缓起伏远小于 30°，照旧平滑。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Rock Shell",
+		meta = (EditCondition = "bRockShellSmoothNormals", ClampMin = "0.0", ClampMax = "180.0"))
+	float RockShellSmoothAngleDeg = 30.0f;
+
+	/**
+	 * 岩壳材质。为空退回引擎默认表面材质（壳照样画，只是灰的）。
+	 *
+	 * 实际绘制的是它的一个**动态子实例**（`RockShellMaterialInstance`），只多带一个标量
+	 * `RockShellPatternScale` = 本 actor 的图案缩放，供假倒角材质把 TG 原生的图案口径换算到
+	 * 世界（`Docs/TinyGlade/CSRockShellEdgeBevel.md`）。网格的 `Materials[0]` 仍是本资产 ——
+	 * `SaveToStaticMesh` 带走的是它，瞬态实例进不了资产。演示关卡填的是 `MI_rocky_terrain`
+	 * （母材质 `M_TG_Texture`，倒角子图挂在它的静态开关 `RockShellBevel` 后面）。
+	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Rock Shell")
 	TObjectPtr<UMaterialInterface> RockShellMaterial;
 
@@ -376,30 +601,161 @@ public:
 	 * （`Scripts/TinyGladeImportRockShell.py`）。它只当**数据**读（逐顶点胞腔属性在 UV1/UV2），
 	 * 从不作为网格被渲染。
 	 *
-	 * ⚠️ **默认值是硬编码的资产路径而不是空** —— 同 `bRockShell` 那条注释里的教训：留空
-	 * 让别人去填，就会像 `StairMesh` 那样在两张演示关卡里一直是空的，而所有断言照绿。
+	 * ⚠️ **默认值留空，由蓝图填** —— C++ 只硬编码引擎自带资产，项目资产一律走蓝图引用
+	 * （本项目是 `/PCGPlugins/HouseTest/BP_TinyGladeGround`）。`bRockShell` 那条注释里
+	 * 「留空让别人去填就会像 `StairMesh` 那样一直是空的」这条教训改由蓝图默认值兜住：
+	 * 两张演示关卡的地面都是那个蓝图，蓝图上填好就不会空。
 	 * 抽不出数据时 `IsRockShellDrawable` 会给出具体原因（缺资产 / UV 通道不够 / CPU 访问没开）。
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Rock Shell")
-	TSoftObjectPtr<UStaticMesh> RockShellPatternMesh =
-		TSoftObjectPtr<UStaticMesh>(FSoftObjectPath(CSRockShell::DefaultPatternAssetPath));
+	TSoftObjectPtr<UStaticMesh> RockShellPatternMesh;
 
 	/**
 	 * 碎裂图案 → 世界的各向同性缩放。**1.0 = 原件的原生口径**：tile 136.5 m、609 个胞腔、
 	 * 间距 5.53 m、盖三角等边等效边长 1.25 m —— 与 Tiny Glade 逐字相同的绝对密度。
 	 *
-	 * 本项目地面 128 m（`NumCells 256 × CellSize 50`）小于 136.5 m，所以 1.0 就是
-	 * **原生尺寸铺一张、中心对齐、每边富余 4.25 m**，既不平铺也不缩放：
-	 *   · 平铺**不成立** —— 实测 tile 的两侧边界点不一致，不是周期的，接缝会露；
-	 *   · 缩放会同时改变胞腔尺寸与三角边长，直接丢掉「与 TG 同绝对密度」这个唯一的观感锚点。
-	 * 富余的那圈落在地面外，由 kernel 的域判据关掉（见 `FDisplaceParams::DomainMin/Max`）。
+	 * ⚠️ **默认已从 1.0 改为 0.35（2026-08-31 用户裁决），"与 TG 同绝对密度"这个锚点被有意放弃。**
+	 * 理由是实测账：塑形物默认裙边 8 m，而原生胞腔 5.53 m ⇒ **整圈只排得下一层胞腔**
+	 * （16.4 个，实测活 13.7 个），坡度 mask 再啃掉边缘的半个，画面上就是"几块大板 + 大缝"。
+	 * 0.35 把胞腔压到 1.94 m，8 m 裙边能排四层，缝自然消失。
+	 * TG 那个 5.53 m 是给**真悬崖**用的，套到一座 8 m 裙边的小土台上本来就不成立。
 	 *
-	 * ⚠️ 5.53 m 的胞腔让计划 D9 的塑形物尺度警告从建议变成**硬要求**：默认
-	 * `Radius=150` / `FalloffDistance=200` 的裙边只有 2 m 宽，一块碎石都长不出来。
-	 * 演示关卡因此改成 `Radius=600` / `Falloff=800`。
+	 * ⚠️⚠️ **缩放缩的是整张 tile，不是胞腔** —— 0.35 之后 tile 只有 **47.8 m**，小于 128 m 的地面，
+	 * **覆盖区外静默无壳**。平铺补不上（实测 tile 两侧边界点不一致、不是周期的，会露缝）。
+	 * `RebuildRockShell` 因此逐塑形物查一遍触及范围是否落在覆盖区内，超出会打 Warning。
+	 * 想让全地面都能长壳，把本值调回接近 1.0，代价是回到上面那个"一层大胞腔"的观感。
+	 *
+	 * ⚠️ 塑形物尺度仍是硬要求（只是阈值随本值缩）：`Radius=150` / `FalloffDistance=200`
+	 * 那种 2 m 裙边，在 1.94 m 胞腔下也只排得下一层。演示关卡用的是 `Radius=600` / `Falloff=800`。
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Rock Shell", meta = (ClampMin = "0.05", ClampMax = "4.0"))
-	float RockShellPatternScale = 1.0f;
+	float RockShellPatternScale = 0.35f;
+
+	/**
+	 * 厚度（`RockShellCellRelief`）所乘的坡度 mask 的**下限**。0 = 照旧全乘 `Rock`，1 = 完全不衰减。
+	 *
+	 * ⚠️ **这一条是"壳有没有体积"的主开关，不是微调**（2026-08-31 实测）。kernel 原本写
+	 * `Relief * Rock`，而 `Rock = smoothstep(SlopeLo, SlopeHi, |∇h|)`：演示土台最陡才 1.3125，
+	 * 只有极窄一圈能到 `Rock ≈ 1`，**大部分活胞腔的 Rock 只有 0.1~0.5** ⇒ 30 cm 的设定值
+	 * 实际只剩 3~15 cm，整张壳读成"开裂的平毯"。TG `displace:577` 那条是在真悬崖上跑的，
+	 * 那里 Rock 本来就 ≈1，照抄到缓坡上就失真。
+	 *
+	 * ⚠️ **默认已改回 0（TG 口径）** —— 本值一度默认 0.5，作为"壳没有体积"的临时补丁。
+	 * 后来反编译 `_rocky_terrain_displace_rocky_terrain.cs:721` 查清了真机制：TG 的
+	 * `Relief × mask` 与我们原来写的**一模一样**，它的体积来自另外两项我们完全没有的东西
+	 * （突起量 ∝ 坡度、以及 `rocky_terrain.y` 那份偏移）。体积的职责因此交给下面
+	 * 「石头隆起」那一组（`RockShellRiseMultiplier` 等），本值退回纯调参用途、默认不偏离 TG。
+	 *
+	 * 抬它的副作用是实测过的：0.5 会让 `RockShell.DrapesOnSlopes` 的最大垂直距离
+	 * 从 66 cm 以内涨到 83.9 cm —— 那条容差是按"厚度被 mask 压着"标定的。
+	 * 想再抬它就得连那条容差一起重新标定，别只改一头。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Rock Shell", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float RockShellReliefFloor = 0.0f;
+
+	// =========================================================================
+	// 「石头隆起」（用户规格 2026-08-31）—— 六个参数，全部蓝图可调
+	//
+	// 这一组回答的是"包边为什么没有体积"：石头**不再只是贴着地面披挂**，而是按地形隆起的倍数
+	// 自己再抬起来一截，边缘再扎回地里。与上面 `RockShellCellRelief`（逐胞腔的壳厚）是两件事：
+	// 那个给的是"每块石头有多厚"，这一组给的是"整片石头比地面高多少"。
+	// =========================================================================
+
+	/**
+	 * ② ⑤ 切分后的每一片沿径向**朝外**扩张的距离 cm，用来闭合片与片之间的缝。
+	 *
+	 * 图案本身是零重叠零空隙的（盖 86.60% + 裙 13.40% = 100.0000%），所以缝不是图案漏的 ——
+	 * 它来自逐片的位移（`CellRelief` 让相邻盖错开、`CellJitter` 让它们胀缩）。本值把每片整体
+	 * 往外推一点，让相邻片互相压住，与门框砖的 `FrameBrickBloat` 是同一条 TG 纪律（**负缝**）。
+	 *
+	 * ⚠️ 方向靠 `-DirToCentroid`：契约写的是朝外，**实测指向质心**，所以 kernel 里用的是减号。
+	 * 位移带一个到质心的半径淡入，否则顶盖内部点会被推过质心、翻转周围三角。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Rock Shell|Rise", meta = (ClampMin = "0.0", ClampMax = "200.0"))
+	float RockShellCellExpand = 12.0f;
+
+	/**
+	 * 裙圈倾斜（用户方案 2026-08-31）：**只把底圈**再沿 −DirToCentroid 朝外推的距离
+	 * （**图案空间 cm**，世界效果 = ×PatternScale）。
+	 *
+	 * 目的与 `CellExpand` 不同：那个整片平移（含盖），闭合的是缝的**顶宽**；本值只动底圈，
+	 * 改的是裙墙的**倾角** —— 竖直裸墙变外撇斜壁，相邻胞腔的底圈各自越过 Voronoi 边界钻到
+	 * 对方裙下，两片斜壁在 V 槽中段**互相交叉**，缝隙从机制上封死（黑槽 = 相邻盖浮高不同时
+	 * 暴露的竖直墙间隙，斜壁交叉后没有视线能进槽底）。
+	 *
+	 * 盖的形状一动不动 ⇒ 图案观感、`DrapesOnSlopes` 的披挂契约都不受影响（每个顶点仍在
+	 * 自己 XY 采地面高度，只是底圈的 XY 挪远了一点）。调 0 = 旧行为（竖直裙墙）。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Rock Shell|Rise", meta = (ClampMin = "0.0", ClampMax = "200.0"))
+	float RockShellSkirtTilt = 20.0f;
+
+	/**
+	 * ③ 石头隆起相对**地形隆起**的倍数：`石头高 = 地形高 × 本值`。
+	 *
+	 * ⚠️ **默认已从 1.25 归回 1.0（2026-08-31 用户看图裁决）**：TG 的壳**从不离开地形** ——
+	 * 它的位移是有界的（基准 ±0.2/−0.4 m + 厚度 0.3 m + 起伏 ∝ 坡度），而本值是随台高线性长的
+	 * **无界**量。演示档 `Lift=700` 下 1.25 意味着台肩处 +175 cm，再叠基准/浮高/噪波就是
+	 * 约 2 m 的石墙冠 —— 画面上读成一圈**独立的火山口壁**，台顶陷在墙圈里面。
+	 * 体积的职责移交给 TG 口径的三层（`BaseLift`/`BaseSink`、`CellRelief`、坡度比例起伏）。
+	 * 本组四个参数保留为**风格化旋钮**（默认全中性），拧它们就是有意离开 TG 形态。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Rock Shell|Rise", meta = (ClampMin = "0.0", ClampMax = "4.0"))
+	float RockShellRiseMultiplier = 1.0f;
+
+	/**
+	 * ④ 隆起时叠加的噪波幅度 cm。按隆起量淡入 —— 平地一点不加，否则整片地面起毛刺。
+	 * ⚠️ 默认 25 → 0（同上那次裁决）：TG 没有这条沿世界 Z 的噪波，它的表面细节全在
+	 * `RockShellNoiseAmount` 那条**沿法线、∝ 坡度**的起伏里。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Rock Shell|Rise", meta = (ClampMin = "0.0"))
+	float RockShellRiseNoiseAmount = 0.0f;
+
+	/** ④ 隆起噪波的波长 cm。太短会低于地面网格采样率，看着像"石头和地面对不上"。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Rock Shell|Rise", meta = (ClampMin = "1.0"))
+	float RockShellRiseNoiseWavelength = 400.0f;
+
+	/**
+	 * ⑥ 石头隆起的**台顶外扩距离** cm：隆起的衰减比地面**晚**这么远才开始。
+	 *
+	 * 实现是把每座塑形物的 `Radius` 临时加上本值再求值（不是缩 `Falloff`）—— 前者把台顶整体
+	 * 外推、裙边形状原样保留；后者会把裙边压陡，连带改掉坡度 mask 与石阶的等值线。
+	 *
+	 * ⚠️ 默认 150 → 0（同上那次裁决）：外扩让壳在地面已经落下去的地方还端着满高，
+	 * 正是截图里"近垂直石墙外立面"的来源。TG 没有对位物。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Rock Shell|Rise", meta = (ClampMin = "0.0"))
+	float RockShellRiseExtend = 0.0f;
+
+	/**
+	 * ⑧ **末端边缘的隆起相对该点地面高度的上限比例，必须 < 1。**
+	 *
+	 * 硬不变量：石头的末端边缘隆起值一定小于可采样的地面高度 —— 石头必须扎回地里，不许悬空。
+	 * 只在边缘生效（权重取 `1 − RockMask`：内部不约束，band 外缘满约束）。
+	 * 取 1.0 会让最外圈与地面共面 ⇒ 一圈 z-fighting，所以内部再夹到 0.999。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Rock Shell|Rise", meta = (ClampMin = "0.0", ClampMax = "0.999"))
+	float RockShellEdgeCeiling = 0.9f;
+
+	/**
+	 * 岩石 mask 满时，整张壳沿**世界 Z** 浮起的 cm。TG `displace_rocky_terrain.cs:563` 的 +0.2 m。
+	 *
+	 * 与 `RockShellRiseMultiplier`（③）是两件事，而且**互补**：③ 是随台高线性长的无界量，
+	 * 在缓坡小土台上几乎给不出体积；本项是有界常量，多高的台子都只浮这么多，缓坡上照给。
+	 * 完整式子是 `lerp(−BaseSink, +BaseLift, saturate(Rock − Road))`，
+	 * 对位 TG 的 `mix(-0.4, 0.2, clamp((mask + rocky_terrain.z) − 10·path, 0, 1))`
+	 * （`rocky_terrain.z` 是笔画自带的岩石度，本项目没有那条通道）。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Rock Shell|Rise", meta = (ClampMin = "0.0"))
+	float RockShellBaseLift = 20.0f;
+
+	/**
+	 * mask 空、或路上时，整张壳沿**世界 Z** 沉下的 cm。TG 同一行的 −0.4 m。
+	 *
+	 * ⚠️ 它同时在给 ⑧ 兜底：末端 `Rock → 0` ⇒ 本项取满 ⇒ 外缘被额外往地里按。
+	 * 调到 0 不会报错，只是外缘会更容易露出来。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Rock Shell|Rise", meta = (ClampMin = "0.0"))
+	float RockShellBaseSink = 40.0f;
 
 	/** 坡度软阈的下端：|∇h| 低于它完全没有壳。与 TG 的 `smoothstep(0.75, 1.25, ·)` 同口径。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Rock Shell", meta = (ClampMin = "0.0"))
@@ -457,13 +813,47 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Rock Shell", meta = (ClampMin = "0.0"))
 	float RockShellCellRelief = 30.0f;
 
-	/** 表面 FBM 沿法线的幅度 cm。角点不加噪声（TG `displace:579`），否则共享角会裂开缝。 */
+	/**
+	 * 表面起伏沿法线的幅度 cm，**口径是「坡度 = 1 时的满幅」而不是常幅**（2026-08-31 改）。
+	 *
+	 * 实际幅度 = 本值 × 坡度 × `mix(-0.2, 1 − smoothstep(4,7,坡度), n01)` × `smoothstep(0,0.3,Rock)`，
+	 * 照 TG `displace_rocky_terrain.cs:721` 的那一项，默认 30 cm 就是 TG 的 0.3 m。
+	 *
+	 * ⚠️ **语义变过一次**：旧写法是常幅对称的 `Turbulence × 本值`（默认 6 cm）。对称噪声挖掉的
+	 * 和鼓出来的一样多、净体积为零，而且在缓坡上把幅度均摊到整片壳 —— 那正是"壳看着没有体积、
+	 * 像毯子起毛刺"的直接原因。现在幅度随坡度长、且偏正（凹陷最多占两成）。
+	 * 拿本值当"最大起伏"读会高估：演示土台最陡 1.3125 ⇒ 实际值域约 −7.9 .. +39 cm。
+	 *
+	 * 角点不加（TG `displace:579`）—— 角点被推动会让两侧的裙错开，缝张开或叠上。
+	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Rock Shell", meta = (ClampMin = "0.0"))
-	float RockShellNoiseAmount = 6.0f;
+	float RockShellNoiseAmount = 30.0f;
 
 	/** 表面 FBM 的波长 cm。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Rock Shell", meta = (ClampMin = "1.0"))
 	float RockShellNoiseWavelength = 150.0f;
+
+	/**
+	 * 边缘磕碰的幅度 cm（用户诉求 2026-08-31；2026-09-01 反编译确证后换成 TG 正版机制）。
+	 *
+	 * TG `displace:618` 的原话是 `noise(rest.xz×0.5 + 20×rockMask)`：**单倍频 value noise +
+	 * mask 域扭曲**。空间底波长 ~130 m 近似常数，变化全部来自 `20 × mask` —— mask 饱和的
+	 * 带内噪声局部恒定（**石头面干净**），mask 爬坡的带边缘域坐标扫过 ~14 格（**磕碰自动
+	 * 集中在岩石边缘**）。沿边缘的锯齿由 mask 自身的微起伏提供（我们这边是裙边噪声）。
+	 *
+	 * 边缘集中靠**连续场的梯度**，不靠顶点旗标 —— 同 XY 的盖缘/裙顶双胞胎拿同一个偏移，
+	 * 缝不裂。与 `RockShellNoiseAmount`（大起伏带，波长 1.5 m、∝ 坡度）职责互补。
+	 * 角点照旧钉死。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Rock Shell", meta = (ClampMin = "0.0"))
+	float RockShellChipAmount = 10.0f;
+
+	/**
+	 * 磕碰的**空间底**波长 cm（默认 300）。它只兜"mask 恰好平坦"的走廊 —— 磕碰的主频来自
+	 * mask 域扭曲（20×，TG 常数），不来自它。调短它会回到"满脸小凹凸"的近似版。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Rock Shell", meta = (ClampMin = "1.0"))
+	float RockShellChipWavelength = 300.0f;
 
 	/** 逐胞腔随机与表面噪声的种子。同种子同胞腔 ⇒ 逐位相同的结果（`RebuildRockShell` 幂等的一部分）。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Rock Shell")
@@ -481,9 +871,15 @@ public:
 	// 没有场、没有阈值、没有随机撒点。
 	// -------------------------------------------------------------------------
 
-	/** 关掉整条裙边摆件路径（不建组件、不分配显存、不发 dispatch）。留空网格表等价。 */
+	/**
+	 * 关掉整条裙边摆件路径（不建组件、不分配显存、不发 dispatch）。留空网格表等价。
+	 *
+	 * ⚠️ **2026-09-06 改为默认关**（用户裁决：地形隆起之后不要自动长出柴堆 / 桶这类摆件）。
+	 * 网格表与材质仍旧配在 `BP_TinyGladeGround` 上，所以这是一个勾就能拿回来的开关，
+	 * 不是把这条路删了。
+	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Skirt Decor")
-	bool bSkirtDecorEnabled = true;
+	bool bSkirtDecorEnabled = false;
 
 	/** 摆件网格表（一张网格 = 一个 palette = 一个实例化组件）。全空 = 这一家关掉。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Skirt Decor")
@@ -532,6 +928,42 @@ public:
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Skirt Decor")
 	int32 SkirtDecorSeed = 11;
+
+	// -------------------------------------------------------------------------
+	// 地被：草 + 花（第六条派生链）
+	//
+	// **归地面**，与石阶 / 岩壳 / 裙边摆件同一条理由：长不长草由两样东西决定 ——
+	// **合成后**的高度场（坡太陡不长）与地面的**顶点色遮罩**（画了路的地方不长），
+	// 两样都只有本 actor 手上有。完整依据与三条纪律写在 `CSGroundCover.h` 的文件头。
+	//
+	// 草与花是**同一个 kernel 的不同物种**（只差密度/遮罩/缩放/盐），一株一个 instance
+	// —— TG 的草也是每叶一个 instance，没有"一簇"这个概念。
+	// -------------------------------------------------------------------------
+
+	/** 关掉整条地被路径（不建组件、不分配显存、不发 dispatch）。物种网格留空等价。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Cover")
+	bool bGroundCoverEnabled = true;
+
+	/** 草。一株 = 一片叶（`SM_TG_GrassBlade` 就是 TG 那条 VS 公式的静态烘焙件）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Cover")
+	FCSGroundCoverSpecies Grass;
+
+	/**
+	 * 花。**一种花 = 一张网格 = 一个 palette = 一个实例组件**（一个组件只绑一张基础网格，
+	 * 塞进同一块 buffer 的后半段是画不出来的 —— 石子那条已经把这个结论写死过一次）。
+	 * 想加几种就加几行；每一行记得给一个**互不相同的 `Salt`**。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Cover")
+	TArray<FCSGroundCoverSpecies> Flowers;
+
+	/**
+	 * 地被的全局种子。⚠️ 随机源是 **(散布格坐标, 物种盐, 通道盐, 本种子)** 的身份哈希，
+	 * **不是** `InterlockedAdd` 的槽位 —— 槽位由线程组完成顺序决定，而本 pass 每一笔落笔
+	 * 都重扫，拿槽位当种子的症状是"画一笔路整片草原地重掷"，且没有任何断言会报红
+	 * （石阶 S1 栽过一次，现场在 `CSGroundStairs.usf:CSStairs_CellSeed`）。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Ground|Cover")
+	int32 GroundCoverSeed = 7;
 
 	// -------------------------------------------------------------------------
 	// Public API
@@ -877,6 +1309,43 @@ public:
 		bool& bOutRandomsMatchGpu);
 #endif
 
+	// --- 地被（草 + 花）------------------------------------------------------
+
+	/**
+	 * 重新散布地被。**草与所有花在同一张 RDG 图里一起录完**（每个物种一次 clear + 一次
+	 * dispatch）—— 色流 SRV、塑形物参数上传、`FCSMeshRenderThreadEdit` 的进出都只需要一份。
+	 *
+	 * 幂等：输入哈希没变就整趟早退，一次 enqueue 都不发（同岩壳 / 裙边摆件）。哈希里带
+	 * `PaintRevision`，所以画笔一落它就必然重扫 —— 这正是"路上不长草"要的时序。
+	 */
+	UFUNCTION(BlueprintCallable, CallInEditor, Category = "CS Ground|Cover")
+	void RebuildGroundCover();
+
+	/** 上一趟散布用的物种数（0 = 一个都没建组件）。诊断用，不回读 GPU。 */
+	UFUNCTION(BlueprintPure, Category = "CS Ground|Cover")
+	int32 GetGroundCoverSpeciesCount() const { return CoverComponents.Num(); }
+
+	/**
+	 * 画得出来吗（**不回读 GPU**，只查资产/组件/材质那几条会让画面一片灰或空白的前置条件）。
+	 * 与岩壳 / 裙边摆件同形：把"静默换材质"这类不报错的失败做成显式判据。
+	 */
+	UFUNCTION(BlueprintPure, Category = "CS Ground|Cover", meta = (DevelopmentOnly))
+	bool IsGroundCoverDrawable(FString& OutReason) const;
+
+	UFUNCTION(BlueprintPure, Category = "CS Ground|Cover", meta = (DevelopmentOnly))
+	FString GetGroundCoverUndrawableReason() const;
+
+	/**
+	 * **诊断 / 验收专用，阻塞**：某个物种在 GPU 上的实例计数（0 = 草，1.. = 花的下标 + 1）。
+	 * −1 = 那个物种没有组件，与"真的是 0 株"分开 —— 把读不到当 0 会让守着"关掉之后必须归零"
+	 * 的断言在管线坏掉时假绿（同 `DebugReadStairCountGpuSync` 的口径）。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "CS Ground|Cover", meta = (DevelopmentOnly))
+	int32 DebugReadGroundCoverCountGpuSync(int32 SpeciesIndex) const;
+
+	/** **诊断专用，阻塞**：某个物种的实例世界原点（已按 GPU counter 截断）。 */
+	int32 DebugReadGroundCoverOriginsSync(int32 SpeciesIndex, TArray<FVector>& OutWorldOrigins) const;
+
 	/** 顶点色全部铺回 BaseColor（高度不动），并重建。 */
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "CS Ground")
 	void ResetPaint();
@@ -1002,6 +1471,30 @@ private:
 	/** 参数打包：细节面板只暴露改观感的那几个，其余以 `CSHouseDecor::FParams` 的默认值为准。 */
 	CSHouseDecor::FParams MakeSkirtDecorParams() const;
 
+	/**
+	 * 把 `Grass` + `Flowers` 收成一张按下标对齐的物种表（下标 0 恒为草）。
+	 * 网格为空的物种**整条跳过**（不占组件、不占显存），所以表长 ≠ `Flowers.Num() + 1`。
+	 */
+	void CollectCoverSpecies(TArray<const FCSGroundCoverSpecies*>& OutSpecies) const;
+
+	/**
+	 * 保证地被的实例组件、GPU 缓冲与容量都就位。返回是否可以散布。
+	 *
+	 * 稳态下**零阻塞**：容量按"格数上限"一次付清（只涨不缩），组件与物种表按下标对齐，
+	 * 两者都没变时直接返回 —— 同 `EnsureRockShellMesh` / `EnsureStairComponent`。
+	 */
+	bool EnsureCoverComponents(const TArray<const FCSGroundCoverSpecies*>& Species);
+
+	/**
+	 * 地被的输入哈希：塑形物集合与高度场参数、地面几何配置、**落笔计数**、每个物种的配置。
+	 * `RebuildGroundCover()` 的第一句就用它短路，短路点在任何昂贵计算之前。
+	 *
+	 * ⚠️ **必须带上 `PaintRevision`**：遮罩就是顶点色，画一笔路就必须重散一次。而顶点色是
+	 * 257² 个字节，逐笔哈希整张表太贵；一个单调计数器给出同样的"变了没有"判定，代价是常数
+	 * （与岩壳那条逐字同理）。
+	 */
+	uint32 CoverInputHash(const TArray<const FCSGroundCoverSpecies*>& Species) const;
+
 	UPROPERTY(Transient)
 	TObjectPtr<UCSGpuInstancedMeshComponent> StairComponent;
 
@@ -1015,6 +1508,10 @@ private:
 
 	UPROPERTY(Transient)
 	TObjectPtr<UCSMeshRenderComponent> RockShellComponent;
+
+	/** `RockShellMaterial` 的动态子实例（见该属性的注释）。父材质换了才重建，缩放变了只改标量。 */
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> RockShellMaterialInstance;
 
 	/** 上次建壳时的图案资产与世界矩形：只有它们真变了才需要再走一次阻塞的建壳路径。 */
 	TWeakObjectPtr<UStaticMesh> RockShellBuiltPattern;
@@ -1116,6 +1613,33 @@ private:
 	 *  被重建，那时 bool 仍是 true，画面上还是旧网格 —— 症状是"换了资产但什么都没发生"。 */
 	UPROPERTY(Transient)
 	TArray<TObjectPtr<UStaticMesh>> SkirtDecorMeshesBuiltFrom;
+
+	// --- 地被（第六条派生链）：一个物种 = 一张网格 = 一个组件 = 一套实例源 ---
+
+	/** 下标 0 恒为草，1.. 为**网格非空**的花（顺序同 `Flowers`，空网格的那几行被跳过）。 */
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UCSGpuInstancedMeshComponent>> CoverComponents;
+
+	TArray<CSGroundCover::FCoverBuffers> CoverBuffers;
+
+	/** 组件是从哪几张网格建的。⚠️ **不能只靠"组件数对不对"**：在细节面板里换掉网格时组件数
+	 *  不变，只看数量就会得到"换了资产但什么都没发生"（裙边摆件那条踩过）。 */
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UStaticMesh>> CoverMeshesBuiltFrom;
+
+	/** 每个物种基础网格的局部包围球（未缩放），剔除球从它按最大轴缩放放大。 */
+	TArray<FVector3f> CoverBaseSphereCentres;
+	TArray<float> CoverBaseSphereRadii;
+
+	/** 坐底修正 = −局部包围盒 Min.Z（未缩放）。`bSeatOnBase` 关掉时传 0，见该属性的注释。 */
+	TArray<float> CoverBaseRises;
+
+	/** 上次交给组件的容量/包围盒：只有它们真变了才需要再走一次阻塞的 `SetInstanceSourceGPU`。 */
+	TArray<uint32> CoverHandedCapacities;
+	FBox CoverHandedLocalBounds = FBox(ForceInit);
+
+	/** 上次那一趟的输入哈希（0 = 还没散过）。`RebuildGroundCover()` 的第一句就用它短路。 */
+	uint32 CoverBuiltHash = 0;
 
 	/** 本次 stroke 的累计世界脏盒：EndPaintStroke 判断要不要标脏包；也是将来切 dirty 系统时的区域发布素材。 */
 	FBox StrokeDirtyBounds = FBox(ForceInit);

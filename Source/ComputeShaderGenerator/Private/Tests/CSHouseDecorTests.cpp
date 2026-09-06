@@ -54,12 +54,10 @@ CSHouseDecor::FSite CSDecorTest_MakeSite(const FVector2D& Footprint, const FVect
 		Site.Strips.Add(Strip);
 	}
 
-	Site.Roof.RidgeAxis = ECSRidgeAxis::X;
 	Site.Roof.Footprint = Footprint;
 	Site.Roof.EaveZ = CSDecorTest_WallHeight;
 	Site.Roof.Pitch = 35.0f;
 	Site.Roof.Overhang = 25.0f;
-	Site.Roof.Thickness = 12.0f;
 
 	Site.World = FTransform(Origin);
 	Site.BaseZ = Origin.Z;

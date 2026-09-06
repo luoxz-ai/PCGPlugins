@@ -36,7 +36,7 @@
 --- 还剩两张 unlit 的 TG 母材质：**已核实不在交付路径，故意保留** -------------------
 `M_TG_TextureMasked`（20 个 MI）与 `M_TG_Glass` 至今仍是 `MSM_UNLIT`。
 **这不是裁决六的遗漏，是核实之后的保留**（2026-08-31 复核）：两者的**唯一**消费者是
-`Content/TinyGlade/Maps/TinyGladeGallery.umap` 那张看图关卡 —— 990 处组件材质覆盖里
+`Content/HouseTest/TinyGladeAsset/Maps/TinyGladeGallery.umap` 那张看图关卡 —— 990 处组件材质覆盖里
 **没有一处**落在实例组件上，也没有任何 C++ / 蓝图 / 生成路径引用它们。
 裁决六的字面约束是「**任何交付路径上**的材质都不许是 `MSM_Unlit`」，看图关卡不在交付路径上，
 与 `M_SimpleBrush` / `M_Bound` / `M_TransformTest` / `M_Color` 那四张调试材质同一档
@@ -61,8 +61,8 @@
 """
 import unreal
 
-MASTER = "/Game/TinyGlade/Materials/M_TG_Texture"
-SHELL_MI = "/Game/TinyGlade/MaterialInstances/MI_rocky_terrain"
+MASTER = "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/M_TG_Texture"
+SHELL_MI = "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_rocky_terrain"
 
 PARAM_AMOUNT = "RockShellCapSkirt"     # 0 = 整条支路关掉（默认）；1 = 全额
 PARAM_DARKEN = "RockShellSkirtDarken"  # 裙的 BaseColor 乘数

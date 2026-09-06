@@ -7,3 +7,15 @@ backup/
 
 # MeshBoolean 自动落盘的 StaticMesh 产出，非源资产
 Content/MeshBoolean/AutoResult/
+
+# Python 缓存（脚本跑一次就生成，无版本价值）
+__pycache__/
+*.pyc
+
+# 从 Tiny Glade 提取的商业游戏资产（188 MB / 1456 文件）。
+# 仅供本地逆向对照使用，**不入库**：本仓库是公开的，提交等于公开重分发他人受版权保护的美术资产。
+# 需要这批资产的人应当自行从自己购买的游戏中提取。
+Content/HouseTest/TinyGladeAsset/
+
+# 同上：从 Tiny Glade 提取的原始几何（岩壳 / 树叶卡片，约 105 MB），仅供本地对照
+Docs/TinyGlade/geo/

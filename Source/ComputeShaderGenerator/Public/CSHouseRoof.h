@@ -11,31 +11,44 @@
  * 相同**的屋面凹陷噪声；雪 mesh 加与瓦片一致的抖动噪声保证贴合）。不共享就会脱开 —— 屋面
  * 方程一旦散在各自的生成函数里，铺瓦/铺梁/落窗谓词就会各写一份，彼此差一点点就穿帮。
  *
- * 本文件是那个唯一真源：屋顶坡板、山墙三角、以及将来 D8「落屋顶 → 不生成」的谓词全部调这里。
- * 全部是无 GPU 依赖的纯函数，可直接进 automation 测试。
+ * -----------------------------------------------------------------------------
+ * 2026-08-31：双坡 + 山墙 → **四坡（hip）**，屋面本体交给瓦片
+ * -----------------------------------------------------------------------------
+ * 实拍俯视（用户提供）：TG 的屋顶是**四个坡面** + 四条角斜脊 + 中间一条短脊，且整面**全由瓦
+ * 铺成**。逆向侧对得上的是 `roof_shape::ridge_length_01_from_rectangle_ratio` —— 脊长是矩形
+ * 长宽比的连续函数，越接近正方形脊越短，正方形处连续退化成金字塔。
+ *
+ * 据此删掉的三样（都不是"暂时不做"，是**在四坡下不存在**）：
+ *  · **山墙**：四坡的四面墙全是檐墙，墙顶一律平在 `EaveZ`。山墙棱柱、藤爬山墙剖面、
+ *    `ECSHousePart::Gable` 一并作废。
+ *  · **翻轴事件**：脊向由长轴连续导出，正方形处两轴对称、脊长为 0，「脊朝哪」这个问题根本
+ *    不出现。脊向滞回（`ChooseRidgeAxis` / `RidgeSwitchRatio`）与尺寸禁带
+ *    （`FootprintBandFraction`，2026-08-30 裁决四）唯一的存在理由就是遮双坡那次 90° 原地
+ *    跳变，随之删除。
+ *  · **实体屋面板**：屋顶是瓦片实例，房体三角汤里一片屋面都不产。于是"墙顶该砌到哪"那一整套
+ *    （`SlabVerticalThickness` / `SoffitBite` / `SoffitTopZ`、檐口封口楔形、咬入量）全部作废
+ *    —— 没有板底可咬，墙顶就是平的 `EaveZ`。TG 侧那条墙顶与屋面之间的漏光缝是**照抄的**，
+ *    不是缺陷（室内实拍可见）。
+ *
+ * 四坡的高度场 = 矩形**内距**乘坡度，一行写完：
+ *
+ *     Z(x, y) = EaveZ + tan(pitch) · min(HalfX − |x|, HalfY − |y|)
+ *
+ * 四面同坡度 ⇒ 角斜脊自然落在 45° 对角线上、脊线自然缩到 |X − Y|。**脊长与角斜脊都是推论，
+ * 不是独立参数**，别再给它们加旋钮。footprint 边界处按构造等于 `EaveZ`（= 墙顶），外挑段继续
+ * 往下走，所以檐口高度与屋脊高度天然自洽。
  *
  * 坐标口径：脊向坐标系 (AlongRidge, AcrossRidge, Z)，原点在 footprint 中心、Z=0 是房底；
- * RidgeToLocal() 是它到 actor 局部 XY 的唯一映射，屋面上一切摆位都过这一个函数。
+ * `RidgeToLocal()` 是它到 actor 局部 XY 的唯一映射，屋面上一切摆位都过这一个函数。
+ *
+ * 全部是无 GPU 依赖的纯函数，可直接进 automation 测试。
  */
 
-UENUM()
-enum class ECSRidgeAxis : uint8
-{
-	/** 屋脊沿局部 +X 走，跨度在 Y 方向。 */
-	X UMETA(DisplayName = "Ridge along X"),
-	/** 屋脊沿局部 +Y 走，跨度在 X 方向。 */
-	Y UMETA(DisplayName = "Ridge along Y"),
-};
-
-/** 一座双坡屋面的完整描述。房屋 actor 每次生成时现组，不序列化（RidgeAxis 除外，见房屋类）。 */
+/** 一座四坡屋面的完整描述。房屋 actor 每次生成时现组，不序列化（脊向也不再是状态）。 */
 USTRUCT()
 struct COMPUTESHADERGENERATOR_API FCSRoofDesc
 {
 	GENERATED_BODY()
-
-	/** 脊向。**显式而非从长轴隐式导出** —— 隐式的话 D5 单边推拉一旦让 X 穿过 Y，脊与山墙就
-	 *  原地 90° 跳变，且 FootprintSize 在形状哈希里 ⇒ 拖动中用户看到屋顶"啪"地翻过去。 */
-	UPROPERTY() ECSRidgeAxis RidgeAxis = ECSRidgeAxis::X;
 
 	/** 底面尺寸 cm（局部 X/Y）。 */
 	UPROPERTY() FVector2D Footprint = FVector2D(600.0, 400.0);
@@ -43,163 +56,140 @@ struct COMPUTESHADERGENERATOR_API FCSRoofDesc
 	/** 檐口高 = 墙高（局部 Z）。屋面在 footprint 边界处恰好等于它。 */
 	UPROPERTY() float EaveZ = 300.0f;
 
-	/** 坡度（度）。 */
+	/** 坡度（度）。**四个坡面同一个坡度** —— 脊长与角斜脊都是它的推论。 */
 	UPROPERTY() float Pitch = 35.0f;
 
-	/** 屋檐外挑 cm（脊向两端也挑同样多）。 */
+	/** 屋檐外挑 cm（四面都挑同样多）。 */
 	UPROPERTY() float Overhang = 25.0f;
-
-	/** 屋顶板厚 cm。 */
-	UPROPERTY() float Thickness = 12.0f;
 
 	float TanPitch() const { return FMath::Tan(FMath::DegreesToRadians(FMath::Clamp(Pitch, 0.0f, 89.0f))); }
 
-	/** cos(pitch)。屋面板的竖直厚度、封口咬入量都按它换算 —— 别在生成器里再写一遍三角函数。 */
+	/** cos(pitch)。铺瓦时"沿坡量的长度 → 竖直/水平分量"都按它换算，别在生成器里再写一遍三角函数。 */
 	float CosPitch() const { return FMath::Cos(FMath::DegreesToRadians(FMath::Clamp(Pitch, 0.0f, 89.0f))); }
 
-	/** 沿脊方向的底面长。 */
-	float RidgeLength() const { return float(RidgeAxis == ECSRidgeAxis::X ? Footprint.X : Footprint.Y); }
+	float SinPitch() const { return FMath::Sin(FMath::DegreesToRadians(FMath::Clamp(Pitch, 0.0f, 89.0f))); }
 
-	/** 跨度方向的底面长（两坡各占一半）。 */
-	float SpanLength() const { return float(RidgeAxis == ECSRidgeAxis::X ? Footprint.Y : Footprint.X); }
+	/** 局部 XY 半尺寸。 */
+	FVector2D HalfSize() const { return Footprint * 0.5; }
+
+	/**
+	 * 脊沿哪根局部轴走。**由长轴导出，不是状态**：等坡度四坡的脊必然落在长轴上。
+	 *
+	 * ⚠️ **平局（正方形）归 X，是用户裁决（2026-08-31）不是随手写的 `>=`。** 别改成 `>`。
+	 *
+	 * ⚠️ **也别改成"无条件朝 X"** —— 几何上不成立：四坡的脊只能落在长轴上，`Y > X` 时强行
+	 * 朝 X 会让 `SpanLength` 取到长边、`HalfSpan` 超过短半轴，两侧坡面越过顶点继续上升，
+	 * 屋面直接翻掉。想要的"退化成金字塔"由 `RidgeLength()` 的 `max(…, 0)` 自然给出：
+	 * 长宽比走到正方形时脊长连续收到 0，脊向那个布尔翻不翻都看不出来
+	 * （断言在 `House.TilePyramid`：4 cm 一步扫过正方形，瓦数跳变必须 < 80）。
+	 *
+	 * 这条同时**取代了裁决四**（离散脊向 + `RidgeSwitchRatio` 滞回 + 尺寸禁带）：那三样唯一的
+	 * 用途是挡双坡屋顶在 X 穿过 Y 时那次 90° 原地翻面，四坡下这个事件不存在了。
+	 */
+	bool bRidgeAlongX() const { return Footprint.X >= Footprint.Y; }
+
+	/** 沿脊方向的底面长（长边）。⚠️ 不是脊线长，见 `RidgeLength()`。 */
+	float AlongLength() const { return float(bRidgeAlongX() ? Footprint.X : Footprint.Y); }
+
+	/** 跨度方向的底面长（短边，两坡各占一半）。 */
+	float SpanLength() const { return float(bRidgeAlongX() ? Footprint.Y : Footprint.X); }
 
 	float HalfSpan() const { return SpanLength() * 0.5f; }
 
+	/** **脊线本身**的长度 = 长边 − 短边（正方形为 0 ⇒ 金字塔）。等坡度四坡的推论，不是参数。 */
+	float RidgeLength() const { return FMath::Max(AlongLength() - SpanLength(), 0.0f); }
+
+	float RidgeHalfLength() const { return RidgeLength() * 0.5f; }
+
 	/** 檐口外沿的跨度坐标（含外挑）。 */
-	float EaveOuter() const { return HalfSpan() + Overhang; }
+	float EaveOuterAcross() const { return HalfSpan() + Overhang; }
+
+	/** 檐口外沿的沿脊坐标（含外挑）。四坡两端也是坡面，这一条同样是真檐口。 */
+	float EaveOuterAlong() const { return AlongLength() * 0.5f + Overhang; }
 
 	/** (沿脊, 跨度, Z) → actor 局部 (x, y, z)。线性映射，方向向量同样可以过它。 */
 	FVector RidgeToLocal(double AlongRidge, double AcrossRidge, double Z) const
 	{
-		return RidgeAxis == ECSRidgeAxis::X ? FVector(AlongRidge, AcrossRidge, Z) : FVector(AcrossRidge, AlongRidge, Z);
+		return bRidgeAlongX() ? FVector(AlongRidge, AcrossRidge, Z) : FVector(AcrossRidge, AlongRidge, Z);
 	}
 
 	/** actor 局部 XY → 跨度坐标（带符号，脊线上为 0）。 */
 	double LocalToAcross(const FVector2D& LocalXY) const
 	{
-		return RidgeAxis == ECSRidgeAxis::X ? LocalXY.Y : LocalXY.X;
+		return bRidgeAlongX() ? LocalXY.Y : LocalXY.X;
 	}
 
 	/** actor 局部 XY → 沿脊坐标。 */
 	double LocalToAlong(const FVector2D& LocalXY) const
 	{
-		return RidgeAxis == ECSRidgeAxis::X ? LocalXY.X : LocalXY.Y;
+		return bRidgeAlongX() ? LocalXY.X : LocalXY.Y;
+	}
+
+	/**
+	 * 到 footprint 四条边的**最小内距**（边界上为 0、内部为正、外挑段为负）——四坡高度场的核心。
+	 *
+	 * 这就是矩形的直骨架：min 在哪条边上取到，那一点就属于哪个坡面；两条边并列取到的轨迹
+	 * 正是四条 45° 角斜脊；长轴方向上两条短边并列取到的那一段就是脊线。
+	 */
+	double InsetDistance(const FVector2D& LocalXY) const
+	{
+		const FVector2D Half = HalfSize();
+		return FMath::Min(Half.X - FMath::Abs(LocalXY.X), Half.Y - FMath::Abs(LocalXY.Y));
 	}
 };
 
-/**
- * 屋面外表面在给定跨度坐标处的高度（局部 Z）——整套屋面几何的一维内核。
- *
- * Z(b) = EaveZ + tan(pitch) · (HalfSpan − |b|)：脊线（b=0）最高，footprint 边界（|b|=HalfSpan）
- * 恰好落在墙顶 EaveZ 上，外挑段继续往下走。三处关键高度（屋脊 / 墙顶 / 檐口外沿）因此
- * 天然自洽，不需要各自再写一遍。
- */
-inline float CSHouseRoof_EvalZAcross(const FCSRoofDesc& Desc, double AcrossRidge)
-{
-	return Desc.EaveZ + Desc.TanPitch() * float(Desc.HalfSpan() - FMath::Abs(AcrossRidge));
-}
-
-/** 屋面外表面在局部 XY 处的高度。不判是否落在轮廓内（那是 IsUnderRoof 的事）。 */
+/** 屋面在局部 XY 处的高度。不判是否落在轮廓内（那是 `CSHouseRoof_IsUnderRoof` 的事）。 */
 inline float CSHouseRoof_EvalZ(const FCSRoofDesc& Desc, const FVector2D& LocalXY)
 {
-	return CSHouseRoof_EvalZAcross(Desc, Desc.LocalToAcross(LocalXY));
+	return Desc.EaveZ + Desc.TanPitch() * float(Desc.InsetDistance(LocalXY));
 }
 
-/** 屋脊高（局部 Z）。 */
+/** 屋脊高（局部 Z）。四坡的脊高只由**短边**决定 —— 内距在脊线上恰好等于半跨。 */
 inline float CSHouseRoof_RidgeZ(const FCSRoofDesc& Desc)
 {
-	return CSHouseRoof_EvalZAcross(Desc, 0.0);
+	return Desc.EaveZ + Desc.TanPitch() * Desc.HalfSpan();
 }
 
-/** 檐口外沿高（局部 Z）——外挑最外一条边。 */
+/** 檐口外沿高（局部 Z）——外挑最外一圈。四面同高（同坡度、同外挑）。 */
 inline float CSHouseRoof_EaveOuterZ(const FCSRoofDesc& Desc)
 {
-	return CSHouseRoof_EvalZAcross(Desc, Desc.EaveOuter());
+	return Desc.EaveZ - Desc.TanPitch() * Desc.Overhang;
 }
 
 /**
- * 屋面板的**竖直**厚度。板厚 Thickness 是垂直于坡面量的，竖直方向要除 cos(pitch)。
+ * 屋面外法线（单位，朝上外）。
  *
- * 为什么需要这个量（踩过的坑）：两块坡板原本沿**法线**挤出、并沿坡向过冲半个板厚来"相接"，
- * 结果是两板互穿、各自尖端戳出对方顶面约 Thickness·sin(pitch)（35° 下 ≈ 7 cm 的交叉小尖）。
- * 改成沿**竖直**挤出以后，坡板在 (跨度, Z) 平面上的截面是平行四边形、脊线那条边正好竖直 ——
- * 两块板可以在脊平面 across = 0 上直接对切收口，既不互穿也不留 V 形豁口，
- * 而垂直坡面量到的板厚仍然是 Thickness（这是 RoofThickness 属性的语义，不能变）。
- *
- * 顺带修掉一处几何与谓词打架：法线挤出会让屋面**顶面**比 CSHouseRoof_IsUnderRoof 声称的
- * 覆盖范围多探出 Thickness·sin(pitch)，竖直挤出后两者的外沿都恰好是 EaveOuter()。
+ * 四个坡面的法线是 (±sin p, 0, cos p) / (0, ±sin p, cos p)；把**所有并列取到最小内距**的边
+ * 的法线相加再归一化，角斜脊上自然给出两面的平均、金字塔尖上四面相消退化成正上方 ——
+ * 不需要为脊 / 角脊 / 尖顶各写一个特例。
  */
-inline float CSHouseRoof_SlabVerticalThickness(const FCSRoofDesc& Desc)
-{
-	return Desc.Thickness / FMath::Max(Desc.CosPitch(), UE_KINDA_SMALL_NUMBER);
-}
-
-/**
- * 墙 / 山墙顶**咬进**屋面板的竖直量（footprint 边界处为 0，向内一个墙厚爬满）。
- *
- * 为什么要咬进去而不是刚好贴住：CSHouseRoof_EvalZAcross 在 footprint 边界处**按构造**等于
- * EaveZ（= 墙顶），于是墙顶面与屋面底沿墙外棱**相切** —— 零余量。零余量的两个后果本项目
- * 两处都吃到了：山墙斜边与屋面底共面 ⇒ 发丝亮线（z-fight 型）；檐墙那两条则连封口面都没有，
- * 墙顶到屋面底之间留着一条外侧 0、内侧 T·tan(pitch) 的楔形空腔。咬入量把"相切"改成"互穿"，
- * 与门框砖那条已落地的**负缝**同一条纪律（Tiny Glade 的砖本来就是故意胀大互穿的）。
- *
- * 量取多少（不硬编 cm 的理由）：
- *  · 唯一的硬上界是"别从屋面板上表面钻出去"，那个上界就是**竖直板厚**。所以按竖直板厚取比例，
- *    RoofThickness / RoofPitch 随便调都不会越界；RoofThickness 下限 2 cm ⇒ 最坏咬入 0.5 cm，
- *    仍比 float32 世界坐标在 1 km 处的 ulp（≈0.008 cm）大两个数量级。
- *  · 只咬 1/4，把剩下 3/4 板厚留给将来铺瓦 / 铺梁时的再次穿插。
- *  · **在 footprint 边界处必须归零**：Overhang = 0 时屋面板的檐口端面恰好落在墙外表面所在的
- *    平面上，那里给正咬入就会造出一对共面重叠的**可见**面（又一处 z-fight）。归零同时让檐口
- *    封口件退化成"外侧 0、内侧 T·tan(pitch)"那块正好补满楔形缝的板，形状上也更对。
- */
-inline float CSHouseRoof_SoffitBite(const FCSRoofDesc& Desc, double AcrossRidge, float RampWidth)
-{
-	constexpr float BiteFraction = 0.25f;
-	const double Ramp = FMath::Clamp(
-		(Desc.HalfSpan() - FMath::Abs(AcrossRidge)) / FMath::Max(double(RampWidth), UE_DOUBLE_KINDA_SMALL_NUMBER), 0.0, 1.0);
-	return BiteFraction * CSHouseRoof_SlabVerticalThickness(Desc) * float(Ramp);
-}
-
-/**
- * 墙 / 山墙顶轮廓（局部 Z）= 屋面板底面 + 咬入量。**整套「墙-顶收口」只有这一条方程**：
- * 檐口封口楔形、山墙多边形的斜边都取它，脱开就又会退回相切或留缝。RampWidth 传墙厚。
- */
-inline float CSHouseRoof_SoffitTopZ(const FCSRoofDesc& Desc, double AcrossRidge, float RampWidth)
-{
-	return CSHouseRoof_EvalZAcross(Desc, AcrossRidge) + CSHouseRoof_SoffitBite(Desc, AcrossRidge, RampWidth);
-}
-
-/** 屋面外法线（单位，朝上外）。脊线上退化为世界上方向。 */
 inline FVector CSHouseRoof_EvalNormal(const FCSRoofDesc& Desc, const FVector2D& LocalXY)
 {
-	const double Across = Desc.LocalToAcross(LocalXY);
-	if (FMath::IsNearlyZero(Across)) return FVector::UpVector;
+	const FVector2D Half = Desc.HalfSize();
+	const double D[4] = {                       // 到 −X / +X / −Y / +Y 四条边的内距
+		Half.X + LocalXY.X, Half.X - LocalXY.X,
+		Half.Y + LocalXY.Y, Half.Y - LocalXY.Y };
+	const FVector2D Fall[4] = {                 // 各坡面的下降方向（水平分量）
+		FVector2D(-1, 0), FVector2D(1, 0), FVector2D(0, -1), FVector2D(0, 1) };
 
-	// 坡面沿 +b 下降 ⇒ 切向 (1, −tan)，法线 (tan, 1) 归一化即 (sin p, cos p)。
-	const float PitchRad = FMath::DegreesToRadians(FMath::Clamp(Desc.Pitch, 0.0f, 89.0f));
-	const double Sign = Across > 0 ? 1.0 : -1.0;
-	return Desc.RidgeToLocal(0.0, Sign * FMath::Sin(PitchRad), FMath::Cos(PitchRad)).GetSafeNormal(UE_SMALL_NUMBER, FVector::UpVector);
+	double MinDist = D[0];
+	for (int32 I = 1; I < 4; ++I) MinDist = FMath::Min(MinDist, D[I]);
+
+	const float SinP = Desc.SinPitch();
+	FVector Sum(0, 0, 0);
+	// 容差按 cm 取：并列与否是"这一点在不在角斜脊上"，那是厘米量级的事，不是 ulp 量级的。
+	for (int32 I = 0; I < 4; ++I)
+	{
+		if (D[I] > MinDist + 0.01) continue;
+		Sum += FVector(Fall[I].X * SinP, Fall[I].Y * SinP, Desc.CosPitch());
+	}
+	return Sum.GetSafeNormal(UE_SMALL_NUMBER, FVector::UpVector);
 }
 
-/** 该局部 XY 是否被屋面覆盖（含两个方向的外挑）。D8 那条"落屋顶 → 不生成窗"的谓词用它。 */
+/** 该局部 XY 是否被屋面覆盖（四面外挑都算）。D8 那条"落屋顶 → 不生成窗"的谓词用它。 */
 inline bool CSHouseRoof_IsUnderRoof(const FCSRoofDesc& Desc, const FVector2D& LocalXY)
 {
-	return FMath::Abs(Desc.LocalToAcross(LocalXY)) <= Desc.EaveOuter()
-		&& FMath::Abs(Desc.LocalToAlong(LocalXY)) <= Desc.RidgeLength() * 0.5f + Desc.Overhang;
-}
-
-/**
- * 脊向的滞回选择（计划 D4）。只有当另一根轴长出当前脊轴 SwitchRatio 倍以上时才换向 ——
- * 单边推拉让 X 恰好穿过 Y 时，没有滞回就会在阈值附近反复翻面，而 FootprintSize 在形状哈希里，
- * 每翻一次都是一次全量重建 + 肉眼可见的 90° 跳变。
- *
- * SwitchRatio ≤ 1 退化为无滞回（等价于旧的 X >= Y 隐式规则）。
- */
-inline ECSRidgeAxis CSHouseRoof_ChooseRidgeAxis(const FVector2D& Footprint, ECSRidgeAxis Current, float SwitchRatio)
-{
-	const double X = FMath::Max(FMath::Abs(Footprint.X), UE_DOUBLE_SMALL_NUMBER);
-	const double Y = FMath::Max(FMath::Abs(Footprint.Y), UE_DOUBLE_SMALL_NUMBER);
-	const double Ratio = FMath::Max(double(SwitchRatio), 1.0);
-	if (Current == ECSRidgeAxis::X) return Y > X * Ratio ? ECSRidgeAxis::Y : ECSRidgeAxis::X;
-	return X > Y * Ratio ? ECSRidgeAxis::X : ECSRidgeAxis::Y;
+	const FVector2D Half = Desc.HalfSize();
+	return FMath::Abs(LocalXY.X) <= Half.X + Desc.Overhang
+		&& FMath::Abs(LocalXY.Y) <= Half.Y + Desc.Overhang;
 }

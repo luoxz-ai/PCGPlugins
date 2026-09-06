@@ -17,7 +17,7 @@ import unreal
 
 PKG = "/PCGPlugins/HouseTest"
 # 原件最长轴实测 1.352 m ⇒ TG 的 mix(0.2, 0.4) 就是 27–54 cm，正是 `StairPebbleSize` 的默认值。
-PEBBLE_MESH = "/Game/TinyGlade/Meshes/stairs_pebble/StaticMeshes/stairs_pebble"
+PEBBLE_MESH = "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/stairs_pebble"
 
 A = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
 

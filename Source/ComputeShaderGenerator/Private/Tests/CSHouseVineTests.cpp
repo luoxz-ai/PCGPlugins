@@ -529,57 +529,6 @@ bool FCSHouseVineWallJumpTest::RunTest(const FString& Parameters)
 }
 
 // -----------------------------------------------------------------------------
-// ⑧ 山墙三角：墙顶是 S 的函数，藤能爬过檐口高度
-// -----------------------------------------------------------------------------
-
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-	FCSHouseVineClimbsGableTest,
-	"PCGPlugins.ComputeShaderGenerator.House.VineClimbsGable",
-	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
-
-bool FCSHouseVineClimbsGableTest::RunTest(const FString& Parameters)
-{
-	const CSHouseVine::FParams Params = CSVineTest_MakeParams();
-
-	CSHouseVine::FWallStrip Flat = CSVineTest_MakeStrip();
-	CSHouseVine::FWallStrip Gable = CSVineTest_MakeStrip();
-	// 脊沿墙中，坡度 35°（演示房子的默认值）。
-	Gable.GableTan = FMath::Tan(FMath::DegreesToRadians(35.0f));
-	Gable.GablePeakS = CSVineTest_Length * 0.5f;
-	Gable.GableHalfSpan = CSVineTest_Length * 0.5f;
-
-	TestEqual(TEXT("檐墙的墙顶是平的"), Flat.TopAt(CSVineTest_Length * 0.5f), CSVineTest_Height, 0.001f);
-	TestEqual(TEXT("山墙两端回到檐口高"), Gable.TopAt(0.0f), CSVineTest_Height, 0.001f);
-	const float PeakTop = CSVineTest_Height + Gable.GableTan * Gable.GableHalfSpan;
-	TestEqual(TEXT("山尖处的墙顶 = 脊高"), Gable.TopAt(Gable.GablePeakS), PeakTop, 0.001f);
-
-	TArray<CSHouseVine::FWallStrip> FlatOnly, GableOnly;
-	FlatOnly.Add(Flat);
-	GableOnly.Add(Gable);
-	CSHouseVine::FPlan FlatPlan, GablePlan;
-	CSHouseVine::BuildPlan(FlatOnly, TArray<FCSWallOpening>(), Params, FlatPlan);
-	CSHouseVine::BuildPlan(GableOnly, TArray<FCSWallOpening>(), Params, GablePlan);
-
-	float FlatMaxZ = 0.0f, GableMaxZ = 0.0f;
-	int32 AboveEave = 0, OverTop = 0;
-	for (const CSHouseVine::FRecord& R : FlatPlan.Branch) FlatMaxZ = FMath::Max(FlatMaxZ, R.WorldPos.Z);
-	for (const CSHouseVine::FRecord& R : GablePlan.Branch)
-	{
-		const FVector2D SZ = CSVineTest_ToWall(R.WorldPos);
-		GableMaxZ = FMath::Max(GableMaxZ, float(SZ.Y));
-		if (SZ.Y > CSVineTest_Height + 0.001f) ++AboveEave;
-		// **每一段都不许越过它自己那个 S 处的墙顶** —— 只看最高点的话，山尖那一根合格就
-		// 掩盖了两端翻出屋面的那些（"上一轮第一版判据拉错轴、把缺陷掩盖了"的同一类错）。
-		if (SZ.Y > Gable.TopAt(float(SZ.X)) + 0.001f) ++OverTop;
-	}
-	TestTrue(FString::Printf(TEXT("檐墙的藤停在檐口（最高 %.1f）"), FlatMaxZ), FlatMaxZ <= CSVineTest_Height + 0.001f);
-	TestTrue(FString::Printf(TEXT("山墙上真的有藤爬过了檐口（%d 段，最高 %.1f）"), AboveEave, GableMaxZ),
-		AboveEave > 0);
-	TestEqual(TEXT("山墙上没有一段翻出那条斜边"), OverTop, 0);
-	return true;
-}
-
-// -----------------------------------------------------------------------------
 // ⑨ 花（`ivy_flower`）
 // -----------------------------------------------------------------------------
 
@@ -685,6 +634,287 @@ bool FCSHouseVineCapacityBoundTest::RunTest(const FString& Parameters)
 	// 是显存白付、或者反过来（公式偏小）在某个尺寸上**静默截断**几段藤。
 	TestTrue(FString::Printf(TEXT("上限没有离谱虚高（%d ≤ 4 × %d）"), Bound, Plan.Branch.Num()),
 		Bound <= FMath::Max(Plan.Branch.Num(), 1) * 4);
+	return true;
+}
+
+// -----------------------------------------------------------------------------
+// (12) 折线与管子路径（2026-09-06 裁决 1/2：枝改扫掠管子、不分叉）
+//
+// ⚠️ 这一族钉的是 `PackTubePath` 交给 vinegenerator 的**缓冲格式**，而那份格式在 GPU 那一侧
+// 出错时**不会有任何断言**：`PathPointMeta` 少填一半只是让切线在端点乱掉、`Axes` 没清零只是让
+// 回退不触发、`SegmentMeta` 越界只是画出一条飞线。全是"画面不对而 readback 全绿"那一类。
+// -----------------------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseVineTubePathTest,
+	"PCGPlugins.TinyGladeHouse.Vine.TubePath",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseVineTubePathTest::RunTest(const FString& Parameters)
+{
+	TArray<CSHouseVine::FWallStrip> Strips;
+	Strips.Add(CSVineTest_MakeStrip());
+	const CSHouseVine::FParams Params = CSVineTest_MakeParams();
+
+	CSHouseVine::FPlan Plan;
+	CSHouseVine::BuildPlan(Strips, TArray<FCSWallOpening>(), Params, Plan);
+	TestTrue(TEXT("规划出了折线"), Plan.Strands.Num() > 0);
+
+	// (a) 不分叉：每根藤是一条链，点数 >= 2。
+	for (const CSHouseVine::FStrand& S : Plan.Strands)
+	{
+		TestTrue(TEXT("每根藤至少两个点（单点连不成管子）"), S.Points.Num() >= 2);
+	}
+
+	const int32 Subdivide = 2;
+	const float CircleScale = 1.0f;
+	CSHouseVine::FTubePath Path;
+	CSHouseVine::PackTubePath(Strips, Plan, Params, Subdivide, CircleScale, TArrayView<const float>(), Path);
+
+	TestTrue(TEXT("打包出了点"), Path.Points.Num() > 0);
+	// (b) 五条并行数组必须等长 —— 长度对不齐时 GPU 侧读的是别人的数据，没有任何检查会拦。
+	TestEqual(TEXT("Axes 与 Points 等长"), Path.Axes.Num(), Path.Points.Num());
+	TestEqual(TEXT("PointMeta 与 Points 等长"), Path.PointMeta.Num(), Path.Points.Num());
+	TestEqual(TEXT("Growth 与 Points 等长"), Path.Growth.Num(), Path.Points.Num());
+	TestEqual(TEXT("段数 = 点数 − 线数"), Path.SegmentMeta.Num(), Path.Points.Num() - Plan.Strands.Num());
+
+	// (c) Axes 必须**逐位为零**：`BuildRawVoxelVineFrame` 的回退判据是 dot(Axis,Axis) > 1e-8，
+	//     非零（比如池子里的旧内容）会让它误以为有轴可用，切线取到上一次的值。
+	int32 NonZeroAxes = 0;
+	for (const FVector4f& A : Path.Axes)
+	{
+		if (!FVector3f(A.X, A.Y, A.Z).IsNearlyZero()) ++NonZeroAxes;
+	}
+	TestEqual(TEXT("Axes 全零（回退判据的前提）"), NonZeroAxes, 0);
+
+	// (d) Meta 的两套口径都要对：Pass C 读 .x/.y（prev/next），GetLinePointIndex 读 .z/.w（base/count）。
+	int32 BadMeta = 0, BadRange = 0, BadSeg = 0;
+	for (int32 i = 0; i < Path.PointMeta.Num(); ++i)
+	{
+		const FIntVector4& M = Path.PointMeta[i];
+		const int32 Base = M.Z, Count = M.W;
+		if (Base < 0 || Count < 2 || Base + Count > Path.Points.Num()) { ++BadRange; continue; }
+		if (i < Base || i >= Base + Count) { ++BadRange; continue; }
+		// prev/next 必须落在**本条线内**，且在端点处夹回自身（TG 的折线没有环，两端不外推）。
+		const int32 ExpectPrev = FMath::Max(i - 1, Base);
+		const int32 ExpectNext = FMath::Min(i + 1, Base + Count - 1);
+		if (M.X != ExpectPrev || M.Y != ExpectNext) ++BadMeta;
+	}
+	TestEqual(TEXT("PointMeta 的 base/count 自洽"), BadRange, 0);
+	TestEqual(TEXT("PointMeta 的 prev/next 夹在本线内"), BadMeta, 0);
+
+	for (const FIntVector4& Seg : Path.SegmentMeta)
+	{
+		const bool bOk = Path.PointMeta.IsValidIndex(Seg.X) && Path.PointMeta.IsValidIndex(Seg.Y)
+			&& Path.PointMeta[Seg.X].Z == Path.PointMeta[Seg.Y].Z;   // 同一条线
+		if (!bOk) ++BadSeg;
+	}
+	TestEqual(TEXT("每段的两端同线且下标有效"), BadSeg, 0);
+
+	// (e) 弧长必须**单调不减**且每条线从 0 起算 —— 生长动画的前沿直接拿它比。
+	int32 BadArc = 0;
+	for (int32 i = 0; i < Path.Growth.Num(); ++i)
+	{
+		const FIntVector4& M = Path.PointMeta[i];
+		if (i == M.Z)
+		{
+			if (!FMath::IsNearlyZero(Path.Growth[i].Y)) ++BadArc;
+		}
+		else if (Path.Growth[i].Y < Path.Growth[i - 1].Y - UE_KINDA_SMALL_NUMBER)
+		{
+			++BadArc;
+		}
+	}
+	TestEqual(TEXT("弧长逐线从 0 起、单调不减"), BadArc, 0);
+
+	// (f) 半径缩放：Pass C 的环半径 = 10 * CircleScale * w，锥度从根到梢 1.0 -> 0.55。
+	//     只查上下界，不查逐点 —— 逐点等于把 Lerp 抄一遍，那种测试只会锁死实现。
+	const float RootR = Params.Thickness * 0.5f;
+	int32 BadRadius = 0;
+	for (const FVector4f& P : Path.Points)
+	{
+		const float R = 10.0f * CircleScale * P.W;
+		if (R > RootR + 0.01f || R < RootR * 0.55f - 0.01f) ++BadRadius;
+	}
+	TestEqual(TEXT("逐点半径落在 [0.55R, R] 内"), BadRadius, 0);
+
+	return true;
+}
+
+// -----------------------------------------------------------------------------
+// (13) 细分不许把线拽离墙面 —— 「Catmull-Rom 是仿射组合、同墙共面」那条立论的可判定形式
+// -----------------------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseVineTubeStaysOnWallTest,
+	"PCGPlugins.TinyGladeHouse.Vine.TubeStaysOnWall",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseVineTubeStaysOnWallTest::RunTest(const FString& Parameters)
+{
+	// **单面墙**：没有跨墙段 => 每一个细分点都必须落在那一个平面上。
+	// 有跨墙段的场景不能用这条判据（转角本来就该切出去）。
+	TArray<CSHouseVine::FWallStrip> Strips;
+	Strips.Add(CSVineTest_MakeStrip());
+	const CSHouseVine::FParams Params = CSVineTest_MakeParams();
+
+	CSHouseVine::FPlan Plan;
+	CSHouseVine::BuildPlan(Strips, TArray<FCSWallOpening>(), Params, Plan);
+
+	CSHouseVine::FTubePath Path;
+	CSHouseVine::PackTubePath(Strips, Plan, Params, 3, 1.0f, TArrayView<const float>(), Path);
+	TestTrue(TEXT("打包出了点"), Path.Points.Num() > 0);
+
+	// 墙面 = 过 (Origin + N*StandOff)、法线 N 的平面。细分后每个点到它的距离应当是 0。
+	const CSHouseVine::FWallStrip& W = Strips[0];
+	const FVector PlanePoint = W.Origin + W.N * Params.StandOff;
+	double MaxOff = 0.0;
+	for (const FVector4f& P : Path.Points)
+	{
+		MaxOff = FMath::Max(MaxOff,
+			FMath::Abs(FVector::DotProduct(FVector(P.X, P.Y, P.Z) - PlanePoint, W.N)));
+	}
+	TestTrue(FString::Printf(TEXT("细分后仍贴墙（最大离面 %.4f cm <= 0.01）"), MaxOff), MaxOff <= 0.01);
+
+	// 细分真的发生了：点数应当明显多于原始折线点数，而不是原样。
+	int32 RawPoints = 0;
+	for (const CSHouseVine::FStrand& S : Plan.Strands) RawPoints += S.Points.Num();
+	TestTrue(FString::Printf(TEXT("细分确实加密了（%d -> %d）"), RawPoints, Path.Points.Num()),
+		Path.Points.Num() > RawPoints);
+	return true;
+}
+
+// -----------------------------------------------------------------------------
+// (14) 折线与实例记录同源 —— 两处各写一份世界映射的话，症状是"藤和叶对不上"而两边各自自洽
+// -----------------------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseVineStrandMatchesRecordsTest,
+	"PCGPlugins.TinyGladeHouse.Vine.StrandMatchesRecords",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseVineStrandMatchesRecordsTest::RunTest(const FString& Parameters)
+{
+	TArray<CSHouseVine::FWallStrip> Strips;
+	Strips.Add(CSVineTest_MakeStrip());
+	const CSHouseVine::FParams Params = CSVineTest_MakeParams();
+
+	CSHouseVine::FPlan Plan;
+	CSHouseVine::BuildPlan(Strips, TArray<FCSWallOpening>(), Params, Plan);
+
+	// 折线的**段数**与枝记录数必须一致：两者是同一次游走的两种记法。
+	int32 StrandSegments = 0;
+	for (const CSHouseVine::FStrand& S : Plan.Strands) StrandSegments += S.Points.Num() - 1;
+	TestEqual(TEXT("折线段数 = 枝记录数"), StrandSegments, Plan.Branch.Num());
+
+	// 不细分时，折线的每个非末点映射回世界应当逐点落在对应枝记录的**起点**上。
+	CSHouseVine::FTubePath Path;
+	CSHouseVine::PackTubePath(Strips, Plan, Params, 0, 1.0f, TArrayView<const float>(), Path);
+	int32 Mismatched = 0, RecordCursor = 0, PointBase = 0;
+	for (const CSHouseVine::FStrand& S : Plan.Strands)
+	{
+		for (int32 i = 0; i + 1 < S.Points.Num(); ++i, ++RecordCursor)
+		{
+			if (!Plan.Branch.IsValidIndex(RecordCursor) || !Path.Points.IsValidIndex(PointBase + i))
+			{
+				++Mismatched;
+				continue;
+			}
+			const FVector4f& P = Path.Points[PointBase + i];
+			const FVector3f& Rec = Plan.Branch[RecordCursor].WorldPos;
+			if ((FVector3f(P.X, P.Y, P.Z) - Rec).Size() > 0.01f) ++Mismatched;
+		}
+		PointBase += S.Points.Num();
+	}
+	TestEqual(TEXT("折线点与枝记录的世界位置逐点相同"), Mismatched, 0);
+
+	// RootKey 必须与 SpawnTime 的键口径一致（不含位置、不含长宽）。
+	int32 BadKey = 0;
+	for (const CSHouseVine::FStrand& S : Plan.Strands)
+	{
+		if (S.RootKey != CSHouseVine::IdentityHash(S.RootEdgeIndex, S.StrandIndex, -1, 7u, Params.Seed)) ++BadKey;
+	}
+	TestEqual(TEXT("RootKey 与身份哈希口径一致"), BadKey, 0);
+	return true;
+}
+
+// -----------------------------------------------------------------------------
+// (15) 悬空不长藤（用户裁决 2026-09-06）
+//
+// 与承重柱互补：柱子在 Gap > PillarMinGap 处**出现**，藤在同处**消失**。
+// -----------------------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCSHouseVineNoVineWhenAirborneTest,
+	"PCGPlugins.TinyGladeHouse.Vine.NoVineWhenAirborne",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCSHouseVineNoVineWhenAirborneTest::RunTest(const FString& Parameters)
+{
+	const CSHouseVine::FParams Params = CSVineTest_MakeParams();
+
+	// (a) 没有采样 = 不知道 = 按贴地处理。这一条护着既有的十几条几何断言：
+	//     它们用的墙都没有地面可采，缺省成"悬空"会让它们一次全红。
+	{
+		TArray<CSHouseVine::FWallStrip> Strips;
+		Strips.Add(CSVineTest_MakeStrip());
+		CSHouseVine::FPlan Plan;
+		CSHouseVine::BuildPlan(Strips, TArray<FCSWallOpening>(), Params, Plan);
+		TestTrue(TEXT("没有地面采样时照常长藤（空数组 = 贴地）"), Plan.Strands.Num() > 0);
+	}
+
+	// (b) 整面墙悬空 => 一根都不长。
+	{
+		TArray<CSHouseVine::FWallStrip> Strips;
+		CSHouseVine::FWallStrip S = CSVineTest_MakeStrip();
+		S.GroundGaps.Init(Params.MaxGroundGap + 50.0f, 8);
+		Strips.Add(S);
+		CSHouseVine::FPlan Plan;
+		CSHouseVine::BuildPlan(Strips, TArray<FCSWallOpening>(), Params, Plan);
+		TestEqual(TEXT("整面墙悬空时一根藤都没有"), Plan.Strands.Num(), 0);
+		TestEqual(TEXT("连枝记录也没有"), Plan.Branch.Num(), 0);
+	}
+
+	// (c) 半边悬空 => 只在贴地那半边长。判据取**藤脚**的 S，不是整根。
+	{
+		TArray<CSHouseVine::FWallStrip> Strips;
+		CSHouseVine::FWallStrip S = CSVineTest_MakeStrip();
+		const int32 N = 9;
+		S.GroundGaps.SetNumUninitialized(N);
+		for (int32 i = 0; i < N; ++i)
+		{
+			// 前半贴地、后半悬空。中点附近由线性插值过渡。
+			S.GroundGaps[i] = (float(i) / float(N - 1) < 0.5f) ? 0.0f : Params.MaxGroundGap + 50.0f;
+		}
+		Strips.Add(S);
+		CSHouseVine::FPlan Plan;
+		CSHouseVine::BuildPlan(Strips, TArray<FCSWallOpening>(), Params, Plan);
+		TestTrue(TEXT("半边悬空时仍有藤"), Plan.Strands.Num() > 0);
+
+		int32 OnAirborneHalf = 0;
+		for (const CSHouseVine::FStrand& Strand : Plan.Strands)
+		{
+			// 藤脚的 S 落在悬空那半边（留一个插值过渡带的余量）就算越界。
+			if (Strand.Points.Num() > 0 && Strand.Points[0].WallSZ.X > CSVineTest_Length * 0.6f) ++OnAirborneHalf;
+		}
+		TestEqual(TEXT("悬空那半边没有藤脚"), OnAirborneHalf, 0);
+	}
+
+	// (d) 阈值真的是阈值：刚好在阈下要长、阈上不长。
+	{
+		auto CountAt = [&Params](float Gap)
+		{
+			TArray<CSHouseVine::FWallStrip> Strips;
+			CSHouseVine::FWallStrip S = CSVineTest_MakeStrip();
+			S.GroundGaps.Init(Gap, 4);
+			Strips.Add(S);
+			CSHouseVine::FPlan Plan;
+			CSHouseVine::BuildPlan(Strips, TArray<FCSWallOpening>(), Params, Plan);
+			return Plan.Strands.Num();
+		};
+		TestTrue(TEXT("阈下照常长"), CountAt(Params.MaxGroundGap - 1.0f) > 0);
+		TestEqual(TEXT("阈上不长"), CountAt(Params.MaxGroundGap + 1.0f), 0);
+	}
 	return true;
 }
 

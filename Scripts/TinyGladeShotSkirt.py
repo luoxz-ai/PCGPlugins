@@ -74,7 +74,7 @@ ZERO_FAIL = 0.005
 #     每件摆件只剩两三个采样点，差异率掉到 0.3~0.8%。
 MOUND_XY = (1500.0, 2400.0)
 MOUND_R, MOUND_F, MOUND_LIFT = 250.0, 400.0, 380.0
-CLUTTER = "/Game/TinyGlade/Meshes/clutter/%s/StaticMeshes/%s.%s"
+CLUTTER = "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/%s.%s"
 SKIRT_MESHES = ["barrel", "firewood", "basket"]
 SKIRT_MATERIAL = "%s/M_TinyGladeDecor.M_TinyGladeDecor" % PKG
 
@@ -131,7 +131,7 @@ def build():
         return None
     STATE["ground"] = ground
 
-    meshes = [unreal.load_asset(CLUTTER % (n, n, n)) for n in SKIRT_MESHES]
+    meshes = [unreal.load_asset(CLUTTER % (n, n)) for n in SKIRT_MESHES]
     material = unreal.load_asset(SKIRT_MATERIAL)
     if not all(meshes) or not material:
         unreal.log_error("SKIRT FAILED: 缺资产 meshes=%s material=%s"

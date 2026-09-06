@@ -7,23 +7,27 @@ readback 断言能证明"拖完的一切等于全量重建"（回归里那条已
 
 产物（`Saved/TinyGladeShots/`）：
 
-  · `resize_on_f0..f8.png`    禁带**开**（默认口径）。同机位，Y 从 400 连续拉到 800。
-  · `resize_off_f0..f8.png`   禁带**关**（对照 / 破坏实验之一）。同一段拉伸、同一机位。
-  · `resize_on_no{frame,vine,decor}.png`  末尾尺寸上分别关掉一类派生物（破坏实验之二）。
+  · `resize_on_f0..f8.png`    同机位，Y 从 400 连续拉到 800。
+  · `resize_on_no{frame,vine,decor}.png`  末尾尺寸上分别关掉一类派生物（破坏实验）。
   · `resize_on_f{2,5,8}_{rb,rel}.png`     同一帧的"全量重建"与"松手"孪生帧（判据 D / E）。
 
-⚠️ **实测结论先写在这里，免得看图的人误判**：拖动**中**的画面与"同一状态松手后"的画面
-能差 6.3–9.0% 像素，而 CPU 侧每一个量都相同（三角数、`GetWorldBoundsApprox`、脊向、
-门/洞/砖/藤/摆件计数逐位相等，两图也**没有任何像素位移**）。差的全是阴影与受光：
-背光墙整片压到精确 (0,0,0)（zero% 2.28% → 0.047%）。**几何跟得住，画面收敛以松手为准。**
-根因未定位，且与世界状态无关（同一段重放换个任务次序就干净了），属于状态文件
-「离屏 SceneCapture 画不出 GPU 实例（真因仍开放）」那一族。
+  （原来还有一组 `resize_off_f0..f8.png`＝"禁带关"的对照。禁带与翻轴已随四坡屋顶于
+   2026-08-31 删除，没有翻轴事件可拍，那一组整体作废 —— 见文件末尾 `jobs` 处的留档。）
+
+⚠️ **本节曾经的结论「几何跟得住，画面收敛以松手为准」已于 2026-08-31 作废，别再照它判图。**
+当时实测拖动**中**与"同一状态松手后"能差 6.3–9.0% 像素（CPU 侧每个量都相同、零像素位移，
+差的全是阴影受光，背光墙整片压到精确 (0,0,0)）。**真因已定位并修掉，且两条都不在拉尺寸这条路上**：
+① `CSMeshOps.usf` 的 `TransformMeshCS` / `NegateNormalsCS` 用 uint 逻辑右移解包 snorm8 切空间，
+   把符号位剥掉了 ⇒ 凡被增量搬过的网格法线全折进 +X+Y+Z 卦限，朝 −X/−Y 的墙当场翻面；
+② `RebuildFrame` 的早退哈希漏了墙框架，拉垂直方向时门框砖整段不重排。
+修完同机位实测 6.83% → **0.013%**，`SCS_BASE_COLOR` 与关掉 Lumen 两组都是 **0.000%**
+（见 `TinyGladeShotResizeProbe.py` 与 `CSHouseActor.h::PushEdge` 头注释）。**拖动中的画面就是对的。**
 
 判据由 `Scripts/TinyGladeShotResizeStats.py` 离线算（PIL + numpy）：
 
-  A **相邻帧差异率**：禁带开时，除跳带那一帧外，逐帧差异应当是平滑的一小段；
-    禁带关时，屋脊翻面的那一帧会顶出一个尖峰。**这一条同时就是"门是活的"的证明** ——
-    翻轴在像素上看得见，所以"禁带开时没看见"才是有意义的。
+  A **相邻帧差异率**：逐帧差异应当是连续拉伸该有的那一小段，**全程不许有尖峰**。
+    （旧口径是"禁带开时平滑 / 禁带关时翻面顶出尖峰"，靠对照组证明相机看得见翻轴。
+     四坡屋顶下脊向连续、没有翻轴事件，对照组作废，只剩"全程平滑"这一条正向判据。）
   B **派生物可见性**：关掉门框砖 / 藤 / 摆件之后与同尺寸的基准帧比，差异率必须**明显不为零**。
     若某一类关掉后画面纹丝不动，说明这组图**根本没拍到它**，
     "它跟得住"就是一句空话（D8 那轮的教训：第一版判据量的是藤蔓重排，不是洞）。
@@ -87,8 +91,9 @@ WARMUP_CAPTURES = int(os.environ.get("TG_SHOT_WARMUP", "128"))
 # 症状极具误导性：看着就是"拖尺寸把一面墙弄没了"。
 SETTLE_TICKS = int(os.environ.get("TG_SHOT_SETTLE", "24"))
 
-# 一段连续拉伸：Y 从 400 拉到 800，每帧 50 cm。X 恒 600 ⇒ 翻轴阈 690、禁带 [480, 720]，
-# 阈值整个落在带里 —— 这正是要拍的那一段。
+# 一段连续拉伸：Y 从 400 拉到 800，每帧 50 cm。X 恒 600 ⇒ 这一段跨过 Y == X == 600
+# 那个正方形点，正是四坡脊长连续收到 0 再长回来的那一段（旧口径下它是"翻轴阈 690、
+# 禁带 [480, 720]"，翻轴与禁带均已于 2026-08-31 删除；机位不变，要拍的仍是这一段）。
 START = unreal.Vector2D(600.0, 400.0)
 STEP_CM = 50.0
 FRAMES = 9
@@ -121,23 +126,21 @@ def note(name):
         why = str(getter())
         if why:
             reasons.append("%s:%s" % (label, why))
-    unreal.log("RESIZE %-14s size=(%.1f, %.1f) axis=%s doors=%d openings=%d bricks=%d vines=%d decor=%d%s"
-               % (name, size.x, size.y, h.get_editor_property("RidgeAxis"),
+    unreal.log("RESIZE %-14s size=(%.1f, %.1f) doors=%d openings=%d bricks=%d vines=%d decor=%d%s"
+               % (name, size.x, size.y,
                   h.get_open_door_count(), h.get_opening_count(), h.get_frame_brick_count(),
                   h.get_vine_segment_count(), h.get_decor_instance_count(),
                   "" if not reasons else ("  undrawable: " + " ".join(reasons))))
 
 
-def reset_house(band_on, frame=True, vine=True, decor=True):
+def reset_house(frame=True, vine=True, decor=True):
     """把房子放回起点，并设好这一帧要开/关哪些派生物。"""
     h, home = STATE["house"], STATE["home"]
     h.set_editor_property("bFrameEnabled", frame)
     h.set_editor_property("bVineEnabled", vine)
     h.set_editor_property("bDecorEnabled", decor)
-    h.set_editor_property("FootprintBandFraction", 0.20 if band_on else 0.0)
     h.set_actor_location(unreal.Vector(home.x, home.y, h.get_actor_location().z), False, False)
     h.set_editor_property("FootprintSize", START)
-    h.set_editor_property("RidgeAxis", unreal.CSRidgeAxis.X)
     h.call_method("RebuildHouse")
 
 
@@ -221,30 +224,28 @@ def build():
     unreal.log("RESIZE cam at (%.0f, %.0f, %.0f) aim (%.0f, %.0f, %.0f)"
                % (cam.x, cam.y, cam.z, aim.x, aim.y, aim.z))
 
-    # 每条任务 = (名字, 目标帧号, 禁带开否, 关掉哪些派生物)。
+    # 每条任务 = (名字, 目标帧号, 关掉哪些派生物)。
+    #
+    # 原来还有一组"禁带关"的破坏实验（证明相机看得见屋脊 90° 翻面）。禁带与翻轴已随四坡屋顶
+    # 一起删除（2026-08-31）—— 脊向由长轴连续导出，没有翻轴这个事件可拍，那一组整体作废。
     jobs = []
-    # ① 禁带开：这一段就是交付要看的那组图。
+    # ① 拉伸序列：这一段就是交付要看的那组图。
     for i in range(FRAMES):
-        jobs.append(("on_f%d" % i, i, True, {}))
-    # ② 禁带关（破坏实验之一）：同一段拉伸，屋脊会在某个**平滑**帧原地翻 90°。
-    #    这组图的价值不在"好看"，在于**证明这台相机看得见翻轴** —— 看不见的话
-    #    ①"没看见翻轴"就是空话。
-    for i in range(FRAMES):
-        jobs.append(("off_f%d" % i, i, False, {}))
-    # ③ 派生物可见性（破坏实验之二）：末尾尺寸上逐类关掉。差异率≈0 = 这组图没拍到它。
-    jobs.append(("on_noframe", FRAMES - 1, True, {"frame": False}))
-    jobs.append(("on_novine", FRAMES - 1, True, {"vine": False}))
-    jobs.append(("on_nodecor", FRAMES - 1, True, {"decor": False}))
-    # ④ **全量重建的孪生帧**（判据 D，最硬的一条）：同一帧再补一次 RebuildHouse 后重拍。
+        jobs.append(("on_f%d" % i, i, {}))
+    # ② 派生物可见性（破坏实验）：末尾尺寸上逐类关掉。差异率≈0 = 这组图没拍到它。
+    jobs.append(("on_noframe", FRAMES - 1, {"frame": False}))
+    jobs.append(("on_novine", FRAMES - 1, {"vine": False}))
+    jobs.append(("on_nodecor", FRAMES - 1, {"decor": False}))
+    # ③ **全量重建的孪生帧**（判据 D，最硬的一条）：同一帧再补一次 RebuildHouse 后重拍。
     #    "拖出来的画面与全量重建逐像素相同"是"派生物跟得住"能给出的最强形态 ——
     #    回归里那条 readback 断言只能证明**计数**相同，证不了摆位。
     for i in (2, 5, 8):
-        jobs.append(("on_f%d_rb" % i, i, True, {"rebuild": True}))
-    # ⑤ **松手帧**（判据 E）：同一帧再补一次 `push_edge(..., bFinished=True)`，也就是用户松开鼠标。
-    #    与 ④ 的区别是它**不清滞回表**（`RebuildHouse` 会清），因此是真实交互的收尾状态。
+        jobs.append(("on_f%d_rb" % i, i, {"rebuild": True}))
+    # ④ **松手帧**（判据 E）：同一帧再补一次 `push_edge(..., bFinished=True)`，也就是用户松开鼠标。
+    #    与 ③ 的区别是它**不清迟回表**（`RebuildHouse` 会清），因此是真实交互的收尾状态。
     #    拖动**中**与松手后的画面差多少，就是"拖动期有多少东西还没收敛"的直接读数。
     for i in (2, 5, 8):
-        jobs.append(("on_f%d_rel" % i, i, True, {"release": True}))
+        jobs.append(("on_f%d_rel" % i, i, {"release": True}))
     STATE["jobs"] = jobs
     return world
 
@@ -264,10 +265,10 @@ def tick(delta):
         unreal.SystemLibrary.quit_editor()
         return
 
-    name, target, band_on, off = STATE["jobs"][STATE["job"]]
+    name, target, off = STATE["jobs"][STATE["job"]]
 
     if STATE["stage"] == "reset":
-        reset_house(band_on, frame=off.get("frame", True), vine=off.get("vine", True),
+        reset_house(frame=off.get("frame", True), vine=off.get("vine", True),
                     decor=off.get("decor", True))
         STATE["pushed"], STATE["stage"] = 0, "push"
         return

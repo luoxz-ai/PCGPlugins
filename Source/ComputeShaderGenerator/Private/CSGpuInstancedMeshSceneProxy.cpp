@@ -91,11 +91,16 @@ public:
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, SrcInstances)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float>, SrcCustomData)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, SrcInstanceCount)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RWClusterVisible)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RWVisTransforms)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RWVisOrigins)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RWVisLightmap)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, RWVisCustomData)
+		// 0 = 生产者没给 custom data（石阶 / 摆件 / 砖 / 瓦都不给）⇒ 可见槽写零。
+		// 用 uniform 而不是 permutation：分支全 wave 一致，运行时代价为零。
+		SHADER_PARAMETER(uint32, bHasCustomData)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RWLodCounters)
 		SHADER_PARAMETER_ARRAY(FVector4f, FrustumPlanes, [6])
 		SHADER_PARAMETER(FVector3f, ViewOriginLocal)
@@ -355,6 +360,8 @@ void CSGpuInstancedBuildAuxStreamDescs(
 	AddAux(TEXT("CSGpuInstanced.VisibleTransforms"), ECSGpuInstancedAuxSlot::VisibleTransforms, sizeof(FVector4f), PF_A32B32G32R32F, VisibleSlots * 3u);
 	AddAux(TEXT("CSGpuInstanced.VisibleOrigins"), ECSGpuInstancedAuxSlot::VisibleOrigins, sizeof(FVector4f), PF_A32B32G32R32F, VisibleSlots);
 	AddAux(TEXT("CSGpuInstanced.VisibleLightmap"), ECSGpuInstancedAuxSlot::VisibleLightmap, sizeof(FVector4f), PF_A32B32G32R32F, VisibleSlots);
+	AddAux(TEXT("CSGpuInstanced.VisibleCustomData"), ECSGpuInstancedAuxSlot::VisibleCustomData, sizeof(float), PF_R32_FLOAT,
+		VisibleSlots * uint32(CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS));
 	// Fixed at the maximum rather than sized to NumLODs: 16 bytes, and it keeps a base mesh gaining
 	// or losing a LOD from re-declaring this stream (which reallocates the whole resident set).
 	AddAux(TEXT("CSGpuInstanced.LodCounters"), ECSGpuInstancedAuxSlot::LodCounters, sizeof(uint32), PF_R32_UINT, CS_GPU_INSTANCED_MAX_LODS);
@@ -374,6 +381,7 @@ void FCSGpuInstancedMeshSceneProxy::OnStreamsAllocated(FRHICommandListBase& RHIC
 	FRHIShaderResourceView* Origins = GetStreamSRV(ECSGpuStreamRole::AuxVertex, uint8(ECSGpuInstancedAuxSlot::VisibleOrigins));
 	FRHIShaderResourceView* Transforms = GetStreamSRV(ECSGpuStreamRole::AuxVertex, uint8(ECSGpuInstancedAuxSlot::VisibleTransforms));
 	FRHIShaderResourceView* Lightmap = GetStreamSRV(ECSGpuStreamRole::AuxVertex, uint8(ECSGpuInstancedAuxSlot::VisibleLightmap));
+	FRHIShaderResourceView* CustomData = GetStreamSRV(ECSGpuStreamRole::AuxVertex, uint8(ECSGpuInstancedAuxSlot::VisibleCustomData));
 
 	// The one place an aux-slot mistake becomes visible. A slot that collides with another stream's
 	// (Role, TexCoordIndex) is refused at declaration time and simply never exists, and a factory
@@ -388,7 +396,9 @@ void FCSGpuInstancedMeshSceneProxy::OnStreamsAllocated(FRHICommandListBase& RHIC
 		return;
 	}
 
-	InstancedVF->SetInstanceStreams(Origins, Transforms, Lightmap);
+	// CustomData 允许为空（老网格的常驻集里没有这条槽位时）：工厂那边会把
+	// NumCustomDataFloats 置 0，材质读到 0 而不是去读一条冒名顶替的缓冲。
+	InstancedVF->SetInstanceStreams(Origins, Transforms, Lightmap, CustomData);
 }
 
 // -----------------------------------------------------------------------------
@@ -479,6 +489,7 @@ void FCSGpuInstancedMeshSceneProxy::RunCulling(FRDGBuilder& GraphBuilder, const 
 	FRDGBufferRef VisTransforms = Aux(ECSGpuInstancedAuxSlot::VisibleTransforms);
 	FRDGBufferRef VisOrigins = Aux(ECSGpuInstancedAuxSlot::VisibleOrigins);
 	FRDGBufferRef VisLightmap = Aux(ECSGpuInstancedAuxSlot::VisibleLightmap);
+	FRDGBufferRef VisCustomData = Aux(ECSGpuInstancedAuxSlot::VisibleCustomData);
 	FRDGBufferRef LodCounters = Aux(ECSGpuInstancedAuxSlot::LodCounters);
 	FRDGBufferRef IndirectArgs = Edit->IndirectArgs();
 	// A packed GPU source replaces this stream outright; the mesh then carries only a placeholder.
@@ -489,6 +500,13 @@ void FCSGpuInstancedMeshSceneProxy::RunCulling(FRDGBuilder& GraphBuilder, const 
 		: Aux(ECSGpuInstancedAuxSlot::SourceInstances);
 
 	if (!ClusterBoundsBuffer || !ClusterVisible || !VisTransforms || !VisOrigins || !VisLightmap) return;
+	if (!VisCustomData) return;
+
+	// 生产者的 custom data（可空）。与 SourceInstances 同一条口径：它属于生产者而不是这张网格，
+	// 直接 register，剔除只读不写。
+	FRDGBufferRef SourceCustomData = (GpuSource.IsValid() && GpuSource.CustomData.IsValid())
+		? GraphBuilder.RegisterExternalBuffer(GpuSource.CustomData)
+		: nullptr;
 	if (!LodCounters || !IndirectArgs || !SourceInstances) return;
 
 	// Instance count: a plain uniform for the CPU array, the producer's GPU counter otherwise. The
@@ -562,6 +580,12 @@ void FCSGpuInstancedMeshSceneProxy::RunCulling(FRDGBuilder& GraphBuilder, const 
 		Params->RWVisTransforms = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(VisTransforms, PF_A32B32G32R32F));
 		Params->RWVisOrigins = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(VisOrigins, PF_A32B32G32R32F));
 		Params->RWVisLightmap = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(VisLightmap, PF_A32B32G32R32F));
+		Params->RWVisCustomData = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(VisCustomData, PF_R32_FLOAT));
+		// 源为空时也必须绑一条**非空** SRV（RDG 拒绝 null 绑定）：拿可见缓冲自己当哑源，
+		// 有 bHasCustomData 挡着，一个字节都不会被读。
+		Params->SrcCustomData = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(
+			SourceCustomData ? SourceCustomData : VisCustomData, PF_R32_FLOAT));
+		Params->bHasCustomData = SourceCustomData ? 1u : 0u;
 		Params->RWLodCounters = LodCountersUAV;
 		for (int32 i = 0; i < 6; ++i) Params->FrustumPlanes[i] = FrustumPlanes[i];
 		Params->ViewOriginLocal = ViewOriginLocal;

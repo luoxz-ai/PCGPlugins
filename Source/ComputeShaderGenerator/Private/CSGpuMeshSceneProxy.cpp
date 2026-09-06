@@ -12,6 +12,7 @@
 #include "RHICommandList.h"
 #include "RenderGraphBuilder.h"
 #include "RenderGraphUtils.h"
+#include "RenderUtils.h"      // VelocityIncludeStationaryPrimitives
 #include "RHIGPUReadback.h"
 
 FCSGpuMeshSceneProxy::FCSGpuMeshSceneProxy(const UPrimitiveComponent* Component, UMaterialInterface* InMaterial, const char* DebugName)
@@ -135,8 +136,18 @@ FPrimitiveViewRelevance FCSGpuMeshSceneProxy::GetViewRelevance(const FSceneView*
 	Result.bRenderInMainPass = ShouldRenderInMainPass();
 	Result.bUsesLightingChannels = GetLightingChannelMask() != GetDefaultLightingChannelMask();
 	Result.bRenderCustomDepth = ShouldRenderCustomDepth();
-	Result.bVelocityRelevance = false;
 	MaterialRelevance.SetPrimitiveViewRelevance(Result);
+	// 必须与引擎预通道 / 速度通道的分工一致（公式抄 FStaticMeshSceneProxy::GetViewRelevance）。
+	// 全深度预通道是 DDM_AllOpaqueNoVelocity 时（本工程 r.VelocityOutputPass=0 就是这一档），
+	// FDepthPassMeshProcessor::AddMeshBatch 会按 DrawsVelocity() / AlwaysHasVelocity() 把"本帧有速度"
+	// 的图元踢出预通道，指望速度通道替它写深度；而基通道是 DepthRead，谁都不写。这里曾硬写 false，
+	// 结果材质接了 WPO（草的风动，代理构造时就带上 bHasWorldPositionOffsetVelocity）或 Movable 组件
+	// 变换变化的那一帧，深度缓冲里根本没有它。实测症状（2026-09-05）：草在天空背景下被大气 / 雾按远平面
+	// 合成成半透明白片，背景是地面时借地面深度"看着正常"、且后画的花把它整片盖掉；拖动 actor 时
+	// 花、石阶、石子同样丢深度一帧。依赖 bOpaque，所以必须放在 SetPrimitiveViewRelevance 之后。
+	// 速度着色器对两面 / WPO 材质本来就在 shader map 里（TVelocityVS::ShouldCompilePermutation），不需要新编译。
+	Result.bVelocityRelevance = (VelocityIncludeStationaryPrimitives(View->GetShaderPlatform()) || DrawsVelocity())
+		&& Result.bOpaque && Result.bRenderInMainPass;
 	return Result;
 }
 
@@ -302,8 +313,19 @@ void FCSGpuMeshSceneProxy::AllocateStreamsAndBindVF(FRHICommandListBase& RHICmdL
 			// 一条流可以承载多组 UV（交错，每组 2 个 float）—— 见 FStandardStreamOptions::NumTexCoordSets。
 			// 逐组各挂一个 stream component（偏移 8×组号、步长 = 整条 unit），SRV 只有一个槽位、
 			// 设一次即可：引擎的 manual fetch 正是按 NumTexCoords 做交错索引的。
+			//
+			// ⚠️ **stream component 最多只挂 4 个，而 NumTexCoords 可以到 8**，两个数不是一回事：
+			// `FStaticMeshDataType::TextureCoordinates` 是 `TFixedAllocator<MAX_STATIC_TEXCOORDS / 2>`
+			// （引擎 `Components.h:46`）—— 第 5 个 Add 当场撑爆固定分配器；顶点声明那边也只排属性
+			// 4..7（`LocalVertexFactory.cpp:530-549`，不足 4 个还拿最后一个补齐），引擎自己同样把
+			// 声明侧钳在 `MAX_TEXCOORDS = 4`（`StaticMeshVertexBuffer.cpp:626`）。
+			// 第 5..8 组只经 manual fetch 的 SRV 到达 shader：`MANUAL_VERTEX_FETCH` 在
+			// `RHISupportsManualVertexFetch()` 成立时恒开（`LocalVertexFactory.cpp:306-308`），而本插件
+			// 只面向 SM5+（`CSGpuInstancedMeshVertexFactory.h:18-19`）⇒ 恒成立。要往非 SM5 平台移植
+			// 时，UV4..7 会静默读不到，得先把这条钳位的前提重新论证。
 			const int32 NumSets = FMath::Max(int32(D.ElementsPerUnit) / 2, 1);
-			for (int32 Set = 0; Set < NumSets; ++Set)
+			const int32 NumDeclaredSets = FMath::Min(NumSets, int32(MAX_STATIC_TEXCOORDS) / 2);
+			for (int32 Set = 0; Set < NumDeclaredSets; ++Set)
 			{
 				Data.TextureCoordinates.Add(FVertexStreamComponent(
 					&S.VB, uint32(Set) * 2u * sizeof(float), VertexStride, VET_Float2));

@@ -117,14 +117,36 @@ struct COMPUTESHADERGENERATOR_API FCSWallOpening
 	 * 与左右两侧残料跨度有关的样式位（`CSHouse_StylePier*`）。
 	 *
 	 * **为什么把它挂在洞上而不是另起一张表**：墩的判定带双阈迟滞 ⇒ 它是路径依赖的，
-	 * 记忆只能活在 actor 里（同 `DoorSlotOpen`）；而铺墙板的 `CSHouse_BuildBodySoup` 是纯函数，
+	 * 记忆只能活在 actor 里（同 `DoorRunMemory`）；而铺墙板的 `CSHouse_BuildBodySoup` 是纯函数，
 	 * 只吃一份 desc。中间要么再传一张按跨度序号索引的表（两边各自枚举跨度、序号一旦对不上就
 	 * 静默错位），要么把结论粘在洞本身上——洞是唯一同时流过两边、且顺序天然一致的东西。
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Opening")
 	uint8 StyleFlags = 0;
 
+	/**
+	 * 拱顶相对**起拱线**的升高 cm（`Shape == Arch` 才有意义）。**0 = 用半宽**，即正半圆。
+	 *
+	 * 加它是为了把**拱高与洞宽解耦**（2026-09-04，用户"门上升过高"）。半圆下拱高恒等于半宽，
+	 * 洞一宽拱就顶到很高；TG 不是这样 —— `img/tiny-glade-ref-twin-arch-pier.jpg` 里那两个拱
+	 * 跨约 200 cm、起拱线以上只升约 80 cm，明显**扁于半圆**（TG 侧的载体是
+	 * `create_stone_arch_profile` + `ArchFunction::remap_t` 的剖面曲线）。
+	 *
+	 * 归一化之后判据一个字都不用改：`q = ((S−Cs)/HW, (Z−拱脚)/Rise)`，`dot(q,q) < 1` 从正圆
+	 * 变成**椭圆**。⇒ **材质里那段 HLSL 不需要跟着改** —— 它只看已经归一化的 q，
+	 * 缩放全在 `FCSOpeningClipField` 里。这条是这次改动能这么小的原因。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CS Opening")
+	float ArchRise = 0.0f;
+
 	float HalfWidth() const { return Width * 0.5f; }
+	/** 实际拱高：`ArchRise` 为 0 时退回半宽（正半圆），并夹在洞高之内。 */
+	float Rise() const
+	{
+		const float Full = FMath::Max(Z1 - Z0, UE_KINDA_SMALL_NUMBER);
+		const float Want = (ArchRise > UE_KINDA_SMALL_NUMBER) ? ArchRise : HalfWidth();
+		return FMath::Clamp(Want, UE_KINDA_SMALL_NUMBER, Full);
+	}
 	float S0() const { return CenterS - Width * 0.5f; }
 	float S1() const { return CenterS + Width * 0.5f; }
 	bool IsValid() const { return Width > UE_KINDA_SMALL_NUMBER && Z1 > Z0 + UE_KINDA_SMALL_NUMBER; }
@@ -208,14 +230,20 @@ inline void CSHouse_SampleOpeningProfile(const FCSWallOpening& Opening, float Ch
 	case ECSOpeningShape::Arch:
 	default:
 	{
-		// 矩形下身（Z0 → 拱脚）+ 半圆顶。拱脚高 = 洞顶 − 半宽；拱高不足时退化成纯半圆。
-		const float SpringZ = FMath::Max(Opening.Z1 - R, Opening.Z0);
-		const int32 N = CSHouse_ProfileSegments(R, ChordTolerance);
-		const float Circum = R / FMath::Cos(PI / (2.0f * N));
+		// 矩形下身（Z0 → 拱脚）+ **椭圆**顶：半轴 = (半宽, Rise)。`ArchRise` 为 0 时 Rise = 半宽，
+		// 退化成原来的正半圆，逐位不变。拱脚高 = 洞顶 − Rise。
+		const float Rise = Opening.Rise();
+		const float SpringZ = FMath::Max(Opening.Z1 - Rise, Opening.Z0);
+		// 段数按**较长**那根半轴取：扁拱的 S 向仍然很长，按 Rise 取会在两肩上欠采样。
+		const int32 N = CSHouse_ProfileSegments(FMath::Max(R, Rise), ChordTolerance);
+		// 外接补偿逐轴各做一次（弦高补偿是等比缩放，两轴不同尺度时不能共用一个系数）。
+		const float Inflate = 1.0f / FMath::Cos(PI / (2.0f * N));
+		const float CircumS = R * Inflate;
+		const float CircumZ = Rise * Inflate;
 		for (int32 K = 0; K <= N; ++K)
 		{
 			const float A = PI * K / N;   // 0..π，从 S0 扫到 S1
-			Emit(Opening.CenterS - Circum * FMath::Cos(A), Opening.Z0, SpringZ + Circum * FMath::Sin(A));
+			Emit(Opening.CenterS - CircumS * FMath::Cos(A), Opening.Z0, SpringZ + CircumZ * FMath::Sin(A));
 		}
 		break;
 	}
@@ -231,7 +259,8 @@ inline void CSHouse_SampleOpeningProfile(const FCSWallOpening& Opening, float Ch
  * 贴图，靠 FCSMeshStreamLayout::NumTexCoordSets 的逐 mesh 变体腾出来的）。
  *
  * **每种形状自带一套归一化，判据因此都是自封闭的**（不需要额外传洞底/洞高）：
- *   Arch   q = ((S−Cs)/HW, (Z−SpringZ)/HW)      判据 q.y ≤ 0 ? |q.x| < 1 : dot(q,q) < 1
+ *   Arch   q = ((S−Cs)/HW, (Z−SpringZ)/Rise)    判据 q.y ≤ 0 ? |q.x| < 1 : dot(q,q) < 1
+ *          （Rise 缺省 = HW ⇒ 正半圆；给了别的值就是**椭圆拱**，见 `FCSWallOpening::ArchRise`）
  *   Rect   q = ((S−Cs)/HW, (Z−Zmid)/HH)         判据 max(|q.x|, |q.y|) < 1
  *   Circle q = ((S−Cs)/HW, (Z−Zc)/HW)           判据 dot(q,q) < 1
  *
@@ -294,9 +323,14 @@ inline FCSOpeningClipField CSHouse_ComputeClipField(const FCSWallOpening& Openin
 		break;
 	case ECSOpeningShape::Arch:
 	default:
-		Field.RefZ = Opening.Z1 - HW;  // 拱脚
-		Field.InvScaleZ = 1.0f / HW;
+	{
+		// 竖直尺度是 **Rise 而不是半宽**（2026-09-04）：两者相等时就是原来的正半圆。
+		// 这一行是"拱高与洞宽解耦"的全部实现 —— 判据与材质 HLSL 都只看归一化后的 q，不必改。
+		const float Rise = Opening.Rise();
+		Field.RefZ = Opening.Z1 - Rise;  // 拱脚
+		Field.InvScaleZ = 1.0f / Rise;
 		break;
+	}
 	}
 	return Field;
 }
@@ -316,6 +350,94 @@ inline bool CSHouse_ClipKeeps(const FCSOpeningClipField& Field, const FVector2f&
 	default:
 		return !(Q.Y <= 0.0f ? FMath::Abs(Q.X) < 1.0f : (Q.X * Q.X + Q.Y * Q.Y) < 1.0f);
 	}
+}
+
+/**
+ * 洞在高度 `Z` 处的**半宽**（0 = 这个高度上没有洞）。`CSHouse_ClipKeeps` 的逆解。
+ *
+ * 砖层（D4 两层之 A）的①删实例要它：按洞的**包围盒**裁行，拱洞会被切成一个矩形缺口 ——
+ * 拱顶两侧本该有砖的地方全空了。按剪影裁才是对的，而剪影就是"每个高度上洞有多宽"。
+ *
+ * ⚠️ **两处边界不能只看 clip 场**：
+ * - 拱的 clip 场在**拱脚以下无下界**（`FCSOpeningClipField` 注释里写明是故意的，窗台那一截由
+ *   实心盒承担）。只问 clip 场的话，一扇 `Z0 = 90` 的拱窗会一路裁到地面。所以先用洞自己的
+ *   `[Z0, Z1]` 卡一道。
+ * - 判据用 **`<=` 而不是 `<`**：`|q| == 1` 恰好落在洞缘上（矩形洞的 `Z == Z0` 就是这种情况）。
+ *   取闭区间会把洞算大一丝丝 ⇒ 多删一块砖而不是留一块砖在洞里，**朝安全的方向错**。
+ */
+inline float CSHouse_OpeningHalfWidthAtZ(const FCSWallOpening& Opening, float Z)
+{
+	if (!Opening.IsValid()) return 0.0f;
+	if (Z < Opening.Z0 || Z > Opening.Z1) return 0.0f;
+
+	const FCSOpeningClipField Field = CSHouse_ComputeClipField(Opening);
+	if (!Field.bValid || Field.InvHalfWidth <= UE_KINDA_SMALL_NUMBER) return 0.0f;
+
+	const float HalfWidth = 1.0f / Field.InvHalfWidth;
+	const float QY = (Z - Field.RefZ) * Field.InvScaleZ;
+
+	switch (Field.Shape)
+	{
+	case ECSOpeningShape::Rect:
+		return FMath::Abs(QY) <= 1.0f ? HalfWidth : 0.0f;
+	case ECSOpeningShape::Circle:
+		return FMath::Abs(QY) <= 1.0f ? HalfWidth * FMath::Sqrt(FMath::Max(1.0f - QY * QY, 0.0f)) : 0.0f;
+	case ECSOpeningShape::Arch:
+	default:
+		// 拱脚以下是矩形下身（满宽），以上是椭圆。
+		if (QY <= 0.0f) return HalfWidth;
+		return QY <= 1.0f ? HalfWidth * FMath::Sqrt(FMath::Max(1.0f - QY * QY, 0.0f)) : 0.0f;
+	}
+}
+
+/**
+ * 洞在一条**横带** `[LowZ, HighZ]` 上挡掉的 S 区间（返回 false = 这一带它挡不住）。
+ *
+ * 取带内**最宽**的那个高度 —— 少取一点就会在洞里留下半块砖。三个采样点足够覆盖三种形状：
+ * 两个端点，加上 `RefZ`（圆洞的最宽处在中间，拱与矩形则单调或恒定，端点已经包住）。
+ */
+inline bool CSHouse_OpeningSpanForBand(const FCSWallOpening& Opening, float LowZ, float HighZ,
+	float& OutS0, float& OutS1)
+{
+	if (!Opening.IsValid()) return false;
+
+	// 带与洞在 Z 上的交集。空 ⇒ 挡不住（高窗不切勒脚、落地门不切压顶就靠这一句）。
+	const float Lo = FMath::Max(LowZ, Opening.Z0);
+	const float Hi = FMath::Min(HighZ, Opening.Z1);
+	if (Hi < Lo) return false;
+
+	const FCSOpeningClipField Field = CSHouse_ComputeClipField(Opening);
+	const float Peak = FMath::Clamp(Field.RefZ, Lo, Hi);
+
+	float HalfWidth = 0.0f;
+	HalfWidth = FMath::Max(HalfWidth, CSHouse_OpeningHalfWidthAtZ(Opening, Lo));
+	HalfWidth = FMath::Max(HalfWidth, CSHouse_OpeningHalfWidthAtZ(Opening, Hi));
+	HalfWidth = FMath::Max(HalfWidth, CSHouse_OpeningHalfWidthAtZ(Opening, Peak));
+	if (HalfWidth <= UE_KINDA_SMALL_NUMBER) return false;
+
+	OutS0 = Opening.CenterS - HalfWidth;
+	OutS1 = Opening.CenterS + HalfWidth;
+	return true;
+}
+
+/**
+ * 一条横带上，洞缘从**带底到带顶**收进去多少（≥ 0）。砖层洞缘四级的③要它。
+ *
+ * ①按剪影裁行时，切口取的是带内**最宽**的那个高度 —— 于是洞窄下去的那一头（拱圈往上）
+ * 会在砖与洞之间留一条缝，最宽处 = 本函数的返回值。③把端头那块砖**剪切**成上宽下窄，
+ * 缝就没了：TG 对位物是 `flags & 32` 那条"局部 z 按拱高曲线缩放"，做的是同一件事。
+ *
+ * ⚠️ 只处理**往上收窄**（拱；矩形恒 0）。往上变宽的洞（正圆的下半）返回 0 ⇒ 保持①的保守
+ * 阶梯：剪切是**平行四边形**，一个自由度救不了上下两头都要动的梯形，硬凑会把砖推进洞里。
+ */
+inline float CSHouse_OpeningTopShear(const FCSWallOpening& Opening, float LowZ, float HighZ)
+{
+	float S0 = 0.0f, S1 = 0.0f;
+	if (!CSHouse_OpeningSpanForBand(Opening, LowZ, HighZ, S0, S1)) return 0.0f;
+
+	const float WidestHalf = (S1 - S0) * 0.5f;
+	const float TopHalf = CSHouse_OpeningHalfWidthAtZ(Opening, FMath::Min(HighZ, Opening.Z1));
+	return FMath::Max(WidestHalf - TopHalf, 0.0f);
 }
 
 /** 洞在墙上实际占掉的沿边区间（面板宽度）：半宽再向两侧各让出半个墩，端盖因此 |q.x| > 1 恒保留。 */
@@ -348,6 +470,26 @@ inline void CSHouse_OpeningCell(const FCSWallOpening& Opening, float PierWidth, 
 /** `FCSWallOpening::StyleFlags` 的位：我**左**（S 小）/ **右**（S 大）那段残料按墩处理。 */
 constexpr uint8 CSHouse_StylePierBefore = 1 << 0;
 constexpr uint8 CSHouse_StylePierAfter = 1 << 1;
+// `1 << 2` 曾是 `CSHouse_StyleCornerDoor`（跨转角段被切出的那片），**2026-09-06 用户裁决删除**：
+// 转角就是一个墩 —— 两道拱只是不在同一条边上 —— 所以它走上面那两位，配对在
+// `ResolvePierSpans` 里跨角做，中间的柱子由 `BuildCornerPierBricks` 出。这一位空着不复用，
+// 免得旧序列化数据里残留的位被读成别的意思。
+/**
+ * 这个洞是**一条路被切成多拱**（拱廊）里的一个子拱（2026-09-04 傍晚）。
+ *
+ * 用户在 TG 里的实测："两道门并排时只有拱没有木门" —— 木门只装在**单拱**上，
+ * 一排连续拱是敞开的过道（实拍 `img/tiny-glade-ref-twin-arch-pier.jpg` 里两道拱都空着）。
+ * ⚠️ `ResolvePierSpans` 只清墩那两位，这一位能活到门扇那一步。
+ */
+constexpr uint8 CSHouse_StyleArcade = 1 << 3;
+/**
+ * 门扇看这一组：任一位为真 ⇒ 敞开过道，不装门扇。
+ *
+ * 墩位进这里是 2026-09-06 删掉转角位的直接后果：转角一对靠墩位相认，"转角不装门扇"就得从墩位读。
+ * 附带的行为变化：**两扇独立的门挨得够近被判成墩时也不装门扇了** —— 与 TG 实测
+ * "两道门并排时只有拱没有木门"一致，此前那种情况反而是例外。
+ */
+constexpr uint8 CSHouse_StyleNoLeafMask = CSHouse_StylePierBefore | CSHouse_StylePierAfter | CSHouse_StyleArcade;
 
 /** 墩样式的两个阈值。双阈迟回与门拱点亮同一条纪律（计划 D6）。 */
 struct FCSHousePierStyle
@@ -361,7 +503,7 @@ struct FCSHousePierStyle
 
 /**
  * 双阈迟回：跨度是**连续量**，单阈会让跨度在阈值附近抖动时样式来回切换（整面墙的灰泥
- * 忽有忽无，比"选错一种样式"难看得多）。与 `SlotOnCoverage / SlotOffCoverage` 同型。
+ * 忽有忽无，比"选错一种样式"难看得多）。与门洞的区间滞回（`DoorKeepWidthRatio`）同型。
  */
 inline bool CSHouse_SpanIsPier(const FCSHousePierStyle& Style, float SpanWidth, bool bWasPier)
 {
@@ -539,6 +681,225 @@ inline FCSHouseEdgeFrame CSHouse_GetEdge(int32 EdgeIndex, const FVector2D& Footp
 	default:F.Start = { -HX, HY - T };  F.U = { 0, -1 }; F.In = { 1, 0 };  F.Len = float(Footprint.Y) - 2 * T; break;
 	}
 	return F;
+}
+
+/**
+ * 射线（或一个点）落在哪面外墙上。**房子局部空间** —— 世界变换由调用方先解掉。
+ *
+ * D8 特征标记的宿主解析用它：`S` / `Z` 恰好就是 `FCSHouseWindow` 要的 `CenterS` / 窗台高，
+ * 所以标记从"我在世界的哪里"到"我是这面墙上的哪一扇窗"是一步换算，不需要第二套坐标。
+ */
+struct FCSWallHit
+{
+	bool  bHit = false;
+	/** 0..3，与 `CSHouse_GetEdge` 同号。 */
+	int32 EdgeIndex = -1;
+	/** 沿边弧长，与 `CSHouse_GetEdge` 的 S 同口径。 */
+	float S = 0.0f;
+	/** 墙空间高度，房底为 0。 */
+	float Z = 0.0f;
+	/** 射线版是沿射线的距离；就近版是到墙面的垂距。 */
+	float Distance = 0.0f;
+};
+
+/**
+ * 射线 × 四面外墙，取最近的一次命中（**解析求交，不是引擎 trace**）。
+ *
+ * ⚠️ **必须解析求交**：房子的 gpumesh 全线 `NoCollision`（`CSGpuMeshComponent.cpp`），
+ * `LineTraceSingle` 永远打不到 —— 计划 D8 明写这条，照 trace 写会得到"窗户一放就没"，
+ * 而且不会有任何断言报红（标记自毁是"合法"行为）。
+ *
+ * 只判**外表面**（`dot(Dir, 外法线) < 0`）：从墙里往外打不算命中，否则站在房内乱挥鼠标
+ * 会把窗贴到背面那堵墙上。
+ */
+inline FCSWallHit CSHouse_RayHitWall(
+	const FVector& LocalOrigin, const FVector& LocalDir,
+	const FVector2D& Footprint, float T, float WallHeight, float MaxDistance)
+{
+	FCSWallHit Best;
+	Best.Distance = MaxDistance;
+
+	const FVector2D Dir2(LocalDir.X, LocalDir.Y);
+	for (int32 Edge = 0; Edge < 4; ++Edge)
+	{
+		const FCSHouseEdgeFrame F = CSHouse_GetEdge(Edge, Footprint, T);
+		if (F.Len <= UE_KINDA_SMALL_NUMBER) continue;
+
+		const FVector2D N(-F.In.X, -F.In.Y);          // 外法线
+		const double Denom = FVector2D::DotProduct(Dir2, N);
+		if (Denom > -UE_KINDA_SMALL_NUMBER) continue;  // 平行、或从背面打过来
+
+		const double Dist = FVector2D::DotProduct(F.Start - FVector2D(LocalOrigin.X, LocalOrigin.Y), N) / Denom;
+		if (Dist <= 0.0 || Dist >= double(Best.Distance)) continue;
+
+		const FVector P = LocalOrigin + LocalDir * Dist;
+		const double S = FVector2D::DotProduct(FVector2D(P.X, P.Y) - F.Start, F.U);
+		if (S < 0.0 || S > double(F.Len)) continue;
+		if (P.Z < 0.0 || P.Z > double(WallHeight)) continue;
+
+		Best.bHit = true;
+		Best.EdgeIndex = Edge;
+		Best.S = float(S);
+		Best.Z = float(P.Z);
+		Best.Distance = float(Dist);
+	}
+	return Best;
+}
+
+/**
+ * 就近找墙：把点投到四面外墙上取最近的一面（计划 D8 的 `csh.WindowSnapDist` 退路）。
+ *
+ * 射线版是"朝向摆正了"的通路；这条兜的是"贴着墙但朝向没摆正"——两条都空才判无宿主。
+ * S / Z 都夹到墙面内，所以它返回的永远是墙上一个**合法**位置，谓词那关照旧另判。
+ */
+inline FCSWallHit CSHouse_NearestWall(
+	const FVector& LocalPoint, const FVector2D& Footprint, float T, float WallHeight, float MaxDistance)
+{
+	FCSWallHit Best;
+	Best.Distance = MaxDistance;
+
+	const FVector2D P2(LocalPoint.X, LocalPoint.Y);
+	for (int32 Edge = 0; Edge < 4; ++Edge)
+	{
+		const FCSHouseEdgeFrame F = CSHouse_GetEdge(Edge, Footprint, T);
+		if (F.Len <= UE_KINDA_SMALL_NUMBER) continue;
+
+		const FVector2D N(-F.In.X, -F.In.Y);
+		const double S = FMath::Clamp(FVector2D::DotProduct(P2 - F.Start, F.U), 0.0, double(F.Len));
+		const double Z = FMath::Clamp(double(LocalPoint.Z), 0.0, double(WallHeight));
+		// 到墙面的距离取三维：面内偏移已经被夹住，剩下的就是法向 + 被夹掉的那两段。
+		const FVector2D OnFace = F.Start + F.U * S;
+		const FVector Delta(P2.X - OnFace.X, P2.Y - OnFace.Y, LocalPoint.Z - Z);
+		// 背面（法向为负）不算 —— 与射线版同一条纪律。
+		if (FVector2D::DotProduct(P2 - F.Start, N) < 0.0) continue;
+
+		const double Dist = Delta.Size();
+		if (Dist >= double(Best.Distance)) continue;
+
+		Best.bHit = true;
+		Best.EdgeIndex = Edge;
+		Best.S = float(S);
+		Best.Z = float(Z);
+		Best.Distance = float(Dist);
+	}
+	return Best;
+}
+
+/**
+ * 附属物挂在墙上的**锚点**（D8，用户裁决 2026-09-06「位置的存储方式与 TG 一致」）。
+ *
+ * ## 为什么是「离某个角多远」而不是绝对弧长
+ *
+ * `FCSHouseWindow::CenterS` 的原点是 `CSHouse_GetEdge` 的 `F.Start`，而 `ACSHouseActor::PushEdge(e)`
+ * 会把 e 那一侧的**两个角**各挪 `Δ` —— 它们恰好是第 `e` 与第 `(e+1)%4` 条边的 S 原点。后果实测过
+ * （2026-09-05 四条边逐一推算）：**推第 e 条边，第 e 与第 e+1 条边上的窗错位 Δ，另外两条完全正确**，
+ * 其中 e+1 那面墙**根本没动**、窗却沿着它滑了 Δ —— 最难解释的一种。
+ *
+ * 锚到「最近的那个角」之后：被推那一侧的窗随墙走、另一侧的窗原地不动，行为可预期。
+ * 这与 TG `wall_attachment::WallCornerAttachment::{from_rectangle_corner_id, to_rectangle_corner_id}`
+ * 用**拓扑角编号**而不是坐标是同一个思路 `[PDB]`。
+ *
+ * ⚠️ **锚点是唯一权威，actor 变换是派生量**（TG `CachedDecoratorTransforms` + `move_decorators_following_anchors`）。
+ * 序列化这份结构，不要序列化世界变换 —— 反过来做就是 2026-09-05 分析出的那条"重开关卡窗又挪一次位"。
+ */
+USTRUCT(BlueprintType)
+struct COMPUTESHADERGENERATOR_API FCSWallAnchor
+{
+	GENERATED_BODY()
+
+	/** 挂在哪条边，0..3，与 `CSHouse_GetEdge` 同号。`-1` = 尚未锚定。 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Wall Anchor")
+	int32 EdgeIndex = -1;
+
+	/** `false` = 从边的**起点角**量起，`true` = 从**终点角**量起。取离命中点近的那个。 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Wall Anchor")
+	bool bFromEndCorner = false;
+
+	/** 到那个角的沿墙距离 cm（恒 ≥ 0）。 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Wall Anchor")
+	float DistFromCorner = 0.0f;
+
+	/** 洞底离墙基的高度 cm（= `FCSHouseWindow::SillZ`）。 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CS Wall Anchor")
+	float SillZ = 0.0f;
+
+	bool IsValidAnchor() const { return EdgeIndex >= 0 && EdgeIndex <= 3 && DistFromCorner >= 0.0f; }
+
+	/** 逐字段相等。用来在重登记前挡掉"没动"的那些，口径同 `FCSHouseWindow::operator==`。 */
+	bool operator==(const FCSWallAnchor& O) const
+	{
+		return EdgeIndex == O.EdgeIndex && bFromEndCorner == O.bFromEndCorner
+			&& DistFromCorner == O.DistFromCorner && SillZ == O.SillZ;
+	}
+	bool operator!=(const FCSWallAnchor& O) const { return !(*this == O); }
+};
+
+/**
+ * 一次墙面命中 → 锚点。**沿边弧长离哪个角近就锚哪个角**（见 `FCSWallAnchor` 的注释）。
+ *
+ * `SillZ` 由调用方给：命中点的 `Z` 是窗**心**高度，洞底要再减半个窗高（口径与
+ * `ACSWindowMarker::MakeDemand` 一致，两处必须同源，否则窗会整体偏高半扇）。
+ */
+inline FCSWallAnchor CSHouse_MakeWallAnchor(const FCSWallHit& Hit, const FVector2D& Footprint, float T, float SillZ)
+{
+	FCSWallAnchor A;
+	if (!Hit.bHit) return A;
+
+	const FCSHouseEdgeFrame F = CSHouse_GetEdge(Hit.EdgeIndex, Footprint, T);
+	const float S = FMath::Clamp(Hit.S, 0.0f, FMath::Max(F.Len, 0.0f));
+
+	A.EdgeIndex = Hit.EdgeIndex & 3;
+	// 正中间（S == Len/2）归**起点角**：判据要给出确定的一侧，`>` 而不是 `>=` 就是这个用意。
+	A.bFromEndCorner = (S > F.Len * 0.5f);
+	A.DistFromCorner = A.bFromEndCorner ? (F.Len - S) : S;
+	A.SillZ = SillZ;
+	return A;
+}
+
+/**
+ * 锚点 → 沿边弧长 `S`（`FCSHouseWindow::CenterS` 要的那个量）。
+ *
+ * 墙缩短到锚点越界时**夹到 `[0, Len]`** 而不是留在墙外：谓词那关照旧会判 `NearCorner` 把它拒掉，
+ * 但夹住能保证派生变换永远落在墙面上 —— 标记不会飞到墙外的空中去。
+ */
+inline float CSHouse_AnchorS(const FCSWallAnchor& A, const FVector2D& Footprint, float T)
+{
+	const FCSHouseEdgeFrame F = CSHouse_GetEdge(A.EdgeIndex, Footprint, T);
+	const float Len = FMath::Max(F.Len, 0.0f);
+	const float S = A.bFromEndCorner ? (Len - A.DistFromCorner) : A.DistFromCorner;
+	return FMath::Clamp(S, 0.0f, Len);
+}
+
+/**
+ * 锚点 → **房子构建空间**的变换（`ACSHouseActor::GetBuildTransform()` 那个只取 yaw 的空间）。
+ * 这就是 TG `CachedDecoratorTransforms` 的对位物：变换是从锚点算出来的，不是存下来的。
+ *
+ * 约定（与 `ACSHouseFeatureMarker` 的探针同向，**别改**）：
+ * - **+X = 墙的内法线 `In`**（标记站在墙外看着墙）。`ResolveHostAndRegister` 沿 `GetActorForwardVector()`
+ *   打探针，反过来的话标记一放上去就找不到宿主 —— 而找不到宿主是"合法"的自毁，不会有断言报红。
+ * - 原点在墙的外表面**再往外 `Standoff`** 处。窗框资产按 −X 朝外来摆。
+ *
+ * ⚠️ **`Standoff` 必须 ≥ 0，不能把原点推进墙里**（否则派生出来的位置会让探针失效，而且两条通路
+ * 一起失效：射线版从外皮内侧往内打得到**负**距离被 `Dist <= 0` 挡掉，就近版的
+ * `dot(P − Start, 外法线) < 0` 判成背面直接 `continue`）。症状是"窗吸附一次之后就再也解析不到宿主"，
+ * 而无宿主会自毁 —— 又是一次不报红的静默失效。派生变换必须是解析的**不动点**：
+ * `SnapToAnchor()` 之后再 `ResolveHostAndRegister()` 必须拿回同一个锚点，单测 `House.WallAnchor` 钉这条。
+ *
+ * `HalfHeight` = 窗高的一半：锚点存的是洞底，而标记本体锚在窗**心**（口径同 `MakeDemand`）。
+ */
+inline FTransform CSHouse_AnchorToLocal(
+	const FCSWallAnchor& A, const FVector2D& Footprint, float T, float HalfHeight, float Standoff)
+{
+	const FCSHouseEdgeFrame F = CSHouse_GetEdge(A.EdgeIndex, Footprint, T);
+	const float S = CSHouse_AnchorS(A, Footprint, T);
+
+	// 外表面上的点 + 沿**外**法线站开一点。`F.Start` 本来就在外皮上（东西两面缩 T 是为了避开转角
+	// 重叠，缩的是长度不是法向），所以这里不需要再补半个墙厚。
+	const FVector2D P2 = F.Start + F.U * double(S) - F.In * double(FMath::Max(Standoff, 0.0f));
+	const FVector Pos(P2.X, P2.Y, double(A.SillZ + HalfHeight));
+
+	const FVector Fwd(F.In.X, F.In.Y, 0.0);
+	return FTransform(FRotationMatrix::MakeFromXZ(Fwd, FVector::UpVector).Rotator(), Pos);
 }
 
 /** 洞被拒的原因（计划 D8 的 `FCSFeaturePlacement::Reason`）。编辑器/脚本据此区分"没生成"与"生成了但看不见"。 */

@@ -28,6 +28,7 @@ class FCSHouseVinePackCS : public FGlobalShader
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, VineRecords)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RWVineInstances)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RWVineCounter)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, RWVineCustomData)
 		SHADER_PARAMETER(FMatrix44f, VineWorldToComponent)
 		SHADER_PARAMETER(FVector3f, VineBaseSphereCentre)
 		SHADER_PARAMETER(FVector3f, VineBlockSize)
@@ -53,12 +54,15 @@ IMPLEMENT_GLOBAL_SHADER(FCSHouseVinePackCS, "/Plugin/PCGPlugins/Shaders/Private/
 /** 记录数组 → 上传用的 float4 平铺。布局与 `CSHouseVine.usf` 文件头逐字对应。 */
 void CSHouseVine_Flatten(const TArray<CSHouseVine::FRecord>& In, TArray<FVector4f>& Out)
 {
-	Out.Reset(In.Num() * 3);
+	Out.Reset(In.Num() * 4);
 	for (const CSHouseVine::FRecord& R : In)
 	{
 		Out.Add(FVector4f(R.WorldPos.X, R.WorldPos.Y, R.WorldPos.Z, R.LengthScale));
 		Out.Add(FVector4f(R.Dir.X, R.Dir.Y, R.Dir.Z, R.Random01));
 		Out.Add(FVector4f(R.Normal.X, R.Normal.Y, R.Normal.Z, R.SizeScale));
+		// 第 4 行只用 xy（生长动画）。zw 留白 —— 别顺手塞别的：行宽是 kernel 里
+		// `Index * 4u` 那个常量，两边必须一起改。
+		Out.Add(FVector4f(R.SpawnTime, R.ArcLength, 0.0f, 0.0f));
 	}
 }
 }
@@ -170,27 +174,48 @@ void BuildPlan(const TArray<FWallStrip>& Strips, const TArray<FCSWallOpening>& O
 		const float Slot = Root.Length / float(StrandCount);
 		const float RootMargin = MarginOf(Root);
 
-		for (int32 Strand = 0; Strand < StrandCount; ++Strand)
+		for (int32 StrandIdx = 0; StrandIdx < StrandCount; ++StrandIdx)
 		{
 			const FWallStrip* Wall = &Root;
 			float Margin = RootMargin;
 			// 起点：格中心 + 半格以内的抖动。**身份里没有位置** —— 见头文件那段。
-			const float RootJitter = (Hash01(IdentityHash(Root.EdgeIndex, Strand, -1, 3u, Params.Seed)) - 0.5f) * Slot;
-			float S = FMath::Clamp((float(Strand) + 0.5f) * Slot + RootJitter, Margin, Root.Length - Margin);
+			const float RootJitter = (Hash01(IdentityHash(Root.EdgeIndex, StrandIdx, -1, 3u, Params.Seed)) - 0.5f) * Slot;
+			float S = FMath::Clamp((float(StrandIdx) + 0.5f) * Slot + RootJitter, Margin, Root.Length - Margin);
 			float Z = 0.0f;
 			// 初始倾角：左右各一半，别让整面墙的藤都朝同一边歪。
-			float Angle = (Hash01(IdentityHash(Root.EdgeIndex, Strand, -1, 5u, Params.Seed)) - 0.5f) * 2.0f * Params.MaxLean * 0.5f;
+			float Angle = (Hash01(IdentityHash(Root.EdgeIndex, StrandIdx, -1, 5u, Params.Seed)) - 0.5f) * 2.0f * Params.MaxLean * 0.5f;
 
 			// 藤脚在洞里（门口正下方）：先试着侧移出去，实在挪不开才放弃这根。
 			if (!CSHouseVine_EscapeRoot(Openings, Wall->EdgeIndex, S, Margin, Wall->Length - Margin,
 				Params.HoleClearance, Slot, SegLen)) continue;
+
+			// 悬空不长藤（用户裁决 2026-09-06）。判据放在 `EscapeRoot` **之后** —— 侧移会改 S，
+			// 按侧移前的位置判等于在问一个藤脚根本不会落的地方。
+			if (Wall->SampleGroundGap(S) > Params.MaxGroundGap) continue;
+
+			// 折线：枝的**唯一形状来源**（2026-09-06 裁决 1/2）。点存墙面参数坐标，与 TG 的
+			// `WallCoord` 同构 —— 映射到世界是 `PackTubePath` 的最后一步，在这之前一切都天然贴墙。
+			// ⚠️ 身份用**起点那面墙**，跨墙不改：与 `IdentityHash` 的调用口径必须逐字一致，
+			// 否则 `SpawnTime` 的键会在藤拐弯的那一帧突变，整根藤重新长一遍。
+			FStrand Strand;
+			Strand.RootEdgeIndex = Root.EdgeIndex;
+			Strand.StrandIndex = StrandIdx;
+			Strand.RootKey = IdentityHash(Root.EdgeIndex, StrandIdx, -1, 7u, Params.Seed);
+			Strand.Points.Add(FStrandPoint{ FVector2f(S, Z), Wall->EdgeIndex });
+			Strand.Arc.Add(0.0f);
+
+			// 沿藤累加的世界弧长，喂叶/花的生长相位（见 `FRecord::ArcLength` 的注释）。
+			float StrandArc = 0.0f;
+			// 这一根在 `OutPlan.Strands` 里的下标。**在这里取而不是在末尾** —— 末尾那句
+			// `Add` 之后 Num() 已经加过一了，而且中途 `break` 出去的藤根本走不到那里。
+			const int32 ThisStrandIndex = OutPlan.Strands.Num();
 
 			for (int32 Segment = 0; Segment < MaxSeg; ++Segment)
 			{
 				// ⚠️ **身份一律用"起点那面墙"的编号**，不是当前所在的墙：跨墙以后用当前墙的话，
 				// 同一根藤在拐弯前后会拿到两套随机，而且拐不拐弯本身又由随机决定 ⇒ 自指。
 				// 身份 = (起点墙, 藤号, 段号, 佐料, 种子)，跨墙对它是透明的。
-				const uint32 Id = IdentityHash(Root.EdgeIndex, Strand, Segment, 11u, Params.Seed);
+				const uint32 Id = IdentityHash(Root.EdgeIndex, StrandIdx, Segment, 11u, Params.Seed);
 				Angle += (Hash01(Id) - 0.5f) * 2.0f * Params.Wander;
 				Angle = FMath::Clamp(Angle, -Params.MaxLean, Params.MaxLean);
 
@@ -198,9 +223,9 @@ void BuildPlan(const TArray<FWallStrip>& Strips, const TArray<FCSWallOpening>& O
 				float NextS = S + FMath::Sin(Angle) * SegLen;
 				const float NextZ = Z + FMath::Cos(Angle) * SegLen;
 
-				// 长到墙顶就收。**墙顶是 S 的函数**：檐墙恒 = 墙高，山墙是那条三角斜边
-				// （藤因此能爬过檐口高度、继续在山墙上长）。这条线以上是屋面板，不是墙。
-				if (NextZ > Wall->TopAt(FMath::Clamp(NextS, 0.0f, Wall->Length))) break;
+				// 长到墙顶就收。四坡屋顶下四面墙顶一律平在墙高（山墙那条随坡升高的剖面已随
+				// 双坡结构一起删除），这条线以上是屋面，不是墙。
+				if (NextZ > Wall->Height) break;
 
 				// 撞墙角。两条出路：
 				//  · 跨到隔壁那面墙继续长（TG 的 `check_for_wall_jump`）—— 藤绕着房子转角爬，
@@ -215,7 +240,7 @@ void BuildPlan(const TArray<FWallStrip>& Strips, const TArray<FCSWallOpening>& O
 						: nullptr;
 					const bool bJump = Neighbour && Neighbour != Wall
 						&& Neighbour->Length > MarginOf(*Neighbour) * 2.0f
-						&& Hash01(IdentityHash(Root.EdgeIndex, Strand, Segment, 53u, Params.Seed)) < Params.JumpChance;
+						&& Hash01(IdentityHash(Root.EdgeIndex, StrandIdx, Segment, 53u, Params.Seed)) < Params.JumpChance;
 					if (bJump)
 					{
 						const float NeighbourMargin = MarginOf(*Neighbour);
@@ -276,18 +301,20 @@ void BuildPlan(const TArray<FWallStrip>& Strips, const TArray<FCSWallOpening>& O
 					Rec.LengthScale = Len * FMath::Max(Params.Bloat, 1.0f);
 					Rec.Dir = FVector3f(Delta / Len);
 					Rec.Normal = FVector3f(SegNormal);
-					Rec.Random01 = Hash01(IdentityHash(Root.EdgeIndex, Strand, Segment, 71u, Params.Seed));
+					Rec.Random01 = Hash01(IdentityHash(Root.EdgeIndex, StrandIdx, Segment, 71u, Params.Seed));
 					// 越往上越细，藤才有"长出来"的方向感（TG 的 IvySegment 自带 start/end_thickness）。
 					Rec.SizeScale = FMath::Lerp(1.0f, 0.55f, float(Segment) / float(MaxSeg));
+					Rec.StrandIndex = ThisStrandIndex;
+					Rec.ArcLength = StrandArc;
 					OutPlan.Branch.Add(Rec);
 				}
 
 				const FVector Along = Delta.GetSafeNormal();
 				if (!Along.IsNearlyZero()
-					&& Hash01(IdentityHash(Root.EdgeIndex, Strand, Segment, 23u, Params.Seed)) < Params.LeafChance)
+					&& Hash01(IdentityHash(Root.EdgeIndex, StrandIdx, Segment, 23u, Params.Seed)) < Params.LeafChance)
 				{
-					const float Side = Hash01(IdentityHash(Root.EdgeIndex, Strand, Segment, 31u, Params.Seed)) < 0.5f ? -1.0f : 1.0f;
-					const float Spread = 0.6f + 0.8f * Hash01(IdentityHash(Root.EdgeIndex, Strand, Segment, 37u, Params.Seed));
+					const float Side = Hash01(IdentityHash(Root.EdgeIndex, StrandIdx, Segment, 31u, Params.Seed)) < 0.5f ? -1.0f : 1.0f;
+					const float Spread = 0.6f + 0.8f * Hash01(IdentityHash(Root.EdgeIndex, StrandIdx, Segment, 37u, Params.Seed));
 					// 叶子从段的中点斜着支出去：方向 = 段方向绕墙面法线转 ±(35°..80°)。
 					const float Turn = Side * Spread;
 					const FVector Sideways = FVector::CrossProduct(SegNormal, Along).GetSafeNormal();
@@ -296,13 +323,16 @@ void BuildPlan(const TArray<FWallStrip>& Strips, const TArray<FCSWallOpening>& O
 					{
 						FRecord Leaf;
 						Leaf.WorldPos = FVector3f((A + B) * 0.5 + SegNormal * (Params.StandOff * 0.5));
-						const float Jitter = 1.0f + (Hash01(IdentityHash(Root.EdgeIndex, Strand, Segment, 43u, Params.Seed)) - 0.5f)
+						const float Jitter = 1.0f + (Hash01(IdentityHash(Root.EdgeIndex, StrandIdx, Segment, 43u, Params.Seed)) - 0.5f)
 							* 2.0f * Params.LeafSizeJitter;
 						Leaf.LengthScale = FMath::Max(Params.LeafSize * Jitter, 1.0f);
 						Leaf.Dir = FVector3f(LeafDir);
 						Leaf.Normal = FVector3f(SegNormal);
-						Leaf.Random01 = Hash01(IdentityHash(Root.EdgeIndex, Strand, Segment, 97u, Params.Seed));
+						Leaf.Random01 = Hash01(IdentityHash(Root.EdgeIndex, StrandIdx, Segment, 97u, Params.Seed));
 						Leaf.SizeScale = Jitter;
+						Leaf.StrandIndex = ThisStrandIndex;
+						// 叶挂在段的**中点**上，弧长取半段（记录的 WorldPos 也是中点）。
+						Leaf.ArcLength = StrandArc + Len * 0.5f;
 						OutPlan.Leaf.Add(Leaf);
 					}
 				}
@@ -311,30 +341,43 @@ void BuildPlan(const TArray<FWallStrip>& Strips, const TArray<FCSWallOpening>& O
 				// 而且贴着地面那一圈会被地形与杂物挡住，纯白付实例。
 				const int32 FlowerFrom = FMath::CeilToInt(float(MaxSeg) * FMath::Clamp(Params.FlowerFromFrac, 0.0f, 1.0f));
 				if (Segment >= FlowerFrom && !Along.IsNearlyZero()
-					&& Hash01(IdentityHash(Root.EdgeIndex, Strand, Segment, 59u, Params.Seed)) < Params.FlowerChance)
+					&& Hash01(IdentityHash(Root.EdgeIndex, StrandIdx, Segment, 59u, Params.Seed)) < Params.FlowerChance)
 				{
 					// 花簇朝**外上方**张开（`ivy_flower` 实测底面在 Z=0、簇沿自身 +Z 张开）。
 					// ⚠️ 基准向量给 `Along` 而不是墙法线：kernel 用 cross(Normal, Dir) 搭面内轴，
 					// 而花的 Dir 本身就以墙法线为主 ⇒ 传墙法线会近似共线，被 kernel 的退化判据丢掉，
 					// 症状是"花一朵都不出现"而 counter 却是对的。
-					const float Tilt = (Hash01(IdentityHash(Root.EdgeIndex, Strand, Segment, 67u, Params.Seed)) - 0.5f) * 0.7f;
+					const float Tilt = (Hash01(IdentityHash(Root.EdgeIndex, StrandIdx, Segment, 67u, Params.Seed)) - 0.5f) * 0.7f;
 					const FVector Sideways = FVector::CrossProduct(SegNormal, Along).GetSafeNormal();
 					const FVector FlowerDir = (SegNormal * 0.85 + FVector(0.0, 0.0, 0.45) + Sideways * Tilt).GetSafeNormal();
 					if (!FlowerDir.IsNearlyZero())
 					{
 						FRecord Flower;
 						Flower.WorldPos = FVector3f(B + SegNormal * (Params.StandOff * 0.5));
-						const float Jitter = 1.0f + (Hash01(IdentityHash(Root.EdgeIndex, Strand, Segment, 89u, Params.Seed)) - 0.5f)
+						const float Jitter = 1.0f + (Hash01(IdentityHash(Root.EdgeIndex, StrandIdx, Segment, 89u, Params.Seed)) - 0.5f)
 							* 2.0f * Params.LeafSizeJitter;
 						// 高 = 宽 × 实测高宽比：`BlockSize` 只把 xy 钉成 FlowerSize 的方截面，
 						// z 得由记录自己说，否则花被拉成柱子（见 FParams::FlowerAspect）。
 						Flower.LengthScale = FMath::Max(Params.FlowerSize * Params.FlowerAspect * Jitter, 1.0f);
 						Flower.Dir = FVector3f(FlowerDir);
 						Flower.Normal = FVector3f(Along);
-						Flower.Random01 = Hash01(IdentityHash(Root.EdgeIndex, Strand, Segment, 101u, Params.Seed));
+						Flower.Random01 = Hash01(IdentityHash(Root.EdgeIndex, StrandIdx, Segment, 101u, Params.Seed));
 						Flower.SizeScale = Jitter;
+						Flower.StrandIndex = ThisStrandIndex;
+						// 花挂在段的**终点** B 上，所以吃满整段。
+						Flower.ArcLength = StrandArc + Len;
 						OutPlan.Flower.Add(Flower);
 					}
+				}
+
+				StrandArc += Len;
+
+				// 折线推进。判据用 `Len`（**世界**距离）而不是 (S,Z) 的差：跨墙时 S 会跳到隔壁墙的
+				// 坐标里，两者的差没有几何意义，拿它判重会把转角那一段误判成退化段丢掉。
+				if (Len > UE_KINDA_SMALL_NUMBER)
+				{
+					Strand.Points.Add(FStrandPoint{ FVector2f(NextS, NextZ), NextWall->EdgeIndex });
+					Strand.Arc.Add(StrandArc + Len);
 				}
 
 				S = NextS;
@@ -345,6 +388,163 @@ void BuildPlan(const TArray<FWallStrip>& Strips, const TArray<FCSWallOpening>& O
 					Margin = MarginOf(*Wall);
 				}
 			}
+
+			// 一个点连不成管子。**门限是 2 而不是 1**，与 SC 那条路的 `Count < 2u` 同一个理由：
+			// 下游按"点数 − 1"算段数，单点线会排出 0 段却仍占着 Meta 的槽位。
+			if (Strand.Points.Num() >= 2) OutPlan.Strands.Add(MoveTemp(Strand));
+		}
+	}
+}
+
+void PackTubePath(const TArray<FWallStrip>& Strips, const FPlan& Plan, const FParams& Params,
+	int32 Subdivide, float CircleScale, TArrayView<const float> StrandSpawnTimes, FTubePath& OutPath)
+{
+	OutPath.Reset();
+	if (Plan.Strands.IsEmpty()) return;
+
+	auto FindStrip = [&Strips](int32 EdgeIndex) -> const FWallStrip*
+	{
+		for (const FWallStrip& Strip : Strips) { if (Strip.EdgeIndex == EdgeIndex) return &Strip; }
+		return nullptr;
+	};
+	// (S, Z) + 所在墙 → 世界。与 `BuildPlan` 里算 A / B 的那两行逐字同源 —— 两处写法一旦分岔，
+	// 症状是"折线和记录对不上"，而两边各自都自洽。
+	auto ToWorld = [&FindStrip, &Params](const FStrandPoint& P) -> FVector
+	{
+		const FWallStrip* W = FindStrip(P.EdgeIndex);
+		if (!W) return FVector::ZeroVector;
+		return W->Origin + W->U * double(P.WallSZ.X) + W->Up * double(P.WallSZ.Y) + W->N * Params.StandOff;
+	};
+
+	const int32 Sub = FMath::Clamp(Subdivide, 0, 8);
+	// Pass C 的环半径 = `10 * CircleScale * Points[i].w`，所以这里反解出 w。
+	const float RadiusToScale = 1.0f / FMath::Max(10.0f * CircleScale, UE_KINDA_SMALL_NUMBER);
+	const float TipRadius = FMath::Max(Params.Thickness * 0.5f, 0.01f);
+
+	TArray<FVector> World;
+	TArray<int32> Edges;
+	for (int32 StrandIndex = 0; StrandIndex < Plan.Strands.Num(); ++StrandIndex)
+	{
+		const FStrand& Strand = Plan.Strands[StrandIndex];
+		const int32 RawCount = Strand.Points.Num();
+		if (RawCount < 2 || Strand.Arc.Num() != RawCount) continue;
+
+		World.Reset(RawCount);
+		Edges.Reset(RawCount);
+		for (const FStrandPoint& P : Strand.Points) { World.Add(ToWorld(P)); Edges.Add(P.EdgeIndex); }
+
+		// ── 细分 ────────────────────────────────────────────────────────────────
+		// Catmull-Rom 是**仿射组合**（权重和为 1），所以同一面墙上的四个共面控制点插出来的点
+		// 必然还在那个平面里 —— 在世界空间做细分不会把线拽离墙面，不必回到 (S,Z) 里算。
+		// ⚠️ **但跨墙段必须退回线性**：那四个控制点不共面，混着算会把线甩进墙体内部。
+		// 线性插值在转角处就是切一刀，正是想要的圆角。
+		const int32 Base = OutPath.Points.Num();
+		TArray<FVector> Dense;
+		Dense.Reserve(RawCount + (RawCount - 1) * Sub);
+		Dense.Add(World[0]);
+		// 与 Dense 等长的**生长弧长**：从折线自带的 Arc 线性插值，而不是重新累加细分后的
+		// 长度（见 `FStrand::Arc` 的注释 —— 一把尺，别混）。
+		TArray<float> GrowArc;
+		GrowArc.Reserve(RawCount + (RawCount - 1) * Sub);
+		GrowArc.Add(0.0f);
+		for (int32 i = 0; i + 1 < RawCount; ++i)
+		{
+			const FVector& P1 = World[i];
+			const FVector& P2 = World[i + 1];
+			const float ArcA = Strand.Arc[i];
+			const float ArcB = Strand.Arc[i + 1];
+			const bool bSameWall = Edges[i] == Edges[i + 1];
+			for (int32 s = 1; s <= Sub; ++s)
+			{
+				const double T = double(s) / double(Sub + 1);
+				if (!bSameWall)
+				{
+					Dense.Add(FMath::Lerp(P1, P2, T));
+					GrowArc.Add(FMath::Lerp(ArcA, ArcB, float(T)));
+					continue;
+				}
+				// 端点处把控制点夹回自身（TG 的折线没有环，两端不外推）。同墙才取邻居，
+				// 否则 P0/P3 会来自另一面墙、把共面性破坏掉 —— 那正是上面警告的那种线。
+				const FVector& P0 = (i > 0 && Edges[i - 1] == Edges[i]) ? World[i - 1] : P1;
+				const FVector& P3 = (i + 2 < RawCount && Edges[i + 2] == Edges[i + 1]) ? World[i + 2] : P2;
+				const double T2 = T * T, T3 = T2 * T;
+				Dense.Add(0.5 * ((2.0 * P1) + (-P0 + P2) * T
+					+ (2.0 * P0 - 5.0 * P1 + 4.0 * P2 - P3) * T2
+					+ (-P0 + 3.0 * P1 - 3.0 * P2 + P3) * T3));
+				GrowArc.Add(FMath::Lerp(ArcA, ArcB, float(T)));
+			}
+			Dense.Add(P2);
+			GrowArc.Add(ArcB);
+		}
+
+		// 主体弧长（**收尖之前**量）—— 上面那条锥度曲线的归一化分母。
+		float MainArc = 0.0f;
+		for (int32 i = 1; i < Dense.Num(); ++i) MainArc += float((Dense[i] - Dense[i - 1]).Size());
+		MainArc = FMath::Max(MainArc, UE_KINDA_SMALL_NUMBER);
+
+		// ── 梢部收尖 ────────────────────────────────────────────────────────────
+		// 主锥度只收到 0.55，梢仍是一圈**开口**的管腔 —— 从侧上方看正对着那个洞。
+		// 沿最后一段的方向再续两环，半径收到 0.45 / 0.10，视觉上就是一个自然的尖。
+		//
+		// ⚠️ **不收到 0**：整圈环顶点收到同一点会退化成零面积三角形、法线变 NaN
+		//（与材质里 `VineThickenStart` 不许取 0 是同一条）。0.10 剩下的孔径不到半毫米。
+		// ⚠️ **只封梢不封根**：根埋在墙脚下，封了看不见，白付两环。
+		{
+			const int32 Last = Dense.Num() - 1;
+			if (Last >= 1)
+			{
+				const FVector Dir = (Dense[Last] - Dense[Last - 1]).GetSafeNormal();
+				if (!Dir.IsNearlyZero())
+				{
+					// 再往前续一小段收口。**收紧的主体不在这两环上**（那是下面按弧长的
+					// 平滑衰减干的），这里只是让最末端真的闭合而不是停在一个开口上。
+					const double TipR = double(TipRadius) * 0.55;
+					Dense.Add(Dense[Last] + Dir * (TipR * 0.8));
+					Dense.Add(Dense[Last] + Dir * (TipR * 1.6));
+					// 续的两环也要有弧长，否则生长前沿扫到尖上就没数了（读到 0 ⇒ 尖端恒可见）。
+					const float EndArc = GrowArc.Last();
+					GrowArc.Add(EndArc + float(TipR * 0.8));
+					GrowArc.Add(EndArc + float(TipR * 1.6));
+				}
+			}
+		}
+
+		// ── 弧长（细分后的世界折线上累加）───────────────────────────────────────
+		const int32 Count = Dense.Num();
+		TArray<float> Arc;
+		Arc.SetNumUninitialized(Count);
+		Arc[0] = 0.0f;
+		for (int32 i = 1; i < Count; ++i) Arc[i] = Arc[i - 1] + float((Dense[i] - Dense[i - 1]).Size());
+		// 收紧以**最末点**为基准（含上面续的两环），不是主体末点：否则那两环会落在
+		// 衰减曲线之外，重新鼓回主锥度，收口白做。
+		const float TipEndArc = Arc[Count - 1];
+
+		const float SpawnTime = StrandSpawnTimes.IsValidIndex(StrandIndex) ? StrandSpawnTimes[StrandIndex] : 0.0f;
+
+		for (int32 i = 0; i < Count; ++i)
+		{
+			// 锥度：与实例路那条 `Lerp(1.0, 0.55, Segment / MaxSeg)` 同一条曲线，只是自变量
+			// 换成了归一化弧长（细分之后段号已经不是均匀的了，用它会让锥度随细分次数变）。
+			// ⚠️ 归一化**用的是收尖之前的主体长度**：拿含尖的 TotalArc 去归一，主体的锥度会被
+			// 那两环稀释（收得比 0.55 早一点点），细分次数一变还会漂。
+			const float MainTaper = FMath::Lerp(1.0f, 0.55f, FMath::Min(Arc[i] / MainArc, 1.0f));
+
+			// 梢部收紧：从梢往回 `TipTaperLength` 的一段里，把主锥度平滑压到 `TipTaperMin`。
+			// ⚠️ **用 smoothstep 而不是线性**：线性衰减在"开始收"的那一点上是折角，
+			// 而那一点正落在藤中段最显眼的位置；smoothstep 两端一阶导为零，接得上。
+			// ⚠️ 短藤要夹：`TipTaperLength` 比整根还长时，分母取整根长度，否则整根都在收，
+			// 连根部都变细了 —— 症状是"矮墙上的藤整条像根须"。
+			const float TipSpan = FMath::Max(FMath::Min(Params.TipTaperLength, MainArc), UE_KINDA_SMALL_NUMBER);
+			const float ToTip = FMath::Clamp((TipEndArc - Arc[i]) / TipSpan, 0.0f, 1.0f);
+			const float Smooth = ToTip * ToTip * (3.0f - 2.0f * ToTip);
+			const float Taper = MainTaper * FMath::Lerp(FMath::Max(Params.TipTaperMin, 0.01f), 1.0f, Smooth);
+			OutPath.Points.Add(FVector4f(FVector3f(Dense[i]), TipRadius * Taper * RadiusToScale));
+			OutPath.Axes.Add(FVector4f(0.0f, 0.0f, 0.0f, 0.0f));   // 见 FTubePath::Axes 的注释：必须是零
+			const int32 Prev = Base + FMath::Max(i - 1, 0);
+			const int32 Next = Base + FMath::Min(i + 1, Count - 1);
+			OutPath.PointMeta.Add(FIntVector4(Prev, Next, Base, Count));
+			OutPath.Growth.Add(FVector2f(SpawnTime, GrowArc.IsValidIndex(i) ? GrowArc[i] : Arc[i]));
+			if (i + 1 < Count) OutPath.SegmentMeta.Add(FIntVector4(Base + i, Base + i + 1, 0, 0));
 		}
 	}
 }
@@ -412,7 +612,7 @@ bool BuildBaseMesh(UStaticMesh* Source, int32 LengthAxis, FCSGpuMeshCPUData& Out
 	Out.Tangents.SetNumZeroed(int32(NumVerts));
 	Out.TexCoords().SetNumZeroed(int32(NumVerts));
 	// 顶点色：**有就搬，没有才退白**。藤那两张都没有颜色流，所以这一段对 D13 是恒等的；
-	// 它是为 **D12 的 clutter** 加的 —— TG 的杂物把颜色全烘在顶点流里（`Content/TinyGlade/Textures/`
+	// 它是为 **D12 的 clutter** 加的 —— TG 的杂物把颜色全烘在顶点流里（`Content/HouseTest/TinyGladeAsset/Textures/`
 	// 里没有一张 clutter 贴图，459 张贴图与 459 个 MI 一一对应、clutter 一个都不在其中）。
 	// 丢掉它的症状是整批摆件变成同一种平色 —— 看着像"贴图没接上"，实际上本就没有贴图。
 	// ⚠️ 搬过来的值是**线性域的、而且很暗**（直接从源 GLB 量：`barrel` 均值 .041、
@@ -517,19 +717,24 @@ bool Pack(const FPlan& Plan, const TArray<CSShaperSteps::FPaletteBuffers>& Palet
 
 			for (int32 Index = 0; Index < Palette_Num; ++Index)
 			{
-				if (!Work[Index].IsValid()) continue;
+				// CustomData 也要在 —— 它是 `FPaletteBuffers::IsValid()` 之外新加的一条，
+				// 老的常驻集可能没有它，那时 RegisterExternalBuffer 会拿到空指针。
+				if (!Work[Index].IsValid() || !Work[Index].CustomData.IsValid()) continue;
 				FRDGBufferRef PackedRef = GraphBuilder.RegisterExternalBuffer(Work[Index].PackedInstances, TEXT("CSHouseVine.PackedInstances"));
 				FRDGBufferRef CounterRef = GraphBuilder.RegisterExternalBuffer(Work[Index].Counter, TEXT("CSHouseVine.Counter"));
+				FRDGBufferRef CustomRef = GraphBuilder.RegisterExternalBuffer(Work[Index].CustomData, TEXT("CSHouseVine.CustomData"));
 				FRDGBufferUAVRef PackedUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(PackedRef, PF_A32B32G32R32F));
 				FRDGBufferUAVRef CounterUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(CounterRef, PF_R32_UINT));
+				FRDGBufferUAVRef CustomUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(CustomRef, PF_R32_FLOAT));
 
 				const TArray<FVector4f>& Rows = Records[Index];
-				const uint32 Count = uint32(Rows.Num() / 3);
+				const uint32 Count = uint32(Rows.Num() / 4);
 				// 空调色板必须显式清零：kernel 一个线程都不跑的话 counter 会留着上一次的值，
 				// 症状是"藤已经没了但画面上还在"，而且只在从有到无那一次出现。
 				if (Count == 0)
 				{
 					AddClearUAVPass(GraphBuilder, CounterUAV, 0u);
+					GraphBuilder.SetBufferAccessFinal(CustomRef, ERHIAccess::SRVMask);
 					GraphBuilder.SetBufferAccessFinal(PackedRef, ERHIAccess::SRVMask);
 					GraphBuilder.SetBufferAccessFinal(CounterRef, ERHIAccess::SRVMask);
 					continue;
@@ -543,6 +748,7 @@ bool Pack(const FPlan& Plan, const TArray<CSShaperSteps::FPaletteBuffers>& Palet
 				PassParams->VineRecords = RecordRefs.SRV;
 				PassParams->RWVineInstances = PackedUAV;
 				PassParams->RWVineCounter = CounterUAV;
+				PassParams->RWVineCustomData = CustomUAV;
 				PassParams->VineWorldToComponent = WorldToComponent;
 				PassParams->VineBaseSphereCentre = Work[Index].BaseSphereCentre;
 				PassParams->VineBlockSize = Work[Index].BlockSize;
@@ -557,6 +763,7 @@ bool Pack(const FPlan& Plan, const TArray<CSShaperSteps::FPaletteBuffers>& Palet
 				// 剔除 pass 只读这两个 buffer，且明说不负责恢复它们的状态 —— producer 自己留在 SRVMask。
 				GraphBuilder.SetBufferAccessFinal(PackedRef, ERHIAccess::SRVMask);
 				GraphBuilder.SetBufferAccessFinal(CounterRef, ERHIAccess::SRVMask);
+				GraphBuilder.SetBufferAccessFinal(CustomRef, ERHIAccess::SRVMask);
 			}
 
 			GraphBuilder.Execute();

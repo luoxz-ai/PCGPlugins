@@ -13,6 +13,16 @@ class UMaterialInterface;
  *  thresholds in a float4). Extra LODs on the source mesh are ignored. */
 #define CS_GPU_INSTANCED_MAX_LODS 4
 
+/**
+ * 逐实例 custom data 的 float 数。材质侧就是 `Per Instance Custom Data` 节点。
+ *
+ * ⚠️ **它是材质侧的读取步长**（引擎按 `Buffer[InstanceId * NumCustomDataFloats + i]` 取），
+ * 改这个数就要同时改所有消费它的材质，否则读到的是错位的邻居值 —— 数值看着"有点怪"，
+ * 不报错、不断言。所以它是个编译期常量而不是逐组件的属性。
+ * 当前语义（藤蔓 D13）：[0] = SpawnTime 秒、[1] = 该实例在藤上的弧长 cm。
+ */
+#define CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS 2
+
 /** One LOD of the base mesh inside the shared GPU vertex/index buffers. */
 struct FCSGpuInstancedLODRange
 {
@@ -73,6 +83,13 @@ struct FCSGpuInstanceSourceGPU
 {
 	TRefCountPtr<FRDGPooledBuffer> PackedInstances; // Buffer<float4>, 5 per instance
 	TRefCountPtr<FRDGPooledBuffer> Counter;         // Buffer<uint>, [0] = instance count
+	/**
+	 * Buffer<float>, CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS per instance。**可空** ——
+	 * 只有需要逐实例 custom data 的生产者（藤蔓的叶 / 花）才填，别的留空即可，
+	 * 剔除 pass 会给可见槽写零。刻意做成**并列缓冲**而不是把 packed 行加宽：
+	 * 那个 `* 5u` 的步长散在两个 .usf 与四处 CPU 路径里，动它的代价与风险都不对等。
+	 */
+	TRefCountPtr<FRDGPooledBuffer> CustomData;
 	uint32 Capacity = 0;                            // instances the buffer can hold
 	FBox LocalBounds = FBox(ForceInit);             // conservative bounds of the whole scatter
 

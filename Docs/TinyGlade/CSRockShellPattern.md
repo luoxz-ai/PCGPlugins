@@ -21,7 +21,7 @@ TG 侧的逆向口径在 [`CSGroundShaper.md` 的「对照 Tiny Glade」](CSGrou
 **本文所有实测数字都由 `VerifyRockShellGlb.py` 产出。** 改了下面任何一张表，先重跑它。
 
 ⚠️ **别拿错文件**：`assets/meshes/terrain_rocks.json` 是 ±430 m 的**背景岩石**（零 cell 属性），
-已经导在 `/Game/TinyGlade/Meshes/terrain_rocks`，**不是这一份**。本文讲的是
+已经导在 `/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/terrain_rocks`，**不是这一份**。本文讲的是
 `assets/data/rocky_terrain.json` 经 `extract/rocky_terrain2glb.py` 导出的
 `rocky_terrain_shell.glb`。`MESH_GENERATION_ANALYSIS.md` §7.2 把属性挂在了错的文件名下。
 
@@ -182,7 +182,7 @@ struct FBakedVertex
 UnrealEditor-Cmd.exe <uproject> -run=pythonscript -script="Plugins/PCGPlugins/Scripts/TinyGladeImportRockShell.py"
 ```
 
-落点 `/Game/TinyGlade/Meshes/rocky_terrain_shell/StaticMeshes/rocky_terrain_shell`，
+落点 `/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/rocky_terrain_shell/rocky_terrain_shell/StaticMeshes/rocky_terrain_shell`，
 与已导入的其它 TG 网格同构。脚本可重跑（已存在先删再导）。
 
 **⚠️ 本轮没有实际跑过这个脚本** —— 另一个 agent 正在占用构建资源，标准约束里禁止启动

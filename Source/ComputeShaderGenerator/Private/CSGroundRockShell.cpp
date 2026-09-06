@@ -128,11 +128,73 @@ CSRockShell::FPattern CSRockShell_ExtractPattern(UStaticMesh* PatternMesh)
 		Out.Centroids[Cell] = Counts[Cell] > 0 ? Sums[Cell] / float(Counts[Cell]) : FVector2f::ZeroVector;
 	}
 
+	// --- 假倒角载荷（Docs/TinyGlade/CSRockShellEdgeBevel.md）：逐胞腔盖轮廓 → 逐源顶点平面距离 ---
+	// 轮廓 = 只被一个盖三角使用的边；距离**只在图案平面（XY）里量** —— 裙面在静止姿态竖直
+	// 展开约 3.1 m，运行时被高度替换压扁，量三维距离会让整张裙读成"远"。
+	// 算法与离线脚本 Scripts/BakeRockShellBevelChannels.py 同式（那份烘 StaticMesh 资产，这份喂运行时壳）。
+	TArray<float> SourceRimDistCm;
+	{
+		auto QuantKey = [](const FVector3f& P) -> uint64   // 0.1 cm 栅格上的位置身份
+		{
+			return (uint64(uint32(FMath::RoundToInt(P.X * 10.0f))) << 32)
+				 |  uint64(uint32(FMath::RoundToInt(P.Y * 10.0f)));
+		};
+		TArray<TMap<TPair<uint64, uint64>, TPair<int32, FVector4f>>> CellEdges;
+		CellEdges.SetNum(int32(Out.CellCount));
+		for (uint32 Tri = 0; Tri < NumIndices / 3u; ++Tri)
+		{
+			const uint32 I0 = IndexView[int32(Tri * 3u)];
+			if (I0 >= NumSourceVerts) continue;
+			if (AttrVB.GetVertexUV(I0, CSRockShell_UVRim).Y <= 0.5f) continue;   // 裙三角不参与轮廓
+			const int32 Cell = SourceCellId[int32(I0)];
+			for (uint32 K = 0; K < 3u; ++K)
+			{
+				const uint32 A = IndexView[int32(Tri * 3u + K)];
+				const uint32 B = IndexView[int32(Tri * 3u + (K + 1u) % 3u)];
+				if (A >= NumSourceVerts || B >= NumSourceVerts) continue;
+				const FVector3f PA = PosVB.VertexPosition(A);
+				const FVector3f PB = PosVB.VertexPosition(B);
+				uint64 KA = QuantKey(PA), KB = QuantKey(PB);
+				if (KB < KA) Swap(KA, KB);
+				TPair<int32, FVector4f>& Entry = CellEdges[Cell].FindOrAdd(
+					TPair<uint64, uint64>(KA, KB), TPair<int32, FVector4f>(0, FVector4f(PA.X, PA.Y, PB.X, PB.Y)));
+				++Entry.Key;
+			}
+		}
+		TArray<TArray<FVector4f>> RimSegs;
+		RimSegs.SetNum(int32(Out.CellCount));
+		for (int32 Cell = 0; Cell < int32(Out.CellCount); ++Cell)
+			for (const TPair<TPair<uint64, uint64>, TPair<int32, FVector4f>>& It : CellEdges[Cell])
+				if (It.Value.Key == 1) RimSegs[Cell].Add(It.Value.Value);
+
+		SourceRimDistCm.SetNumUninitialized(int32(NumSourceVerts));
+		for (uint32 V = 0; V < NumSourceVerts; ++V)
+		{
+			const FVector2f P(PosVB.VertexPosition(V).X, PosVB.VertexPosition(V).Y);
+			// ⚠️ 图案空间不封顶（BuildMesh 乘完 Scale 才按 RimDistMaxCm 归一）：
+			// 在这里按 50 cm 截断，×0.35 的默认缩放会让"远"永远到不了 1，倒角糊满整个盖面。
+			float Best = 1.0e9f;
+			for (const FVector4f& S : RimSegs[SourceCellId[int32(V)]])
+			{
+				const FVector2f SegA(S.X, S.Y);
+				const FVector2f SegD(S.Z - S.X, S.W - S.Y);
+				const float T = FMath::Clamp(
+					FVector2f::DotProduct(P - SegA, SegD) / FMath::Max(SegD.SizeSquared(), 1e-6f), 0.0f, 1.0f);
+				Best = FMath::Min(Best, (SegA + SegD * T - P).Size());
+			}
+			SourceRimDistCm[int32(V)] = Best;
+		}
+	}
+
 	// --- 逐三角展开 ---
 	Out.TriangleCount = NumIndices / 3u;
 	Out.VertexCount = Out.TriangleCount * 3u;
 	Out.RestDir.SetNumUninitialized(int32(Out.VertexCount));
 	Out.CellFlags.SetNumUninitialized(int32(Out.VertexCount));
+	Out.BevelData.SetNumUninitialized(int32(Out.VertexCount));
+	// 逐角的静止位置量化键（0.1 cm 栅格，与上面轮廓边表同一口径）。法线全平均的重合组按它分。
+	TArray<FIntVector> CornerKey;
+	CornerKey.SetNumUninitialized(int32(Out.VertexCount));
 
 	double DirDotSum = 0.0;
 	int32 DirDotCount = 0;
@@ -180,12 +242,24 @@ CSRockShell::FPattern CSRockShell_ExtractPattern(UStaticMesh* PatternMesh)
 			if (bIsTopRim != (P.Z > TopRimZ - 1.0f)) ++RimMismatch;
 
 			const uint32 Dst = Tri * 3u + K;
+			// ⚠️ 键必须是**三维**的：盖的边界与裙的顶圈平面位置相同、厚度轴不同，二维键会把
+			// 它们混进一组。而它们在运行时确实重合（同 XY、同 bIsTopRim ⇒ 同位移），
+			// 该合的那一对靠三维键照样合得上，不该合的（底圈）自然分开。
+			CornerKey[int32(Dst)] = FIntVector(
+				FMath::RoundToInt(P.X * 10.0f), FMath::RoundToInt(P.Y * 10.0f), FMath::RoundToInt(P.Z * 10.0f));
 			Out.RestDir[int32(Dst)] = FVector4f(RestXY.X, RestXY.Y, Dir.X, Dir.Y);
 			Out.CellFlags[int32(Dst)] =
 				  (uint32(CellId) & 0x00FFFFFFu)
 				| (bIsTopRim ? uint32(CSRockShell::ECellFlag::TopRim) : 0u)
 				| (bIsCorner ? uint32(CSRockShell::ECellFlag::Corner) : 0u)
 				| (bCapTri   ? uint32(CSRockShell::ECellFlag::CapTri) : 0u);
+			// 假倒角载荷：外向 = −DirToCentroid（Dir 实测指向质心），θ 用现算的 Dir 而不是烘焙件，
+			// 与 RestDir 同一条"免疫导入器轴翻转"的理由。
+			Out.BevelData[int32(Dst)] = FVector4f(
+				bCapTri ? 1.0f : 0.0f,
+				SourceRimDistCm[int32(Src)],
+				FMath::Frac(float(CellId) * 0.6180339887f),
+				FMath::Frac(FMath::Atan2(-Dir.Y, -Dir.X) / (2.0f * PI) + 1.0f));
 			Corner[K] = P;
 		}
 
@@ -200,15 +274,115 @@ CSRockShell::FPattern CSRockShell_ExtractPattern(UStaticMesh* PatternMesh)
 	Out.bFlipWinding = CapDown > CapUp;
 	Out.DirAgreement = DirDotCount > 0 ? float(DirDotSum / double(DirDotCount)) : 0.0f;
 
+	// --- 法线全平均的重合组：逐角 (偏移, 数量) + 展平的入射三角表 ---
+	// 计数 → 前缀和 → 回填，全程三个平表。写成 TArray<TArray<uint32>> 的话是十几万次小分配，
+	// 而这条路径在关卡加载 / 改格数 / 松手对齐时每次都会走到。
+	int32 GroupCount = 0;
+	int32 MaxIncidence = 0;
+	int32 BoundaryEdges = 0;
+	int32 NonManifoldEdges = 0;
+	int32 CrossCellEdges = 0;
+	{
+		TMap<FIntVector, int32> KeyToGroup;
+		KeyToGroup.Reserve(int32(Out.VertexCount));
+		TArray<int32> CornerGroup;
+		CornerGroup.SetNumUninitialized(int32(Out.VertexCount));
+		for (uint32 V = 0; V < Out.VertexCount; ++V)
+		{
+			if (const int32* Found = KeyToGroup.Find(CornerKey[int32(V)]))
+			{
+				CornerGroup[int32(V)] = *Found;
+			}
+			else
+			{
+				CornerGroup[int32(V)] = GroupCount;
+				KeyToGroup.Add(CornerKey[int32(V)], GroupCount);
+				++GroupCount;
+			}
+		}
+		// 名字带 Group 前缀：外层求胞腔质心那段已经有 Counts，重名会被 -WarningsAsErrors 拦下（C4456）。
+		TArray<int32> GroupSizes;
+		GroupSizes.Init(0, GroupCount);
+		for (uint32 V = 0; V < Out.VertexCount; ++V) ++GroupSizes[CornerGroup[int32(V)]];
+		TArray<int32> GroupOffsets;
+		GroupOffsets.SetNumUninitialized(GroupCount);
+		int32 Running = 0;
+		for (int32 G = 0; G < GroupCount; ++G)
+		{
+			GroupOffsets[G] = Running;
+			Running += GroupSizes[G];
+			MaxIncidence = FMath::Max(MaxIncidence, GroupSizes[G]);
+		}
+		Out.IncidentTris.SetNumUninitialized(Running);
+		TArray<int32> GroupCursor = GroupOffsets;
+		// 一个角只属于一个组，所以"组里的角"与"组里的入射三角"是同一批 —— 直接写 V/3。
+		// 同一个三角在同一组里出现两次只可能是它自己两个角重合（退化三角），面积为零、
+		// 对面积加权和没有贡献，不需要去重。
+		for (uint32 V = 0; V < Out.VertexCount; ++V) Out.IncidentTris[GroupCursor[CornerGroup[int32(V)]]++] = V / 3u;
+		Out.IncidentRange.SetNumUninitialized(int32(Out.VertexCount) * 2);
+		for (uint32 V = 0; V < Out.VertexCount; ++V)
+		{
+			const int32 G = CornerGroup[int32(V)];
+			Out.IncidentRange[int32(V) * 2 + 0] = uint32(GroupOffsets[G]);
+			Out.IncidentRange[int32(V) * 2 + 1] = uint32(GroupSizes[G]);
+		}
+
+		// --- 逐边邻接表（假倒角 v3）---
+		// 复用同一份重合组：边 = 两端组 id 的无序对。壳是三角汤，按顶点序号配对永远配不上，
+		// 而组 id 正是「哪些角在静止姿态重合」的答案 —— 与法线全平均那张表一个来源、一次量化。
+		// 下标约定见 EAuxSlot::Neighbours：槽 k 对着角 k，与 kernel 里的垂距 d[k] 严格对齐。
+		Out.Neighbours.Init(-1, int32(Out.TriangleCount) * 3);
+		{
+			// 值 = 该边**首次**出现的槽号（T*3+k）；配上对之后改写成 -1 当作「已用掉」，
+			// 第三次及以后的入射就是非流形边，直接丢（两侧都留 -1 = 当外轮廓处理，不会画错，
+			// 只是那条边不倒角）。收尾时仍持有正槽号的项 = 一次都没配上 = 石头外轮廓边。
+			TMap<FIntPoint, int32> EdgeToCorner;
+			EdgeToCorner.Reserve(int32(Out.TriangleCount) * 3);
+			for (uint32 T = 0; T < Out.TriangleCount; ++T)
+			{
+				for (uint32 K = 0; K < 3u; ++K)
+				{
+					const int32 GA = CornerGroup[int32(T * 3u + (K + 1u) % 3u)];
+					const int32 GB = CornerGroup[int32(T * 3u + (K + 2u) % 3u)];
+					if (GA == GB) continue;                       // 退化边：两端重合，没有方向可言
+					const FIntPoint Key(FMath::Min(GA, GB), FMath::Max(GA, GB));
+					const int32 Slot = int32(T * 3u + K);
+					if (int32* First = EdgeToCorner.Find(Key))
+					{
+						if (*First >= 0)
+						{
+							const int32 Other = *First / 3;
+							Out.Neighbours[Slot] = Other;
+							Out.Neighbours[*First] = int32(T);
+							*First = -1;
+							// 跨胞腔边 = 两侧属于不同石头。假倒角 v3 会在这种边上把法线混向邻面 ⇒
+							// 石头与石头之间不再是硬边。计数打进日志，好让「组不跨胞腔」这条
+							// 早先的实测结论保持可证伪（CellId 在打包字的低 24 位）。
+							if ((Out.CellFlags[int32(T * 3u)] & 0x00FFFFFFu)
+								!= (Out.CellFlags[Other * 3] & 0x00FFFFFFu)) ++CrossCellEdges;
+						}
+						else ++NonManifoldEdges;
+					}
+					else EdgeToCorner.Add(Key, Slot);
+				}
+			}
+			for (const TPair<FIntPoint, int32>& It : EdgeToCorner) if (It.Value >= 0) ++BoundaryEdges;
+		}
+	}
+
 	UE_LOG(LogCSRockShell, Log,
 		TEXT("[CSRockShell] 图案 %s：%u 三角 / %u 顶点（源 %u，焊掉 %u）/ %u 胞腔；")
 		TEXT(" 跨度 %.0f × %.0f cm、厚 %.1f cm；UV %d 通道、CellId 上界 %.1f；")
-		TEXT(" 盖三角朝上 %d / 朝下 %d ⇒ %s；dir 与烘焙件平均点积 %.4f；环标记不符 %d 个。"),
+		TEXT(" 盖三角朝上 %d / 朝下 %d ⇒ %s；dir 与烘焙件平均点积 %.4f；环标记不符 %d 个；")
+		TEXT(" 法线重合组 %d 个（最大入射 %d、平均 %.2f）；")
+		TEXT(" 逐边邻接：轮廓边 %d 条、非流形丢弃 %d 条、跨胞腔 %d 条。"),
 		*PatternMesh->GetPathName(), Out.TriangleCount, Out.VertexCount, NumSourceVerts,
 		Out.VertexCount > NumSourceVerts ? Out.VertexCount - NumSourceVerts : 0u, Out.CellCount,
 		Size.X, Size.Y, Size.Z, Out.NumUVChannels, Out.MaxCellId,
 		CapUp, CapDown, Out.bFlipWinding ? TEXT("kernel 取负") : TEXT("直接用"),
-		Out.DirAgreement, RimMismatch);
+		Out.DirAgreement, RimMismatch,
+		GroupCount, MaxIncidence, GroupCount > 0 ? double(Out.VertexCount) / double(GroupCount) : 0.0,
+		BoundaryEdges, NonManifoldEdges, CrossCellEdges);
 
 	if (RimMismatch > 0)
 	{
@@ -262,8 +436,21 @@ class FCSGroundRockShellCS : public FGlobalShader
 		SHADER_PARAMETER(float, RockShellRoadSink)
 		SHADER_PARAMETER(float, RockShellCellJitter)
 		SHADER_PARAMETER(float, RockShellCellRelief)
+		SHADER_PARAMETER(float, RockShellReliefFloor)
+		SHADER_PARAMETER(float, RockShellCellExpand)
+		SHADER_PARAMETER(float, RockShellSkirtTilt)
+		SHADER_PARAMETER(float, RockShellRiseMultiplier)
+		SHADER_PARAMETER(float, RockShellRiseNoiseAmp)
+		SHADER_PARAMETER(float, RockShellRiseNoiseFreq)
+		SHADER_PARAMETER(float, RockShellRiseExtend)
+		SHADER_PARAMETER(float, RockShellEdgeCeiling)
+		SHADER_PARAMETER(float, RockShellPeakHeight)
+		SHADER_PARAMETER(float, RockShellBaseLift)
+		SHADER_PARAMETER(float, RockShellBaseSink)
 		SHADER_PARAMETER(float, RockShellNoiseAmp)
 		SHADER_PARAMETER(float, RockShellNoiseFreq)
+		SHADER_PARAMETER(float, RockShellChipAmount)
+		SHADER_PARAMETER(float, RockShellChipFreq)
 		SHADER_PARAMETER(uint32, RockShellSeed)
 	END_SHADER_PARAMETER_STRUCT()
 
@@ -280,17 +467,85 @@ class FCSGroundRockShellCS : public FGlobalShader
 };
 
 IMPLEMENT_GLOBAL_SHADER(FCSGroundRockShellCS, "/Plugin/PCGPlugins/Shaders/Private/CSGroundRockShell.usf", "DisplaceRockShellCS", SF_Compute);
+
+/**
+ * 第二趟：法线**全平均**（用户裁决 2026-09-03，不设夹角阈值）。一线程一角。
+ *
+ * 为什么不是在第一趟里顺手算：面法线要三个角的**最终**位置，而一个角的邻居分散在别的线程组里，
+ * 第一趟跑到写切线那一步时它们不一定写完。分成两趟由 RDG 靠 Positions 的 UAV→SRV 转换定序，
+ * 比手工插 barrier 少一份会漂掉的规则。
+ *
+ * ⚠️ 参数结构里**每一条都被 kernel 真读**。`FComputeShaderUtils::AddPass` 会调
+ * `ClearUnusedGraphResources` 把没绑上的参数置空、连带抹掉那条依赖边 —— 藤蔓 SC pass 就是
+ * 这么挂过 GPU 的。多声明一条自己不读的 SRV 在这里是有代价的，别加。
+ */
+class FCSRockShellAverageNormalsCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FCSRockShellAverageNormalsCS);
+	SHADER_USE_PARAMETER_STRUCT(FCSRockShellAverageNormalsCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float>, RockShellPositionsRO)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, RockShellIncidentRange)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, RockShellIncidentTris)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RW_RockShellTangents)
+		SHADER_PARAMETER(uint32, RockShellVertexCount)
+		SHADER_PARAMETER(float, RockShellWindingSign)
+		SHADER_PARAMETER(float, RockShellSmoothCosThreshold)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), CSRockShell_GroupSizeX);
+	}
+};
+
+IMPLEMENT_GLOBAL_SHADER(FCSRockShellAverageNormalsCS, "/Plugin/PCGPlugins/Shaders/Private/CSGroundRockShell.usf", "AverageRockShellNormalsCS", SF_Compute);
+
+/**
+ * 第三趟：假倒角 v3 的逐像素载荷（垂距 one-hot + 三个邻面法线）写进 UV1..UV5。
+ * kernel 与通道字典见 `CSGroundRockShell.usf` 的第三趟小节与头文件的 `namespace TexCoord`。
+ *
+ * ⚠️ 与第二趟同一条规矩：参数结构里每一条都被 kernel 真读。`ClearUnusedGraphResources`
+ * 会把没绑上的参数连同那条 RDG 依赖边一起抹掉，多声明一条不读的 SRV 是要付代价的。
+ */
+class FCSRockShellBevelPayloadCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FCSRockShellBevelPayloadCS);
+	SHADER_USE_PARAMETER_STRUCT(FCSRockShellBevelPayloadCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float>, RockShellPositionsRO)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<int>, RockShellNeighbours)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, RW_RockShellTexCoords)
+		SHADER_PARAMETER(uint32, RockShellPayloadTriCount)
+		SHADER_PARAMETER(uint32, RockShellTexCoordStride)
+		SHADER_PARAMETER(float, RockShellWindingSign)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUPSIZE_X"), CSRockShell_GroupSizeX);
+	}
+};
+
+IMPLEMENT_GLOBAL_SHADER(FCSRockShellBevelPayloadCS, "/Plugin/PCGPlugins/Shaders/Private/CSGroundRockShell.usf", "RockShellBevelPayloadCS", SF_Compute);
 }
 
 namespace CSRockShell
 {
-// ⚠️ 路径里的 `rocky_terrain_shell` 出现**两次**，这不是笔误：`TinyGladeImportRockShell.py`
-// 同时给了 destination_path 与 destination_name，而 Interchange 的 glTF 管线还会自己再套一层
-// `<name>/StaticMeshes/`，三者叠出这个形状。实测落点就是这里（2026-08-30 首次导入核对过）。
-// 不去搬资产：搬完再跑一次那个脚本又会在这里重建一份，两份都在的话谁都不知道哪份是活的。
-const TCHAR* const DefaultPatternAssetPath =
-	TEXT("/Game/TinyGlade/Meshes/rocky_terrain_shell/rocky_terrain_shell/StaticMeshes/rocky_terrain_shell.rocky_terrain_shell");
-
 const FPattern& GetSharedPattern(UStaticMesh* PatternMesh)
 {
 	// 按资产缓存：抽一次要遍历 148,794 个顶点槽 + 逐胞腔求质心，而重建路径每次都会走到。
@@ -313,8 +568,11 @@ bool BuildMesh(
 {
 	if (!ShellMesh || !Pattern.IsValid()) return false;
 
-	// --- 1) 声明流集：标准集 + 三条 aux。**在第一次分配之前声明**，下一次分配就按它建。 ---
+	// --- 1) 声明流集：标准集 + 六条 aux。**在第一次分配之前声明**，下一次分配就按它建。 ---
 	FCSMeshStreamLayout Layout;
+	// 假倒角 v3 的载荷走 UV1..UV5（字典见 CSGroundRockShell.h 的 namespace TexCoord），
+	// 由第三趟 kernel 每趟披挂重写。这里只声明组数 —— 单条流交错加宽，不是另起流。
+	Layout.NumTexCoordSets = uint32(TexCoord::NumSets);
 	{
 		FCSGpuStreamDesc Desc;
 		Desc.DebugName = TEXT("CSRockShell.RestDir");
@@ -341,6 +599,30 @@ bool BuildMesh(
 		Desc.SrvFormat = PF_G32R32F;                  // -> Buffer<float2>
 		Desc.TexCoordIndex = uint8(EAuxSlot::Centroids);
 		Layout.ExtraStreams.Add(Desc);
+
+		// 法线全平均的拓扑。逐角 2 个 uint（偏移 + 数量）⇒ 回到 PerVertex。
+		Desc.DebugName = TEXT("CSRockShell.IncidentRange");
+		Desc.BytesPerElement = sizeof(uint32);
+		Desc.ElementsPerUnit = 2;
+		Desc.CountSource = ECSGpuCountSource::PerVertex;
+		Desc.SrvFormat = PF_R32_UINT;                 // -> Buffer<uint>
+		Desc.TexCoordIndex = uint8(EAuxSlot::IncidentRange);
+		Layout.ExtraStreams.Add(Desc);
+
+		// 展平的入射三角表：长度由拓扑决定、与顶点数不成整数比 ⇒ Fixed。
+		Desc.DebugName = TEXT("CSRockShell.IncidentTris");
+		Desc.ElementsPerUnit = FMath::Max(uint32(Pattern.IncidentTris.Num()), 1u);
+		Desc.CountSource = ECSGpuCountSource::Fixed;
+		Desc.TexCoordIndex = uint8(EAuxSlot::IncidentTris);
+		Layout.ExtraStreams.Add(Desc);
+
+		// 逐边邻接表：逐**三角** 3 个 int32 ⇒ 与顶点数不成整数比，同 IncidentTris 走 Fixed。
+		Desc.DebugName = TEXT("CSRockShell.Neighbours");
+		Desc.BytesPerElement = sizeof(int32);
+		Desc.ElementsPerUnit = FMath::Max(uint32(Pattern.Neighbours.Num()), 1u);
+		Desc.SrvFormat = PF_R32_SINT;                 // -> Buffer<int>；-1 要能读成 -1，不能用 uint 视图
+		Desc.TexCoordIndex = uint8(EAuxSlot::Neighbours);
+		Layout.ExtraStreams.Add(Desc);
 	}
 	if (!ShellMesh->SetStreamLayoutSync(Layout))
 	{
@@ -356,12 +638,16 @@ bool BuildMesh(
 	FCSGpuMeshCPUData Snapshot;
 	Snapshot.SourceSpace = FCSGpuMeshCPUData::ESpace::World;
 	Snapshot.AttrLayout = FCSGpuMeshCPUData::EAttrLayout::PerVertex;
-	Snapshot.NumTexCoordChannels = 1;
+	// v3：声明满 6 组。通道 0 在下面的循环里写死世界 UV，1..5 先清零 —— 它们的真值由
+	// 第三趟 kernel 在每趟披挂之后写，CPU 这里给的只是「分配出来」和一个安全的中性值
+	// （全 0 ⇒ 垂距 0 ⇒ 材质端会读成「贴边」，所以 kernel 那趟**不能跳过**，见 BevelPayload）。
+	Snapshot.NumTexCoordChannels = TexCoord::NumSets;
 	const int32 NumVerts = int32(Pattern.VertexCount);
 	Snapshot.Positions.SetNumUninitialized(NumVerts);
 	Snapshot.Normals.SetNumUninitialized(NumVerts);
 	Snapshot.Tangents.SetNumUninitialized(NumVerts);
 	Snapshot.TexCoords().SetNumUninitialized(NumVerts);
+	for (int32 Set = 1; Set < TexCoord::NumSets; ++Set) Snapshot.TexCoordChannels[Set].SetNumZeroed(NumVerts);
 	Snapshot.Colors.SetNumUninitialized(NumVerts);
 	Snapshot.Indices.SetNumUninitialized(NumVerts);
 	const FVector2f PatternCentre = Pattern.Centre();
@@ -379,8 +665,15 @@ bool BuildMesh(
 		// ❗ 它只给**材质**用，位移一行不读 —— 同 TG：`Triangle.is_top` 在
 		// `displace_rocky_terrain.cs` 里从没被读过，只原样搬运给光栅化 / 材质。
 		const bool bCapTriVert = (Pattern.CellFlags[V] & uint32(ECellFlag::CapTri)) != 0u;
+		// 通道字典 v2：R = 盖/裙，G = 折痕距离（此处乘 Scale 换成世界口径再归一，1 = 远 = 中性），
+		// B = 石头相位，A = 外向角。见 CSGroundRockShell.h 的 VertexColor 注释与 CSRockShellEdgeBevel.md。
+		const FVector4f Bevel = Pattern.BevelData.IsValidIndex(V)
+			? Pattern.BevelData[V]
+			: FVector4f(bCapTriVert ? VertexColor::CapValue : VertexColor::SkirtValue, 1.0e9f, 1.0f, 1.0f);
 		Snapshot.Colors[V] = FVector4f(
-			bCapTriVert ? VertexColor::CapValue : VertexColor::SkirtValue, 1.0f, 1.0f, 1.0f);
+			Bevel.X,
+			FMath::Clamp(Bevel.Y * Scale / VertexColor::RimDistMaxCm, 0.0f, 1.0f),
+			Bevel.Z, Bevel.W);
 		Snapshot.Indices[V] = uint32(V);
 	}
 	if (!UCSMeshOps::CopyFromMeshSnapshot(ShellMesh, Snapshot))
@@ -405,6 +698,9 @@ bool BuildMesh(
 		Upload(EAuxSlot::RestDir, Pattern.RestDir.GetData(), uint64(Pattern.RestDir.Num()) * sizeof(FVector4f), 16);
 		Upload(EAuxSlot::CellFlags, Pattern.CellFlags.GetData(), uint64(Pattern.CellFlags.Num()) * sizeof(uint32), 4);
 		Upload(EAuxSlot::Centroids, Pattern.Centroids.GetData(), uint64(Pattern.Centroids.Num()) * sizeof(FVector2f), 8);
+		Upload(EAuxSlot::IncidentRange, Pattern.IncidentRange.GetData(), uint64(Pattern.IncidentRange.Num()) * sizeof(uint32), 4);
+		Upload(EAuxSlot::IncidentTris, Pattern.IncidentTris.GetData(), uint64(Pattern.IncidentTris.Num()) * sizeof(uint32), 4);
+		Upload(EAuxSlot::Neighbours, Pattern.Neighbours.GetData(), uint64(Pattern.Neighbours.Num()) * sizeof(int32), 4);
 
 		// **写死包围盒**：kernel 用 NaN 关掉看不见的三角，NaN 会污染任何"从顶点算出来"的
 		// 包围盒（计划已定这是对的做法）。CopyFromMeshSnapshot 刚按静止姿态算过一份，
@@ -463,6 +759,10 @@ bool Displace(
 				FRDGBufferRef RestDir = ShellEdit->Find(ECSGpuStreamRole::AuxVertex, uint8(EAuxSlot::RestDir));
 				FRDGBufferRef CellFlags = ShellEdit->Find(ECSGpuStreamRole::AuxVertex, uint8(EAuxSlot::CellFlags));
 				FRDGBufferRef Centroids = ShellEdit->Find(ECSGpuStreamRole::AuxVertex, uint8(EAuxSlot::Centroids));
+				FRDGBufferRef IncidentRange = ShellEdit->Find(ECSGpuStreamRole::AuxVertex, uint8(EAuxSlot::IncidentRange));
+				FRDGBufferRef IncidentTris = ShellEdit->Find(ECSGpuStreamRole::AuxVertex, uint8(EAuxSlot::IncidentTris));
+				FRDGBufferRef Neighbours = ShellEdit->Find(ECSGpuStreamRole::AuxVertex, uint8(EAuxSlot::Neighbours));
+				FRDGBufferRef ShellTexCoords = ShellEdit->TexCoords();
 				FRDGBufferRef GroundColors = GroundEdit->Colors();
 
 				if (Positions && Tangents && RestDir && CellFlags && Centroids && GroundColors)
@@ -497,13 +797,73 @@ bool Displace(
 					PassParams->RockShellRoadSink = Params.RoadSink;
 					PassParams->RockShellCellJitter = FMath::Max(Params.CellJitter, 0.0f);
 					PassParams->RockShellCellRelief = FMath::Max(Params.CellRelief, 0.0f);
+					PassParams->RockShellReliefFloor = FMath::Clamp(Params.ReliefFloor, 0.0f, 1.0f);
+					PassParams->RockShellCellExpand = FMath::Max(Params.CellExpand, 0.0f);
+					PassParams->RockShellSkirtTilt = FMath::Max(Params.SkirtTilt, 0.0f);
+					PassParams->RockShellRiseMultiplier = FMath::Max(Params.RiseMultiplier, 0.0f);
+					PassParams->RockShellRiseNoiseAmp = FMath::Max(Params.RiseNoiseAmp, 0.0f);
+					PassParams->RockShellRiseNoiseFreq = FMath::Max(Params.RiseNoiseFrequency, 0.0f);
+					PassParams->RockShellRiseExtend = FMath::Max(Params.RiseExtend, 0.0f);
+					// ⑧ 夹到 < 1：等于 1 的话"末端小于地面高度"这条不变量就退化成"小于等于"，
+					// 石头的最外圈会和地面共面，出图上是一圈 z-fighting。
+					PassParams->RockShellEdgeCeiling = FMath::Clamp(Params.EdgeCeiling, 0.0f, 0.999f);
+					PassParams->RockShellPeakHeight = FMath::Max(Params.PeakHeight, 1.0f);
+					PassParams->RockShellBaseLift = FMath::Max(Params.BaseLift, 0.0f);
+					PassParams->RockShellBaseSink = FMath::Max(Params.BaseSink, 0.0f);
 					PassParams->RockShellNoiseAmp = FMath::Max(Params.NoiseAmp, 0.0f);
+					PassParams->RockShellChipAmount = FMath::Max(Params.ChipAmount, 0.0f);
+					PassParams->RockShellChipFreq = Params.ChipFrequency;
 					PassParams->RockShellNoiseFreq = Params.NoiseFrequency;
 					PassParams->RockShellSeed = Params.Seed;
 
 					TShaderMapRef<FCSGroundRockShellCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
 					FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("CSRockShell.Drape"), Shader, PassParams,
 						FComputeShaderUtils::GetGroupCountWrapped(int32(TriangleCount), CSRockShell_GroupSizeX));
+
+					// 第二趟：按重合组把面法线全平均。**必须在披挂之后**，读的正是上一趟刚写出来的位置。
+					// 拓扑流缺席时安静跳过 —— 那时留下的是第一趟写的面法线（硬边），是降级不是不画。
+					if (Params.bSmoothNormals && IncidentRange && IncidentTris)
+					{
+						const uint32 VertexCount = TriangleCount * 3u;
+						FCSRockShellAverageNormalsCS::FParameters* AvgParams =
+							GraphBuilder.AllocParameters<FCSRockShellAverageNormalsCS::FParameters>();
+						AvgParams->RockShellPositionsRO = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Positions, PF_R32_FLOAT));
+						AvgParams->RockShellIncidentRange = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(IncidentRange, PF_R32_UINT));
+						AvgParams->RockShellIncidentTris = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(IncidentTris, PF_R32_UINT));
+						AvgParams->RW_RockShellTangents = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Tangents, PF_R32_UINT));
+						AvgParams->RockShellVertexCount = VertexCount;
+						AvgParams->RockShellWindingSign = Params.bFlipWinding ? -1.0f : 1.0f;
+						// 夹角阈值 → cos。夹到 [0,180]：负角会让 cos > 1 ⇒ 一个邻面都不收，
+						// 症状是整壳退回面法线，而参数面上看不出哪里错了。
+						AvgParams->RockShellSmoothCosThreshold = FMath::Cos(
+							FMath::DegreesToRadians(FMath::Clamp(Params.SmoothAngleDeg, 0.0f, 180.0f)));
+
+						TShaderMapRef<FCSRockShellAverageNormalsCS> AvgShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+						FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("CSRockShell.AverageNormals"), AvgShader, AvgParams,
+							FComputeShaderUtils::GetGroupCountWrapped(int32(VertexCount), CSRockShell_GroupSizeX));
+					}
+
+					// 第三趟：假倒角 v3 的载荷。**同样必须在披挂之后** —— 垂距与邻面法线都随披挂变。
+					// 与第二趟互不依赖（一个写切线、一个写 UV），RDG 会让它们并行；两者共同的前置
+					// 只有 Positions 的 UAV→SRV 转换。
+					// 邻接流缺席时安静跳过：那时 UV1..UV5 留在 BuildMesh 给的全 0 上，而 0 会被材质
+					// 读成「贴边」⇒ 整壳满脸倒角。所以这里**必须**同时把消费侧关掉才算降级，
+					// 目前的做法是让材质的 RockShellBevel 静态开关只在运行时壳的 MI 上打开。
+					if (Neighbours && ShellTexCoords)
+					{
+						FCSRockShellBevelPayloadCS::FParameters* BevelParams =
+							GraphBuilder.AllocParameters<FCSRockShellBevelPayloadCS::FParameters>();
+						BevelParams->RockShellPositionsRO = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Positions, PF_R32_FLOAT));
+						BevelParams->RockShellNeighbours = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(Neighbours, PF_R32_SINT));
+						BevelParams->RW_RockShellTexCoords = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(ShellTexCoords, PF_R32_FLOAT));
+						BevelParams->RockShellPayloadTriCount = TriangleCount;
+						BevelParams->RockShellTexCoordStride = uint32(TexCoord::NumSets) * 2u;
+						BevelParams->RockShellWindingSign = Params.bFlipWinding ? -1.0f : 1.0f;
+
+						TShaderMapRef<FCSRockShellBevelPayloadCS> BevelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+						FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("CSRockShell.BevelPayload"), BevelShader, BevelParams,
+							FComputeShaderUtils::GetGroupCountWrapped(int32(TriangleCount), CSRockShell_GroupSizeX));
+					}
 				}
 			}
 

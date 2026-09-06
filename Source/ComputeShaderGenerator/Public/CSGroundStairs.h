@@ -64,6 +64,10 @@ struct FScanParams
 
 	float StepHeight = 30.0f;
 	float RoadThreshold = 0.35f;
+	/** 塑形物峰高低于它就整座不出台阶；0 = 关掉。见 `ACSGroundActor::StairMinMoundHeight`。 */
+	float MinMoundHeight = 60.0f;
+	/** 掐掉每座最顶上那一级。见 `ACSGroundActor::bStairDropTopStep`。 */
+	bool bDropTopStep = true;
 	float Embed = 25.0f;
 	/** 把块抬起半个身位（= −基础网格局部包围盒 Min.Z × Z 缩放），否则盒心落在等值线上、
 	 *  石块一半埋在地里 —— 旧路记下来的实测修正，这里逐字沿用。 */

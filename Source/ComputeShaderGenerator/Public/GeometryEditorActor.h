@@ -88,6 +88,33 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
 	UCurveLinearColor* CurveControl = nullptr;
 
+	/**
+	 * 表面吸附总开关（TinyGladeHouse D13，2026-09-06 裁决 3）。
+	 *
+	 * 真 = 原行为：把 SC 解出的中心线**投射吸附**到场景表面的体素场上，再沿表面法线外推
+	 * `VinesOffset` 浮起来。这是"藤爬在任意 mesh 表面上"那条路的立身之本，柱子 / 地形 /
+	 * 岩石上的藤只能靠它。
+	 *
+	 * 假 = 中心线**原样使用**。墙面藤走这一档：折线本来就长在墙面参数坐标里，映射到世界时
+	 * 已经带了 `StandOff`，没有可吸附的必要。关掉之后整条链连 CPU 准备一起跳过 ——
+	 * `PrepareSurfaceVoxelPassInputs` / `AddCSSurfaceVoxelPasses` / `BuildVoxelHash` /
+	 * `FinalProject` / `ResampleSurface` / `SmoothPath`。实测基线里 `GenerateVineGPU.Total`
+	 * 的 12.4–14.6 ms 有 **10–12 ms 是 `PrepareSurfaceVoxelInputs`**（由 `VoxelSize` 与包围盒
+	 * 决定、与 target 数无关），所以这一档不是微优化。
+	 *
+	 * ⚠️ **`BuildAxes` 不在被跳过之列，理由很不直观**：Pass C 的环心读的是
+	 * `PathPointSurfaceTargets` 而**不是** `PathPoints`，而那条流的唯一播种者就是
+	 * `BuildVVVoxelAxesCS`。把它当成"体素那一族"一起跳掉的后果是环心全塌到世界原点、
+	 * 整棵藤缩成一个结 —— 不崩、不报错、没有断言。它改为走
+	 * `bHasVoxelSample = false` 那一支（`BuildRawVoxelVineFrame` 本来就带对了回退）。
+	 *
+	 * ⚠️ 为假时下列参数**全部失效**：`FSpaceColonizationOptions::VoxelSize`、本结构的
+	 * `VinesOffset` / `GenerateVineVoxelNormalBlurIterations` /
+	 * `VisVineGPUPostProjection*` / `bVisVineGPUResampleSurfaceEnabled`。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options)
+	bool bSurfaceAdsorption = true;
+
 	// --- moved from FVisVineParameters ---
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Options, meta = (ClampMin = "0"))
 	int32 GenerateVineVoxelNormalBlurIterations = 0;

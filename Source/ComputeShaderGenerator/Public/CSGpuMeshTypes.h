@@ -123,8 +123,15 @@ struct FCSGpuMeshCPUData
 	// are equal, which is exactly when inferring the layout from array sizes is ambiguous.
 	enum class EAttrLayout : uint8 { PerVertex, PerCorner };
 
-	/** StaticMesh 支持 8 条 UV，这里按实际用量留 4 条；不够时改这一个常量即可。 */
-	static constexpr int32 MaxTexCoordChannels = 4;
+	/**
+	 * UV 通道数上限 = 引擎的 `MAX_STATIC_TEXCOORDS`（`Components.h:22`），已经顶到天花板。
+	 *
+	 * ⚠️ 抬到 8 时**顶点声明侧跟不上**：`FStaticMeshDataType::TextureCoordinates` 是
+	 * `TFixedAllocator<MAX_STATIC_TEXCOORDS / 2>`（= 4 个 stream component，`Components.h:46`），
+	 * 第 5 组起只能走 manual fetch 的 SRV 路径。钳位与理由写在 `CSGpuMeshSceneProxy.cpp` 的
+	 * `ECSGpuStreamRole::TexCoord` 分支里，本插件只面向 SM5+ ⇒ manual fetch 恒开。
+	 */
+	static constexpr int32 MaxTexCoordChannels = 8;
 
 	TArray<FVector3f> Positions;
 	TArray<FVector3f> Normals;

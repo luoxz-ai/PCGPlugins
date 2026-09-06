@@ -76,8 +76,11 @@ void FCSGpuInstancedMeshVertexFactory::InitRHI(FRHICommandListBase& RHICmdList)
 	UniformParameters.VertexFetch_InstanceOriginBuffer = InstanceOriginSRV;
 	UniformParameters.VertexFetch_InstanceTransformBuffer = InstanceTransformSRV;
 	UniformParameters.VertexFetch_InstanceLightmapBuffer = InstanceLightmapSRV;
-	UniformParameters.InstanceCustomDataBuffer = InstanceOriginSRV; // unused; must be non-null
-	UniformParameters.NumCustomDataFloats = 0;
+	// 逐实例 custom data。没有真 SRV 时退回 origin 那条（只为"非空"这个硬要求）并把
+	// 条数置 0 —— 条数是材质侧的读取步长，0 意味着材质里的 `Per Instance Custom Data`
+	// 一律读 0，而不是去读那条冒名顶替的缓冲。
+	UniformParameters.InstanceCustomDataBuffer = InstanceCustomDataSRV ? InstanceCustomDataSRV : InstanceOriginSRV;
+	UniformParameters.NumCustomDataFloats = InstanceCustomDataSRV ? CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS : 0;
 	InstanceUniformBuffer = TUniformBufferRef<FInstancedStaticMeshVertexFactoryUniformShaderParameters>::CreateUniformBufferImmediate(
 		UniformParameters, UniformBuffer_MultiFrame, EUniformBufferValidation::None);
 }

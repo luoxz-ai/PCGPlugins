@@ -2,14 +2,14 @@
 """
 给演示关卡的房子接上门框砖 —— 用 Tiny Glade 提取出来的那块 brick。
 
-TG 整个游戏只有一块砖网格（/Game/TinyGlade/Meshes/brick），是个 **100³ 的居中单位立方体**，
+TG 整个游戏只有一块砖网格（/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/brick），是个 **100³ 的居中单位立方体**，
 尺寸全靠逐实例非均匀缩放（逆向报告 §1.4「Affine3Packed transform，非均匀缩放 = 砖尺寸」）。
 所以这里给的是"想要多大"，不是"选哪块"。
 """
 import unreal
 
 PKG = "/PCGPlugins/HouseTest"
-BRICK = "/Game/TinyGlade/Meshes/brick/StaticMeshes/brick"
+BRICK = "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/brick"
 MEL = unreal.MaterialEditingLibrary
 TOOLS = unreal.AssetToolsHelpers.get_asset_tools()
 

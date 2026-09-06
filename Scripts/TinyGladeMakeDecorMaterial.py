@@ -4,7 +4,7 @@
 烘进 BP CDO 与关卡实例。
 
 --- 为什么必须自己建材质 ------------------------------------------------------------
-`clutter/` 那 58 张网格**一张贴图都没有** —— `Content/TinyGlade/Textures/` 实有 459 张，
+`clutter/` 那 58 张网格**一张贴图都没有** —— `Content/HouseTest/TinyGladeAsset/Textures/` 实有 459 张，
 与 `MaterialInstances/` 的 459 个 MI 一一对应，clutter 一个都不在其中（对照文档 §7.3/§7.6）。
 它们的颜色全部烘在**顶点流**里，TG 侧的消费者是 `M_TG_VertexColor`。
 
@@ -60,7 +60,7 @@ PKG = "/PCGPlugins/HouseTest"
 MEL = unreal.MaterialEditingLibrary
 TOOLS = unreal.AssetToolsHelpers.get_asset_tools()
 
-CLUTTER = "/Game/TinyGlade/Meshes/clutter/%s/StaticMeshes/%s"
+CLUTTER = "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/%s"
 
 # 三家各自的 `ClutterMeshes` 读集（TG 的每个 autoclutter 生产者都有自己的一组）。
 # 计划 D12 点名的「箱子/水果摊」在提取资产里就是 `crates_w_flowers` / `stall_veggies`。

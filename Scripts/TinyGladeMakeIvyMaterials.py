@@ -3,7 +3,7 @@
 给演示关卡的房子接上墙面藤蔓（D13）：建两张母材质 + 把网格/材质/参数烘进 CDO 与关卡实例。
 
 --- 为什么必须自己建材质，不能直接用 `MI_ivy_branch_color` -------------------------
-`Content/TinyGlade/` 里藤蔓的贴图与材质实例是**齐的**（`MI_ivy_branch_color` /
+`Content/HouseTest/TinyGladeAsset/` 里藤蔓的贴图与材质实例是**齐的**（`MI_ivy_branch_color` /
 `MI_{summer,autumn,winter}_ivy_leaf_color` / `MI_leaf_alpha`），但它们**全都挂在
 `M_TG_Texture` 下**，而**本脚本落地那天**（2026-08-30 早于裁决六）那张母材质实测是：
 
@@ -74,15 +74,15 @@ PKG = "/PCGPlugins/HouseTest"
 MEL = unreal.MaterialEditingLibrary
 TOOLS = unreal.AssetToolsHelpers.get_asset_tools()
 
-BRANCH_MESH = "/Game/TinyGlade/Meshes/ivy_branch/StaticMeshes/ivy_branch"
-LEAF_MESH = "/Game/TinyGlade/Meshes/ivy_leaf/StaticMeshes/ivy_leaf"
-FLOWER_MESH = "/Game/TinyGlade/Meshes/ivy_flower/StaticMeshes/ivy_flower"
-BRANCH_TEX = "/Game/TinyGlade/Textures/ivy_branch_color"
-FLOWER_TEX = "/Game/TinyGlade/Textures/ivy_flower_color"
+BRANCH_MESH = "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/ivy_branch"
+LEAF_MESH = "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/ivy_leaf"
+FLOWER_MESH = "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/ivy_flower"
+BRANCH_TEX = "/PCGPlugins/HouseTest/TinyGladeAsset/Textures/ivy_branch_color"
+FLOWER_TEX = "/PCGPlugins/HouseTest/TinyGladeAsset/Textures/ivy_flower_color"
 # 顺序即 `ECSVineSeason` 的取值（0 夏 / 1 秋 / 2 冬）—— C++ 那边写的就是这个枚举的整数值。
-SEASON_TEX = ("/Game/TinyGlade/Textures/summer_ivy_leaf_color",
-              "/Game/TinyGlade/Textures/autumn_ivy_leaf_color",
-              "/Game/TinyGlade/Textures/winter_ivy_leaf_color")
+SEASON_TEX = ("/PCGPlugins/HouseTest/TinyGladeAsset/Textures/summer_ivy_leaf_color",
+              "/PCGPlugins/HouseTest/TinyGladeAsset/Textures/autumn_ivy_leaf_color",
+              "/PCGPlugins/HouseTest/TinyGladeAsset/Textures/winter_ivy_leaf_color")
 
 FAILURES = []
 
@@ -205,8 +205,212 @@ def season_blend(mat, tex_paths, fallback_rgb, name):
     return second
 
 
+def scalar_param(mat, name, default, x, y):
+    node = MEL.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, x, y)
+    node.set_editor_property("parameter_name", name)
+    node.set_editor_property("default_value", float(default))
+    return node
+
+
+def growth_nodes(mat, name):
+    """
+    生长动画（TinyGladeHouse D13，2026-09-06 裁决 3/7）。数据由 `CSHouseVine::PackTubePath`
+    经 Pass C 写进 UV：
+
+        UV0 = (周向 U, CurveV)          贴图，本函数不碰
+        UV1 = (SpawnTime 秒, 弧长 cm)   生长前沿
+        UV2 = (环半径 cm, 0)            由细变粗要知道往轴线收多远
+
+    做两件事：
+      ① 生长 —— `clip`（走 Masked 混合模式的 OpacityMask，比 Custom 节点里的 clip() 稳）；
+      ② 由细变粗 —— WPO 沿**顶点法线**把环收向轴线。管子的法线恰好是径向
+         （Pass C 写的 `RadialNormal = Binormal*Px + FrameNormal*Py`），所以不需要额外通道。
+
+    ⚠️ **粗细的推进刻意迟于生长前沿**（`VineThickenLag` 厘米）。这不只是观感偏好：
+    `clip` 把管子横切会露出中空的管腔，而迟滞让断口恰好落在管子最细处，那个洞小到看不见。
+
+    ⚠️ **`VineThickenStart` 不能取 0**：取 0 时前沿处整圈环顶点收到同一点，退化成零面积
+    三角形、法线变 NaN。0.1~0.2 是一根细丝，既安全又正是想要的观感。
+
+    ⚠️ 迟滞按**弧长**（cm）而不是按秒：等速下两者等价，但按厘米在空间上一致 ——
+    藤长得快慢不影响"尖端有多长一截是细的"。
+    """
+    def uv(index, x, y):
+        node = MEL.create_material_expression(mat, unreal.MaterialExpressionTextureCoordinate, x, y)
+        node.set_editor_property("coordinate_index", index)
+        return node
+
+    def comp(src, mask_r, mask_g, x, y):
+        node = MEL.create_material_expression(mat, unreal.MaterialExpressionComponentMask, x, y)
+        node.set_editor_property("r", mask_r)
+        node.set_editor_property("g", mask_g)
+        node.set_editor_property("b", False)
+        node.set_editor_property("a", False)
+        link(src, "", node, "")
+        return node
+
+    def sat01(src, x, y):
+        # 与 season_blend 里同一条理由：不用 MaterialExpressionClamp（针脚名接不上），
+        # 改用 Max/Min —— 它们的针脚是 A/B，是这一族里最没有歧义的两个。
+        lo = MEL.create_material_expression(mat, unreal.MaterialExpressionMax, x, y)
+        lo.set_editor_property("const_b", 0.0)
+        link(src, "", lo, "A")
+        hi = MEL.create_material_expression(mat, unreal.MaterialExpressionMin, x + 120, y)
+        hi.set_editor_property("const_b", 1.0)
+        link(lo, "", hi, "A")
+        return hi
+
+    uv1 = uv(1, -1900, 700)
+    uv2 = uv(2, -1900, 1000)
+    spawn = comp(uv1, True, False, -1750, 700)     # UV1.x = SpawnTime
+    arc = comp(uv1, False, True, -1750, 780)       # UV1.y = 弧长 cm
+    radius = comp(uv2, True, False, -1750, 1000)   # UV2.x = 环半径 cm
+
+    speed = scalar_param(mat, "VineGrowSpeed", 60.0, -1900, 500)
+    fade = scalar_param(mat, "VineGrowFade", 12.0, -1900, 560)
+    lag = scalar_param(mat, "VineThickenLag", 40.0, -1900, 620)
+    tfade = scalar_param(mat, "VineThickenFade", 60.0, -1900, 1120)
+    tstart = scalar_param(mat, "VineThickenStart", 0.15, -1900, 1180)
+
+    # Front = (Time − SpawnTime) × Speed
+    time_node = MEL.create_material_expression(mat, unreal.MaterialExpressionTime, -1900, 440)
+    dt = MEL.create_material_expression(mat, unreal.MaterialExpressionSubtract, -1600, 460)
+    link(time_node, "", dt, "A")
+    link(spawn, "", dt, "B")
+    front = MEL.create_material_expression(mat, unreal.MaterialExpressionMultiply, -1450, 460)
+    link(dt, "", front, "A")
+    link(speed, "", front, "B")
+
+    # Ahead = Front − 弧长（该点前方还剩多少 cm 没长到）
+    ahead = MEL.create_material_expression(mat, unreal.MaterialExpressionSubtract, -1300, 560)
+    link(front, "", ahead, "A")
+    link(arc, "", ahead, "B")
+
+    # Grown = saturate(Ahead / Fade) → OpacityMask
+    gdiv = MEL.create_material_expression(mat, unreal.MaterialExpressionDivide, -1150, 560)
+    link(ahead, "", gdiv, "A")
+    link(fade, "", gdiv, "B")
+    grown = sat01(gdiv, -1000, 560)
+    link_property(grown, "", unreal.MaterialProperty.MP_OPACITY_MASK, "OpacityMask (%s)" % name)
+
+    # Thick = saturate((Ahead − Lag) / ThickenFade)
+    lagged = MEL.create_material_expression(mat, unreal.MaterialExpressionSubtract, -1150, 900)
+    link(ahead, "", lagged, "A")
+    link(lag, "", lagged, "B")
+    tdiv = MEL.create_material_expression(mat, unreal.MaterialExpressionDivide, -1000, 900)
+    link(lagged, "", tdiv, "A")
+    link(tfade, "", tdiv, "B")
+    thick = sat01(tdiv, -850, 900)
+
+    # Radius01 = lerp(ThickenStart, 1, Thick)；收缩量 = 半径 × (1 − Radius01)
+    r01 = MEL.create_material_expression(mat, unreal.MaterialExpressionLinearInterpolate, -650, 940)
+    one = MEL.create_material_expression(mat, unreal.MaterialExpressionConstant, -800, 1000)
+    one.set_editor_property("r", 1.0)
+    link(tstart, "", r01, "A")
+    link(one, "", r01, "B")
+    link(thick, "", r01, "Alpha")
+
+    shrink = MEL.create_material_expression(mat, unreal.MaterialExpressionOneMinus, -500, 940)
+    link(r01, "", shrink, "")
+    pull = MEL.create_material_expression(mat, unreal.MaterialExpressionMultiply, -350, 980)
+    link(radius, "", pull, "A")
+    link(shrink, "", pull, "B")
+
+    # WPO = −N × 收缩量。N 是顶点法线 = 管子的径向。
+    normal = MEL.create_material_expression(mat, unreal.MaterialExpressionVertexNormalWS, -500, 1100)
+    offset = MEL.create_material_expression(mat, unreal.MaterialExpressionMultiply, -200, 1060)
+    link(normal, "", offset, "A")
+    link(pull, "", offset, "B")
+    neg = MEL.create_material_expression(mat, unreal.MaterialExpressionMultiply, -60, 1060)
+    minus_one = MEL.create_material_expression(mat, unreal.MaterialExpressionConstant, -200, 1180)
+    minus_one.set_editor_property("r", -1.0)
+    link(offset, "", neg, "A")
+    link(minus_one, "", neg, "B")
+    link_property(neg, "", unreal.MaterialProperty.MP_WORLD_POSITION_OFFSET, "WPO (%s)" % name)
+
+
+def instance_growth_nodes(mat, name):
+    """
+    叶 / 花的生长动画（TinyGladeHouse D13，2026-09-06 裁决 5/8）。
+
+    它们仍是 **GPU 实例**（枝才是管子），所以数据走 **per-instance custom data**：
+
+        CustomData[0] = SpawnTime 秒     这根藤首次出现的 GameTime
+        CustomData[1] = 弧长 cm          该叶 / 花在藤上的位置
+
+    与枝**共用同一份 SpawnTime**（`ACSHouseActor::VineSpawnTimes`，键是藤的身份哈希），
+    所以同一根藤的枝与叶是一起长出来的。
+
+    表现是**按 pivot 收拢**（用户裁决），不是整片淡入 —— 实测两个资产的原点本来就在附着点
+    （直接读 GLB 的 POSITION accessor：`ivy_leaf` min.z = 0、`ivy_flower` min.y = 0），
+    而 `CSHouseVine::BuildBaseMesh` 的换轴是纯置换 + 变号的线性映射、**原点不动**，
+    所以 `-LocalPosition × (1 - Grown)` 正好把叶片收到它插在藤上的那一点。
+    """
+    def cd(index, x, y):
+        node = MEL.create_material_expression(mat, unreal.MaterialExpressionPerInstanceCustomData, x, y)
+        node.set_editor_property("data_index", index)
+        return node
+
+    spawn = cd(0, -1900, 700)
+    arc = cd(1, -1900, 780)
+
+    speed = scalar_param(mat, "VineGrowSpeed", 60.0, -1900, 500)
+    fade = scalar_param(mat, "VineGrowFade", 12.0, -1900, 560)
+    lag = scalar_param(mat, "VineLeafLag", 15.0, -1900, 620)
+
+    time_node = MEL.create_material_expression(mat, unreal.MaterialExpressionTime, -1900, 440)
+    dt = MEL.create_material_expression(mat, unreal.MaterialExpressionSubtract, -1600, 460)
+    link(time_node, "", dt, "A")
+    link(spawn, "", dt, "B")
+    front = MEL.create_material_expression(mat, unreal.MaterialExpressionMultiply, -1450, 460)
+    link(dt, "", front, "A")
+    link(speed, "", front, "B")
+
+    # Ahead = Front - 弧长 - Lag（叶子比枝的前沿再迟一点冒出来）
+    ahead = MEL.create_material_expression(mat, unreal.MaterialExpressionSubtract, -1300, 560)
+    link(front, "", ahead, "A")
+    link(arc, "", ahead, "B")
+    ahead2 = MEL.create_material_expression(mat, unreal.MaterialExpressionSubtract, -1150, 560)
+    link(ahead, "", ahead2, "A")
+    link(lag, "", ahead2, "B")
+
+    gdiv = MEL.create_material_expression(mat, unreal.MaterialExpressionDivide, -1000, 560)
+    link(ahead2, "", gdiv, "A")
+    link(fade, "", gdiv, "B")
+
+    lo = MEL.create_material_expression(mat, unreal.MaterialExpressionMax, -860, 560)
+    lo.set_editor_property("const_b", 0.0)
+    link(gdiv, "", lo, "A")
+    grown = MEL.create_material_expression(mat, unreal.MaterialExpressionMin, -720, 560)
+    grown.set_editor_property("const_b", 1.0)
+    link(lo, "", grown, "A")
+
+    # WPO = TransformVector<Local->World>(-LocalPosition * (1 - Grown))
+    shrink = MEL.create_material_expression(mat, unreal.MaterialExpressionOneMinus, -580, 560)
+    link(grown, "", shrink, "")
+
+    local_pos = MEL.create_material_expression(mat, unreal.MaterialExpressionLocalPosition, -580, 700)
+    pull = MEL.create_material_expression(mat, unreal.MaterialExpressionMultiply, -420, 640)
+    link(local_pos, "", pull, "A")
+    link(shrink, "", pull, "B")
+
+    neg = MEL.create_material_expression(mat, unreal.MaterialExpressionMultiply, -280, 640)
+    minus_one = MEL.create_material_expression(mat, unreal.MaterialExpressionConstant, -420, 780)
+    minus_one.set_editor_property("r", -1.0)
+    link(pull, "", neg, "A")
+    link(minus_one, "", neg, "B")
+
+    # 局部 -> 世界的**方向**变换。用 TransformVector 而不是 TransformPosition：
+    # 收拢量是一个向量（相对 pivot 的位移），按位置变换会把实例的平移也加进去。
+    xform = MEL.create_material_expression(mat, unreal.MaterialExpressionTransform, -140, 640)
+    xform.set_editor_property("transform_source_type", unreal.MaterialVectorCoordTransformSource.TRANSFORMSOURCE_LOCAL)
+    xform.set_editor_property("transform_type", unreal.MaterialVectorCoordTransform.TRANSFORM_WORLD)
+    link(neg, "", xform, "")
+    link_property(xform, "", unreal.MaterialProperty.MP_WORLD_POSITION_OFFSET, "WPO (%s)" % name)
+
+
 def build_material(name, tex_path, fallback_rgb, roughness, tint_lo, tint_hi, two_sided_foliage,
-                   season_textures=None):
+                   season_textures=None, growth=False, instance_growth=False):
     path = "%s/%s" % (PKG, name)
     if unreal.EditorAssetLibrary.does_asset_exist(path):
         unreal.EditorAssetLibrary.delete_asset(path)
@@ -218,6 +422,13 @@ def build_material(name, tex_path, fallback_rgb, roughness, tint_lo, tint_hi, tw
     # **这一行是这份脚本存在的理由**：没勾它的材质在 UCSGpuInstancedMeshComponent 上
     # 会被引擎静默换成默认材质，画面一片灰而所有 readback 断言照绿。
     mat.set_editor_property("used_with_instanced_static_meshes", True)
+    if growth:
+        # 生长用 OpacityMask 裁 => 必须是 Masked 混合模式。忘了这一句的症状是
+        # "OpacityMask 接上了但完全没效果"，而材质编译不报任何错。
+        mat.set_editor_property("blend_mode", unreal.BlendMode.BLEND_MASKED)
+        # 管子会被 WPO 收细 => 引擎必须知道它的包围盒会往内缩（往外不缩就够用了，
+        # 但这一项留 0 会让某些剔除路径按未变形的位置算，尖端在边缘处闪）。
+        mat.set_editor_property("max_world_position_offset_displacement", 64.0)
     # 藤是薄片状的东西，背面必须画 —— 不然从墙的斜侧看过去叶子会整片消失。
     mat.set_editor_property("two_sided", True)
     if two_sided_foliage:
@@ -259,6 +470,11 @@ def build_material(name, tex_path, fallback_rgb, roughness, tint_lo, tint_hi, tw
         except Exception as exc:
             unreal.log_warning("IVY 透射色接不上（不致命）：%s" % exc)
 
+    if growth:
+        growth_nodes(mat, name)
+    if instance_growth:
+        instance_growth_nodes(mat, name)
+
     MEL.recompile_material(mat)
     unreal.EditorAssetLibrary.save_loaded_asset(mat)
     log("built %s (%s)" % (name, "三季混合" if season_textures else ("贴图 " + str(tex_path))))
@@ -287,14 +503,17 @@ for mesh in (branch_mesh, leaf_mesh, flower_mesh):
     log("mesh %-12s min=(%.1f, %.1f, %.1f) size=(%.1f, %.1f, %.1f)"
         % (mesh.get_name(), box.min.x, box.min.y, box.min.z, size.x, size.y, size.z))
 
+# 枝走管子 + 生长动画（叶/花仍是实例，它们的生长走 per-instance custom data，另做）。
 branch_mat = build_material("M_TinyGladeIvyBranch", BRANCH_TEX,
-                            unreal.LinearColor(0.19, 0.15, 0.10, 1.0), 0.85, 0.80, 1.15, False)
+                            unreal.LinearColor(0.19, 0.15, 0.10, 1.0), 0.85, 0.80, 1.15, False,
+                            growth=True)
 leaf_mat = build_material("M_TinyGladeIvyLeaf", None,
                           unreal.LinearColor(0.10, 0.24, 0.06, 1.0), 0.72, 0.72, 1.20, True,
-                          season_textures=SEASON_TEX)
+                          season_textures=SEASON_TEX, instance_growth=True)
 # 花也走双面植被：花瓣与叶片一样薄，背光那一侧不该是死黑。
 flower_mat = build_material("M_TinyGladeIvyFlower", FLOWER_TEX,
-                            unreal.LinearColor(0.62, 0.58, 0.30, 1.0), 0.60, 0.85, 1.15, True)
+                            unreal.LinearColor(0.62, 0.58, 0.30, 1.0), 0.60, 0.85, 1.15, True,
+                            instance_growth=True)
 
 VINE_PROPS = (
     ("bVineEnabled", True),
@@ -316,7 +535,6 @@ VINE_PROPS = (
     ("VineFlowerChance", 0.10),
     ("VineFlowerSize", 22.0),
     ("VineJumpChance", 0.5),
-    ("bVineClimbGable", True),
 )
 
 bp = unreal.EditorAssetLibrary.load_asset("%s/BP_TinyGladeHouse" % PKG)

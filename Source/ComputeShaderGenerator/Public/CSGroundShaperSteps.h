@@ -2,6 +2,9 @@
 
 #include "CoreMinimal.h"
 #include "RenderGraphResources.h"
+// CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS —— FPaletteBuffers::CustomData 的元素数按它算。
+// 显式写出来：unity 构建下漏 include 一声不吭，只在 -SingleFile 或 Live Coding 下炸。
+#include "CSGpuInstancedMeshComponent.h"
 
 /**
  * GPU 实例源的**共用容器与容量管理**（TinyGladeHouse D6/D9/D12/D13）。
@@ -112,6 +115,10 @@ struct FPaletteBuffers
 {
 	TRefCountPtr<FRDGPooledBuffer> PackedInstances;   // Buffer<float4>，5 个 / 实例
 	TRefCountPtr<FRDGPooledBuffer> Counter;           // Buffer<uint>，[0] = 活跃数
+	/** Buffer<float>，`CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS` 个 / 实例。**恒分配**：
+	 *  8 字节 / 实例，4096 容量也只有 32 KB，为省它多开一条"要不要分配"的分支不划算。
+	 *  不写它的生产者留全零，材质读到 0。 */
+	TRefCountPtr<FRDGPooledBuffer> CustomData;
 	uint32 Capacity = 0;
 	FVector3f BaseSphereCentre = FVector3f::ZeroVector;   // 基础网格局部包围球（未缩放）
 	float BaseSphereRadius = 0.0f;

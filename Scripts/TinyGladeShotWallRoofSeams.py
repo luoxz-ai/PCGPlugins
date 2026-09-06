@@ -34,6 +34,8 @@
  ⑥ 读 UENUM 属性别用 `str(枚举).endswith("X")`（恒假，整组机位跟着转 90°），也别用
     `int(枚举)`（TypeError）。要和枚举值比，且 Python 侧的类型名**去掉 E 前缀**：
     C++ 的 `ECSRidgeAxis` 在这里叫 `unreal.CSRidgeAxis`。
+    ⚠️ `ECSRidgeAxis` 本身已随四坡屋顶于 2026-08-31 删除（脊向改由 `bRidgeAlongX()` 连续导出），
+    这里只当例子留着 —— **规则对任何 UENUM 都成立**，别去找这个枚举。
  ⑦ 脚本在注册 tick **之前**抛异常 ⇒ 编辑器永远不退（`-ExecCmds` 不会因为 py 报错关窗），
     上层只能等超时。所以准备阶段整段包在 try 里，出错自己 quit_editor。
  ⑧ 本轮**没有改任何 C++ 属性默认值**，所以 `TinyGladeSetupFrame.py` /

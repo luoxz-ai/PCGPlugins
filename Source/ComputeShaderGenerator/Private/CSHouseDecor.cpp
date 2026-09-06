@@ -1,5 +1,6 @@
 #include "CSHouseDecor.h"
 
+#include "CSHouseResize.h"        // CSHouseResize_EdgeOuterLocal：边号 → 局部外法线，唯一真源
 #include "ComputeShaderGenerateHelper.h"
 #include "DataDrivenShaderPlatformInfo.h"
 #include "GlobalShader.h"
@@ -210,34 +211,39 @@ void BuildAnchors(const FSite& Site, const FParams& Params, TArray<FAnchor>& Out
 	}
 
 	// -------------------------------------------------------------------------
-	// ③ 檐口 + ④ 屋脊（TG 的 `add_birdnests`，读集里有 `Query<&Roof>`）
+	// ③ 檐口 + ④ 屋脊（TG 的 `add_birdnests`，读集里有 `Query<&Roof>`）—— 四坡口径
 	//
 	// ⚠️ 高度**一律从 `CSHouseRoof.h` 的求值器取**，这里一条屋顶方程都不写（计划 D4：
 	// 屋面方程一旦散开，铺瓦 / 铺梁 / 落窗谓词就会各写一份，彼此差一点点就穿帮）。
 	// -------------------------------------------------------------------------
 	{
 		const FCSRoofDesc& Roof = Site.Roof;
-		const double HalfRidgeOuter = Roof.RidgeLength() * 0.5 + Roof.Overhang;
-		const double AcrossOuter = Roof.EaveOuter();
 		const float EaveZ = CSHouseRoof_EaveOuterZ(Roof) + Params.RoofStandOff;
 
+		// 檐口：**四条边全是檐口**。双坡时只有两条（另两条是山墙），四坡没有山墙这个构件，
+		// 所以两端那两条同样挂得住鸟窝。外法线取 `CSHouseResize_EdgeOuterLocal`，边号与
+		// `CSHouse_GetEdge` 同号 —— 墙在哪儿、朝哪儿只能有一个真源。
+		const FVector2D HalfOuter = Roof.HalfSize() + FVector2D(Roof.Overhang, Roof.Overhang);
 		const float EaveSpacing = FMath::Max(Params.EaveSpacing, 20.0f);
-		const int32 EaveCount = FMath::Max(1, FMath::RoundToInt(2.0 * HalfRidgeOuter / EaveSpacing));
-		const double EaveSlot = 2.0 * HalfRidgeOuter / double(EaveCount);
-
-		for (int32 Side = 0; Side < 2; ++Side)
+		for (int32 Side = 0; Side < 4; ++Side)
 		{
-			const double Sign = Side == 0 ? -1.0 : 1.0;
+			const FVector2D Outward = CSHouseResize_EdgeOuterLocal(Side);
+			const FVector2D AlongDir(-Outward.Y, Outward.X);
+			// 这条边的半长与它离中心多远：外法线/沿边方向都是轴对齐的单位向量，点乘即取分量。
+			const double HalfRun = FMath::Abs(AlongDir.X) * HalfOuter.X + FMath::Abs(AlongDir.Y) * HalfOuter.Y;
+			const FVector2D Base = Outward * (FMath::Abs(Outward.X) * HalfOuter.X + FMath::Abs(Outward.Y) * HalfOuter.Y);
+
+			const int32 EaveCount = FMath::Max(1, FMath::RoundToInt(2.0 * HalfRun / EaveSpacing));
+			const double EaveSlot = 2.0 * HalfRun / double(EaveCount);
 			for (int32 Index = 0; Index < EaveCount; ++Index)
 			{
-				const double Along = -HalfRidgeOuter + (double(Index) + 0.5) * EaveSlot;
-				const FVector Local = Roof.RidgeToLocal(Along, Sign * AcrossOuter, EaveZ);
+				const FVector2D XY = Base + AlongDir * (-HalfRun + (double(Index) + 0.5) * EaveSlot);
 
 				FAnchor Anchor;
 				Anchor.Family = EFamily::Eave;
 				Anchor.AnchorId = Side * 65536 + Index;
-				Anchor.Location = Site.World.TransformPosition(Local);
-				Anchor.Facing = Site.World.TransformVectorNoScale(Roof.RidgeToLocal(0.0, Sign, 0.0)).GetSafeNormal();
+				Anchor.Location = Site.World.TransformPosition(FVector(XY.X, XY.Y, EaveZ));
+				Anchor.Facing = Site.World.TransformVectorNoScale(FVector(Outward.X, Outward.Y, 0.0)).GetSafeNormal();
 				// 屋顶那两家**不落地、也不受道路排除**：鸟窝挂在檐口上，与地面无关。
 				// 而且它们立直（Up = 世界上方向）而不是跟着坡歪 —— 歪着的鸟窝读起来像穿模。
 				Anchor.Up = FVector::UpVector;
@@ -245,7 +251,9 @@ void BuildAnchors(const FSite& Site, const FParams& Params, TArray<FAnchor>& Out
 			}
 		}
 
-		const double HalfRidge = Roof.RidgeLength() * 0.5;
+		// 屋脊：四坡的脊线只有 |X − Y| 长（等坡度四面自然把它缩到这么短），正方形处为 0 ——
+		// 那时屋顶是金字塔，脊退化成一个尖点，下面的 `Max(1, ...)` 正好给出尖上那一个锚点。
+		const double HalfRidge = Roof.RidgeHalfLength();
 		const float RidgeZ = CSHouseRoof_RidgeZ(Roof) + Params.RoofStandOff;
 		const float RidgeSpacing = FMath::Max(Params.RidgeSpacing, 20.0f);
 		const int32 RidgeCount = FMath::Max(1, FMath::RoundToInt(2.0 * HalfRidge / RidgeSpacing));
@@ -341,9 +349,13 @@ int32 MaxRecordsBound(const FVector2D& Footprint, float Overhang, float PierWidt
 
 	const int32 WallFootAnchors = FMath::CeilToInt(Perimeter / FMath::Max(Params.WallFootSpacing, 20.0f)) + 4;
 
-	// 脊向未知时取长轴作上界（`RidgeLength()` 只可能是 X 或 Y 之一）。
-	const double RidgeSpan = FMath::Max(FMath::Abs(Footprint.X), FMath::Abs(Footprint.Y)) + 2.0 * FMath::Abs(Overhang);
-	const int32 EaveAnchors = FMath::CeilToInt(2.0 * RidgeSpan / FMath::Max(Params.EaveSpacing, 20.0f)) + 4;
+	// 檐口：四坡的**四条边**全是檐口 ⇒ 上界取外挑后的整圈周长（双坡时只有两条长边）。
+	// 每条边各自 `Max(1, round())` 一次，四条边最多各多半格，+8 一次性盖住。
+	const double OuterPerimeter = 2.0 * (FMath::Abs(Footprint.X) + FMath::Abs(Footprint.Y) + 4.0 * FMath::Abs(Overhang));
+	const int32 EaveAnchors = FMath::CeilToInt(OuterPerimeter / FMath::Max(Params.EaveSpacing, 20.0f)) + 8;
+
+	// 脊：真脊长 = |X − Y| ≤ 长轴，取长轴作上界（脊向由长轴导出，这里不必知道是哪根）。
+	const double RidgeSpan = FMath::Max(FMath::Abs(Footprint.X), FMath::Abs(Footprint.Y));
 	const int32 RidgeAnchors = FMath::CeilToInt(RidgeSpan / FMath::Max(Params.RidgeSpacing, 20.0f)) + 4;
 
 	return GateAnchors + WallFootAnchors + EaveAnchors + RidgeAnchors;

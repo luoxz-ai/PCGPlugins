@@ -23,6 +23,9 @@ static bool CSShaperSteps_GrowTo(TArray<FPaletteBuffers>& Palettes, const TArray
 					FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), Capacities[Index] * 5u), TEXT("CSShaperSteps.PackedInstances"));
 				Work[Index].Counter = AllocatePooledBuffer(
 					FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 1), TEXT("CSShaperSteps.Counter"));
+				Work[Index].CustomData = AllocatePooledBuffer(
+					FRDGBufferDesc::CreateBufferDesc(sizeof(float),
+						Capacities[Index] * uint32(CS_GPU_INSTANCED_CUSTOM_DATA_FLOATS)), TEXT("CSShaperSteps.CustomData"));
 				Work[Index].Capacity = Capacities[Index];
 			}
 		});

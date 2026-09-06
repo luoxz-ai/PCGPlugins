@@ -25,8 +25,8 @@
 import unreal
 
 PKG = "/PCGPlugins/HouseTest"
-ASSET = "/Game/TinyGlade/Meshes/rocky_terrain_shell/rocky_terrain_shell/StaticMeshes/rocky_terrain_shell"
-SHELL_MAT = "/Game/TinyGlade/MaterialInstances/MI_rocky_terrain"
+ASSET = "/PCGPlugins/HouseTest/TinyGladeAsset/Meshes/rocky_terrain_shell/rocky_terrain_shell/StaticMeshes/rocky_terrain_shell"
+SHELL_MAT = "/PCGPlugins/HouseTest/TinyGladeAsset/Materials/MI_rocky_terrain"
 
 # 原件实测（Docs/TinyGlade/CSRockShellPattern.md「首次导入后必须核对的四项」）
 EXPECT_TRIANGLES = 49598

@@ -1,6 +1,8 @@
 // Fill out your copyright notice in the Description page of Project Settings.
 #include "GeometryEditorActor.h"
 
+#include "CSVineTube.h"
+
 #include "EngineUtils.h"
 #include "Engine/StaticMesh.h"
 #include "PCGPluginDebug.h"
@@ -103,6 +105,8 @@ class FVVVoxelCS : public FGlobalShader
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, PathPointSurfaceTargets)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, PathPointSurfaceNormals)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, SegmentMeta)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FVector2f>, PathPointGrowth)
+		SHADER_PARAMETER(uint32, VineTexCoordSets)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int4>, VoxelCells)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VoxelHashSlots)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, VoxelNormals)
@@ -139,6 +143,7 @@ class FVVVoxelCS : public FGlobalShader
 		SHADER_PARAMETER(uint32, TargetBucketCount)
 		SHADER_PARAMETER(uint32, TargetBucketHashSlotCount)
 		SHADER_PARAMETER(uint32, TargetBucketSearchRadius)
+		SHADER_PARAMETER(uint32, VineSurfaceAdsorption)
 		SHADER_PARAMETER(float, VinesOffset)
 		SHADER_PARAMETER(float, TinyZJitterStrength)
 		RDG_BUFFER_ACCESS(VineDispatchArgs, ERHIAccess::IndirectArgs)
@@ -361,6 +366,11 @@ class FVineUVWriteCS : public FGlobalShader
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, VineUV_CurveV)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, RW_VineUV_TexCoords)
+		// 这一趟只覆盖 set0 的 V，但**下标要按交错步长算**，所以它也得知道组数。
+		// ⚠️ 参数结构与 .usf 里用到的名字是逐字绑定的：shader 用了而结构里没有，
+		// 报的是 "could not be bound to ...'s shader parameter structure"，且只在
+		// 那一个 permutation 上报。
+		SHADER_PARAMETER(uint32, VineTexCoordSets)
 		SHADER_PARAMETER(uint32, VineUV_OutputVertexCount)
 		SHADER_PARAMETER(uint32, VineUV_ProfileCount)
 		SHADER_PARAMETER(uint32, VineUV_PointCount)
@@ -444,6 +454,7 @@ class FVVVoxelBuildAxesCS : public FGlobalShader
 		SHADER_PARAMETER(uint32, TargetBucketCount)
 		SHADER_PARAMETER(uint32, TargetBucketHashSlotCount)
 		SHADER_PARAMETER(uint32, TargetBucketSearchRadius)
+		SHADER_PARAMETER(uint32, VineSurfaceAdsorption)
 		RDG_BUFFER_ACCESS(VineDispatchArgs, ERHIAccess::IndirectArgs)
 	END_SHADER_PARAMETER_STRUCT()
 
@@ -584,6 +595,7 @@ class FVVVoxelNoiseCS : public FGlobalShader
 		SHADER_PARAMETER(uint32, TargetBucketCount)
 		SHADER_PARAMETER(uint32, TargetBucketHashSlotCount)
 		SHADER_PARAMETER(uint32, TargetBucketSearchRadius)
+		SHADER_PARAMETER(uint32, VineSurfaceAdsorption)
 		SHADER_PARAMETER(float, CurlNoiseStrength)
 		SHADER_PARAMETER(float, CurlNoiseFrequency)
 		SHADER_PARAMETER(uint32, NoiseIterations)
@@ -663,6 +675,7 @@ class FVVVoxelFinalProjectCS : public FGlobalShader
 		SHADER_PARAMETER(uint32, TargetBucketCount)
 		SHADER_PARAMETER(uint32, TargetBucketHashSlotCount)
 		SHADER_PARAMETER(uint32, TargetBucketSearchRadius)
+		SHADER_PARAMETER(uint32, VineSurfaceAdsorption)
 		SHADER_PARAMETER(float, VinesOffset)
 		RDG_BUFFER_ACCESS(VineDispatchArgs, ERHIAccess::IndirectArgs)
 	END_SHADER_PARAMETER_STRUCT()
@@ -1361,6 +1374,9 @@ struct FVineBuildInput
 	TArray<FVector4f> PathPointAxes;
 	TArray<FIntVector4> PathPointMeta;
 	TArray<FIntVector4> SegmentMeta;
+	/** 逐点 (SpawnTime, 弧长 cm)。空 = 不做生长动画（下游会绑一条零缓冲）。 */
+	TArray<FVector2f> PathPointGrowth;
+	uint32 NumTexCoordSets = 1u;
 
 	// Repacked surface-voxel arrays (CPU-fallback upload + target-bucket source).
 	TArray<FIntVector4> GPUVoxelCells;
@@ -1369,6 +1385,10 @@ struct FVineBuildInput
 	TArray<FVector4f> GPUVoxelTargetPositions;
 	FVineTargetBucketBuffers TargetBuckets;
 	FVector3f TargetBucketOrigin = FVector3f::ZeroVector;
+
+	/** 表面吸附总开关（见 `FVV::bSurfaceAdsorption`）。为假时体素那一族是 1 元素哑缓冲，
+	 *  采样由 shader 侧的 `VineSurfaceAdsorption` uniform 短路，投影/重采样/平滑三族 pass 不录。 */
+	bool bSurfaceAdsorption = true;
 
 	// Fused space-colonization inputs. When valid, the line geometry is solved and concatenated
 	// inside the leaf's own graph instead of arriving as pooled buffers.
@@ -1748,6 +1768,7 @@ struct FVineMeshPassInputs
 {
 	// GPU-resident line geometry recorded earlier into the SAME graph by the fused SC + concat
 	// passes. Null on the CPU-array fallback below.
+	bool bSurfaceAdsorption = true;
 	bool bUseGPULines = false;
 	FRDGBufferRef GPULinePoints = nullptr;
 	FRDGBufferRef GPULineMeta = nullptr;
@@ -1759,6 +1780,8 @@ struct FVineMeshPassInputs
 	const TArray<FVector4f>* PathPointAxes = nullptr;
 	const TArray<FIntVector4>* PathPointMeta = nullptr;
 	const TArray<FIntVector4>* SegmentMeta = nullptr;
+	const TArray<FVector2f>* PathPointGrowth = nullptr;
+	uint32 NumTexCoordSets = 1u;
 	bool bUseGPUVoxels = false;
 	TRefCountPtr<FRDGPooledBuffer> GPUVoxCells;
 	TRefCountPtr<FRDGPooledBuffer> GPUVoxNormals;
@@ -1835,6 +1858,7 @@ struct FVineMeshPassOutputs
 static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type FeatureLevel, const FVineMeshPassInputs& In, const FVineMeshPassOutputs& Out)
 {
 	// Local aliases so the moved graph body below reads exactly as the original.
+	const bool bSurfaceAdsorption = In.bSurfaceAdsorption;
 	const bool bUseGPULines = In.bUseGPULines;
 	FRDGBufferRef GPULinePoints = In.GPULinePoints;
 	FRDGBufferRef GPULineMeta = In.GPULineMeta;
@@ -1843,6 +1867,8 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 	const TArray<FVector4f>& PathPointAxes = *In.PathPointAxes;
 	const TArray<FIntVector4>& PathPointMeta = *In.PathPointMeta;
 	const TArray<FIntVector4>& SegmentMeta = *In.SegmentMeta;
+	const TArray<FVector2f>& PathPointGrowth = *In.PathPointGrowth;
+	const uint32 NumTexCoordSets = In.NumTexCoordSets;
 	const bool bUseGPUVoxels = In.bUseGPUVoxels;
 	const TRefCountPtr<FRDGPooledBuffer>& GPUVoxCells = In.GPUVoxCells;
 	const TRefCountPtr<FRDGPooledBuffer>& GPUVoxNormals = In.GPUVoxNormals;
@@ -1964,6 +1990,20 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 		SegmentMetaBuffer = CSHelper::CreateUploadedStructuredBuffer(GraphBuilder, SegmentMeta, TEXT("VVVoxel.SegmentMeta"));
 	}
 
+	// 生长通道。**长度对不上就退回零缓冲**而不是硬绑：Pass C 按 PointIndex 直接取，
+	// 短一截就是越界读。零缓冲下 SpawnTime = 0、弧长 = 0 ⇒ 材质算出来到处都"早就长完了"，
+	// 是一个看得见但不致命的退化。
+	CSHelper::FRDGStructuredBufferRefs PathPointGrowthBuffer;
+	if (!bUseGPULines && PathPointGrowth.Num() == int32(PathPointCount))
+	{
+		PathPointGrowthBuffer = CSHelper::CreateUploadedStructuredBuffer(GraphBuilder, PathPointGrowth, TEXT("VVVoxel.PathPointGrowth"));
+	}
+	else
+	{
+		PathPointGrowthBuffer = CSHelper::CreateStructuredBuffer(GraphBuilder, sizeof(FVector2f), PathPointCount, TEXT("VVVoxel.PathPointGrowth.Zero"), true, true);
+		AddClearUAVPass(GraphBuilder, PathPointGrowthBuffer.UAV, 0u);
+	}
+
 	// Trip B: register the GPU-resident producer voxel buffers + rebuild the vine hash
 	// on the GPU (no readback/re-upload); otherwise upload the CPU arrays as before.
 	CSHelper::FRDGStructuredBufferRefs VoxelCellsBuffer;
@@ -2049,6 +2089,7 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 	NoiseParameters->TargetBucketCount = TargetBuckets.BucketCount;
 	NoiseParameters->TargetBucketHashSlotCount = TargetBuckets.HashSlotCount;
 	NoiseParameters->TargetBucketSearchRadius = TargetBuckets.SearchRadius;
+	NoiseParameters->VineSurfaceAdsorption = bSurfaceAdsorption ? 1u : 0u;
 	NoiseParameters->CurlNoiseStrength = CurlNoiseStrength;
 	NoiseParameters->CurlNoiseFrequency = CurlNoiseFrequency;
 	NoiseParameters->NoiseIterations = SafeNoiseIterations;
@@ -2084,6 +2125,7 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 	BuildAxesParameters->TargetBucketCount = TargetBuckets.BucketCount;
 	BuildAxesParameters->TargetBucketHashSlotCount = TargetBuckets.HashSlotCount;
 	BuildAxesParameters->TargetBucketSearchRadius = TargetBuckets.SearchRadius;
+	BuildAxesParameters->VineSurfaceAdsorption = bSurfaceAdsorption ? 1u : 0u;
 	BuildAxesParameters->VineDispatchArgs = DispatchArgsBuffer;
 
 	FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VVVoxel.BuildAxes"), BuildAxesShader, BuildAxesParameters,
@@ -2130,22 +2172,31 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 	FinalProjectParameters->TargetBucketCount = TargetBuckets.BucketCount;
 	FinalProjectParameters->TargetBucketHashSlotCount = TargetBuckets.HashSlotCount;
 	FinalProjectParameters->TargetBucketSearchRadius = TargetBuckets.SearchRadius;
+	FinalProjectParameters->VineSurfaceAdsorption = bSurfaceAdsorption ? 1u : 0u;
 	FinalProjectParameters->VinesOffset = VinesOffset;
 	FinalProjectParameters->VineDispatchArgs = DispatchArgsBuffer;
 
-	FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VVVoxel.FinalProject"), FinalProjectShader, FinalProjectParameters,
-		DispatchArgsBuffer, VineArgOffset(VineArgSlot_Points));
+	// 关掉吸附时**不录这一趟**：它是唯一把中心线拉向表面的力，而墙面藤的线已经在该在的地方。
+	// 参数结构照样 Alloc（几乎无成本），省得把 SRV 绑定也分成两条路。
+	if (bSurfaceAdsorption)
+	{
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VVVoxel.FinalProject"), FinalProjectShader, FinalProjectParameters,
+			DispatchArgsBuffer, VineArgOffset(VineArgSlot_Points));
+	}
 
 	// ===== Pass RS: Surface resample (moved BEFORE smoothing) =====
 	// FinalProject wrote into the B buffers. Redistribute each vine's surface points to
 	// uniform arc-length spacing first (B -> A), so the path smoothing ping-pong below
 	// refines evenly-spaced points. Endpoints stay anchored. Read/Write pointers track the
 	// latest buffer; each pass swaps them so downstream always reads the freshest result.
-	CSHelper::FRDGStructuredBufferRefs* ReadSurfaceTarget = &PathPointSurfaceTargetB;
-	CSHelper::FRDGStructuredBufferRefs* ReadSurfaceNormal = &PathPointSurfaceNormalB;
-	CSHelper::FRDGStructuredBufferRefs* WriteSurfaceTarget = &PathPointSurfaceTargetA;
-	CSHelper::FRDGStructuredBufferRefs* WriteSurfaceNormal = &PathPointSurfaceNormalA;
-	if (bResampleSurface)
+	// 起点跟着 FinalProject 走：录了它，最新结果在 B；没录，最新结果还在 A（BuildAxes 与
+	// PerlinNoise 都写 A）。照抄 &B 的后果是下游读一块**从没被写过**的 buffer —— 管子会整条
+	// 飞到随机位置，而没有任何断言会响。
+	CSHelper::FRDGStructuredBufferRefs* ReadSurfaceTarget = bSurfaceAdsorption ? &PathPointSurfaceTargetB : &PathPointSurfaceTargetA;
+	CSHelper::FRDGStructuredBufferRefs* ReadSurfaceNormal = bSurfaceAdsorption ? &PathPointSurfaceNormalB : &PathPointSurfaceNormalA;
+	CSHelper::FRDGStructuredBufferRefs* WriteSurfaceTarget = bSurfaceAdsorption ? &PathPointSurfaceTargetA : &PathPointSurfaceTargetB;
+	CSHelper::FRDGStructuredBufferRefs* WriteSurfaceNormal = bSurfaceAdsorption ? &PathPointSurfaceNormalA : &PathPointSurfaceNormalB;
+	if (bSurfaceAdsorption && bResampleSurface)
 	{
 		TShaderMapRef<FVVVoxelResampleSurfaceCS> ResampleSurfaceShader(GetGlobalShaderMap(FeatureLevel));
 		FVVVoxelResampleSurfaceCS::FParameters* ResampleParams = GraphBuilder.AllocParameters<FVVVoxelResampleSurfaceCS::FParameters>();
@@ -2171,7 +2222,9 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 	// final cleanup using only the immediate neighbors. Pure geometric position smoothing;
 	// normals are passed through and rebuilt later by BuildParallelTransportFrame.
 	TShaderMapRef<FVVVoxelSmoothPathCS> SmoothPathShader(GetGlobalShaderMap(FeatureLevel));
-	const int32 SafeTotalSmoothIterations = SafePostProjectionSmoothIterations + SafePostProjectionSmallSmoothIterations;
+	// 平滑存在的理由就是**投影会制造折角**。不投影就没有折角可平，全跳。
+	const int32 SafeTotalSmoothIterations = bSurfaceAdsorption
+		? SafePostProjectionSmoothIterations + SafePostProjectionSmallSmoothIterations : 0;
 	for (int32 SmoothIterationIndex = 0; SmoothIterationIndex < SafeTotalSmoothIterations; ++SmoothIterationIndex)
 	{
 		// Wide passes first, then the small radius-1 cleanup passes.
@@ -2249,7 +2302,9 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 		Parameters->RWTexCoords = Out.TexCoordUAV;
 		Parameters->RWColors = Out.ColorUAV;
 		Parameters->RWBaseIndices = Out.IndexUAV;
-		Parameters->VineWorldToLocal = Out.VineWorldToLocal;
+		Parameters->PathPointGrowth = PathPointGrowthBuffer.SRV;
+	Parameters->VineTexCoordSets = FMath::Max(NumTexCoordSets, 1u);
+	Parameters->VineWorldToLocal = Out.VineWorldToLocal;
 		Parameters->RW_OutVertices = nullptr;
 		Parameters->RW_OutUVs = nullptr;
 		Parameters->RW_OutIndices = nullptr;
@@ -2284,6 +2339,7 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 	Parameters->TargetBucketCount = TargetBuckets.BucketCount;
 	Parameters->TargetBucketHashSlotCount = TargetBuckets.HashSlotCount;
 	Parameters->TargetBucketSearchRadius = TargetBuckets.SearchRadius;
+	Parameters->VineSurfaceAdsorption = bSurfaceAdsorption ? 1u : 0u;
 	Parameters->VinesOffset = VinesOffset;
 	Parameters->TinyZJitterStrength = TinyZJitterStrength;
 	Parameters->VineDispatchArgs = DispatchArgsBuffer;
@@ -2407,6 +2463,7 @@ static void AddVineMeshPasses(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type 
 				FVineUVWriteCS::FParameters* VP = GraphBuilder.AllocParameters<FVineUVWriteCS::FParameters>();
 				VP->VineUV_CurveV = VineUVCurveV.SRV;
 				VP->RW_VineUV_TexCoords = Out.TexCoordUAV;
+				VP->VineTexCoordSets = FMath::Max(NumTexCoordSets, 1u);
 				VP->VineUV_OutputVertexCount = OutputVertexCount;
 				VP->VineUV_ProfileCount = ProfileCount;
 				VP->VineUV_PointCount = VineUVPointCount;
@@ -2449,6 +2506,9 @@ static FVineBuildInput VineLeaf_BuildVineBuildInput(
 	float PerlinNoiseFrequency,
 	int32 NoiseIterations,
 	const FCSSurfaceVoxelData& VoxelData,
+	// 表面吸附总开关（见 `FVV::bSurfaceAdsorption`）。为假时**整条体素链不参与**：
+	// 下面的哑缓冲只为让 SRV 绑得上，采样由 shader 的 `VineSurfaceAdsorption` uniform 短路。
+	bool bSurfaceAdsorption,
 	const FVineFusedSCInputs* GPULines,
 	const FCSSurfaceVoxelGPUBuffers* GPUVoxels,
 	// 融合体素输入。非空且有效时优先于 GPUVoxels：体素改在叶子自己的图里现算，
@@ -2466,6 +2526,7 @@ static FVineBuildInput VineLeaf_BuildVineBuildInput(
 	B.PathPointMeta = PathPointMeta;
 	B.SegmentMeta = SegmentMeta;
 
+	B.bSurfaceAdsorption = bSurfaceAdsorption;
 	B.bTube = bTube;
 	B.CircleScale = CircleScale;
 	B.LineScale = LineScale;
@@ -2520,6 +2581,57 @@ static FVineBuildInput VineLeaf_BuildVineBuildInput(
 		|| OutputIndexCount == 0)
 	{
 		return B; // bValid stays false (silent count early-out)
+	}
+
+	// ── 关掉表面吸附：整条体素链不参与 ────────────────────────────────────────────
+	// ⚠️ 不能让流程往下走到 `VoxelCount == 0` 那个早退 —— 那条路会把整次生成判成无效，
+	// 症状是「关掉吸附之后藤一根都没有」，而日志只说 "No voxel data available"。
+	//
+	// 哑缓冲是 **1 元素而不是 0**：0 元素的 structured buffer 创建不出来，下游拿到 null SRV，
+	// RDG 在绑定时才炸，且报的是离这里很远的那个 pass。内容无所谓 —— shader 侧的
+	// `VineSurfaceAdsorption` uniform 在 `FindNearestVoxelSample` 开头就 return false 了，
+	// 这些字节一个都不会被读到。
+	if (!bSurfaceAdsorption)
+	{
+		B.bUseGPUVoxels = false;
+		B.bUseFusedVoxels = false;
+		B.VoxelCount = 1u;
+		B.VoxelOrigin = FVector3f::ZeroVector;
+		B.VoxelSize = FMath::Max(VoxelData.VoxelSize > 0.0 ? float(VoxelData.VoxelSize) : 1.0f, 1.0f);
+		B.GPUVoxelCells.Init(FIntVector4(0, 0, 0, 0), 1);
+		B.GPUVoxelNormals.Init(FVector4f(0.0f, 0.0f, 1.0f, 0.0f), 1);
+		B.GPUVoxelTargetPositions.Init(FVector4f(0.0f, 0.0f, 0.0f, 0.0f), 1);
+		B.GPUVoxelHashSlots.Init(0u, 1);
+		B.GPUVoxelHashSlotCount = 1u;
+		B.TargetBucketOrigin = FVector3f::ZeroVector;
+		B.TargetBuckets = FVineTargetBucketBuffers();
+		B.TargetBuckets.Ranges.Init(FIntVector4(0, 0, 0, 0), 1);
+		B.TargetBuckets.RangeCounts.Init(0u, 1);
+		B.TargetBuckets.VoxelIndices.Init(0u, 1);
+		B.TargetBuckets.HashSlots.Init(0u, 1);
+		B.TargetBuckets.HashSlotCount = 1u;
+		B.TargetBuckets.BucketCount = 1u;
+		B.TargetBuckets.MaxBucketItemCount = 0u;
+		B.TargetBuckets.BucketSize = B.VoxelSize;
+		B.TargetBuckets.SearchRadius = 0u;
+
+		// 渲染包围盒改由**折线本身**给。原路径是从体素的 TargetBounds 撑出来的，这里没有体素；
+		// 而折线正是藤最终所在的地方，比体素还准。留出管径 + 生长动画的余量。
+		FBox PathBounds(ForceInit);
+		for (const FVector4f& P : PathPoints) PathBounds += FVector(P.X, P.Y, P.Z);
+		if (PathBounds.IsValid)
+		{
+			const double Margin = double(FMath::Max(CircleScale * 10.0f * 4.0f, 50.0f));
+			B.LocalBounds = PathBounds.ExpandBy(FVector(Margin));
+		}
+		else
+		{
+			// 折线是空的时候上面的 PathPointCount 早退就该拦住；走到这里说明输入自相矛盾，
+			// 给一个不塌陷的盒子而不是 invalid —— 让失败停在"看得见的空网格"而不是静默返回。
+			B.LocalBounds = FBox(FVector::ZeroVector, FVector(100.0));
+		}
+		B.bValid = true;
+		return B;
 	}
 
 	// 融合路径下体素还没跑，容量是 CPU 侧就知道的 MaxVoxels；旧路径下取 pooled 的容量。
@@ -2690,11 +2802,14 @@ static FVineMeshPassInputs VineLeaf_MakePassInputs(const FVineBuildInput& B)
 	FVineMeshPassInputs In;
 	// GPULine* / LineCountsBuffer are RDG refs the caller fills in after recording the producing
 	// passes into its own graph; only the CPU-side values travel through the bundle.
+	In.bSurfaceAdsorption = B.bSurfaceAdsorption;
 	In.bUseGPULines = B.bUseGPULines;
 	In.PathPoints = &B.PathPoints;
 	In.PathPointAxes = &B.PathPointAxes;
 	In.PathPointMeta = &B.PathPointMeta;
 	In.SegmentMeta = &B.SegmentMeta;
+	In.PathPointGrowth = &B.PathPointGrowth;
+	In.NumTexCoordSets = B.NumTexCoordSets;
 	In.bUseGPUVoxels = B.bUseGPUVoxels;
 	In.GPUVoxCells = B.GPUVoxCells;
 	In.GPUVoxNormals = B.GPUVoxNormals;
@@ -3491,15 +3606,21 @@ bool AVineContainer::GenerateVineGPU()
 
 	// 2. 体素：只做 CPU 侧准备（收集并解析三角形请求、地形三角形、参数），不 dispatch。
 	//    产出的 bundle 一路带到叶子的图里由 AddCSSurfaceVoxelPasses 记录。
+	PendingSurfaceVoxelInputs = FCSSurfaceVoxelPassInputs();
+	if (VV.bSurfaceAdsorption)
 	{
 		GV_ACTOR_TIME_SCOPE(TEXT("AVineContainer.GenerateVineGPU.PrepareSurfaceVoxelInputs"));
-		PendingSurfaceVoxelInputs = FCSSurfaceVoxelPassInputs();
 		if (!PrepareSurfaceVoxelPassInputs(SC.VoxelSize, SurfaceTriangleFilterDistance, PendingSurfaceVoxelInputs))
 		{
 			UE_LOG(LogTemp, Warning, TEXT("[GenerateVineGPU] 范围内没有可体素化的几何，%s 无法生成藤蔓。"), *GetActorNameOrLabel());
 			return false;
 		}
 	}
+	// 关掉吸附：这一步整个不做。**它就是这条路上的大头** —— 实测基线里
+	// `GenerateVineGPU.Total` 的 12.4–14.6 ms 有 10–12 ms 花在这里（收集场景 + 地形三角形，
+	// 规模由 `SC.VoxelSize` 与包围盒决定、与 target 数无关）。
+	// ⚠️ 上面那句无条件的重置不能省：`PendingSurfaceVoxelInputs` 是成员，留着上一次的内容会让
+	// `VineLeaf_BuildVineBuildInput` 误判成"有融合体素"，于是关了开关却仍走吸附路径。
 	// Cache generation bounds for subsequent GPU visualization.
 	InstanceBound = Bounds;
 
@@ -3651,6 +3772,7 @@ bool AVineContainer::GenerateVineGPU()
 			VV.PerlinNoiseFre,
 			VV.VisVineGPUNoiseIterations,
 			EmptySurfaceVoxelData,
+			VV.bSurfaceAdsorption,
 			&FusedSCInputs,
 			LastSurfaceVoxelGPUBuffers.IsValid() ? &LastSurfaceVoxelGPUBuffers : nullptr,
 			// GenerateVineGPU 备好的融合体素输入。有效时体素在构建那张图里现算，
@@ -4641,4 +4763,101 @@ bool AVineContainer::PrepareVineFusedSCInputs(const TArray<FTransform>& SourceTr
 	OutInputs.TotalPointCapacity = PerSourceCapacity * uint32(SourceCount);
 	OutInputs.TotalSegmentCapacity = OutInputs.TotalPointCapacity;
 	return true;
+}
+
+
+// -----------------------------------------------------------------------------
+// CSVineTube：折线 → 管子的对外入口（TinyGladeHouse D13，2026-09-06 裁决 1/2）
+//
+// 放在本文件末尾而不是另起一个 .cpp：它要用的两个东西（VineLeaf_BuildVineBuildInput 与
+// BuildVineGeometryIntoMeshAsync）都是本文件的 file-static，把它们改成外部可见只为开这一个口子
+// 不划算 —— 那会让"谁能录藤蔓 pass"这件事从一处变成到处。
+// -----------------------------------------------------------------------------
+
+namespace CSVineTube
+{
+bool BuildTubeIntoMesh(
+	UCSMesh* Target,
+	const TArray<FVector4f>& PathPoints,
+	const TArray<FVector4f>& PathPointAxes,
+	const TArray<FIntVector4>& PathPointMeta,
+	const TArray<FIntVector4>& SegmentMeta,
+	const TArray<FVector2f>& PathPointGrowth,
+	const FParams& Params,
+	TFunction<void(bool)> OnBuilt)
+{
+	if (!Target || PathPoints.IsEmpty() || SegmentMeta.IsEmpty()) return false;
+
+	// 四条缓冲必须等长/自洽。这里挡一道是因为下游**不会**再查：Pass C 直接拿 Meta 当下标用，
+	// 长度对不齐时读的是别人的数据，画面上是一条飞线，而没有任何断言会响。
+	if (PathPointAxes.Num() != PathPoints.Num() || PathPointMeta.Num() != PathPoints.Num())
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[CSVineTube] 折线缓冲长度不一致（Points=%d Axes=%d Meta=%d），拒绝构建。"),
+			PathPoints.Num(), PathPointAxes.Num(), PathPointMeta.Num());
+		return false;
+	}
+
+	// 体素那一套整条不参与：`bSurfaceAdsorption = false` 会让 VineLeaf_BuildVineBuildInput 走
+	// 专用出口（1 元素哑缓冲 + 折线自算包围盒），采样由 shader 的 VineSurfaceAdsorption 短路。
+	const FCSSurfaceVoxelData EmptyVoxelData;
+	FVineBuildInput Input = VineLeaf_BuildVineBuildInput(
+		PathPoints,
+		PathPointAxes,
+		PathPointMeta,
+		SegmentMeta,
+		/*bTube*/ true,
+		FMath::Max(Params.ProfileCount, 3u),
+		Params.CircleScale,
+		/*LineScale*/ 1.0f,               // 只在 bTube = false 的卡片路径上用得到
+		Params.UVLengthScale,
+		/*VinesOffset*/ 0.0f,             // 吸附关掉 ⇒ 无效；离墙量已经烘在折线里（StandOff）
+		/*TinyZJitterStrength*/ 0.0f,     // 防共面闪烁用的，管子不与墙共面，不需要
+		/*PostProjectionSmoothIterations*/ 0,
+		/*PostProjectionSmoothKernelRadius*/ 1,
+		/*PostProjectionSmallSmoothIterations*/ 0,
+		/*PostProjectionSmoothAngleStrength*/ 0.0f,
+		/*bResampleSurface*/ false,
+		/*ResampleTargetDistance*/ 1.0f,
+		/*CurlNoiseStrength*/ 0.0f,       // ⚠️ 强度给 0，但**不能**指望跳过 Pass N —— 见下
+		/*CurlNoiseFrequency*/ 1.0f,
+		/*PerlinNoiseStrength*/ 0.0f,
+		/*PerlinNoiseFrequency*/ 1.0f,
+		/*NoiseIterations*/ 0,
+		EmptyVoxelData,
+		/*bSurfaceAdsorption*/ false,
+		/*GPULines*/ nullptr,             // ⇒ 走 CPU 折线通路，空间殖民整条不跑
+		/*GPUVoxels*/ nullptr,
+		/*FusedVoxels*/ nullptr);
+
+	// ⚠️ **噪声那两趟是承重的，不是可选装饰**：Pass N（ApplyVVNoiseCS）无条件写
+	// `RW_PathPointsNoised`，而下游一律读那条 buffer 而不是原始 PathPoints。把它当成
+	// "强度为 0 就可以跳过"的后果是下游读一块从没被写过的 buffer。强度给 0 时它是直通。
+
+	if (!Input.bValid)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[CSVineTube] 构建输入无效，未生成管子。"));
+		return false;
+	}
+
+	// 生长动画：有通道就升到 3 组 UV（set1 = (SpawnTime, 弧长)、set2 = (环半径, 0)）。
+	// ⚠️ **UV 组数是流的宽度**，必须在 EnsureCapacitySync 之前定下来（`SetStreamLayoutSync`
+	// 是整套重建）。放在之后的症状是这一帧按旧宽度分配、按新宽度写 —— 越界。
+	// `BuildVineGeometryIntoMeshAsync` 里那次 EnsureCapacitySync 就是那道线。
+	const bool bGrowth = PathPointGrowth.Num() == PathPoints.Num();
+	if (!bGrowth && !PathPointGrowth.IsEmpty())
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[CSVineTube] 生长通道长度与折线不符（%d vs %d），本次不做生长动画。"),
+			PathPointGrowth.Num(), PathPoints.Num());
+	}
+	Input.NumTexCoordSets = bGrowth ? 3u : 1u;
+	if (bGrowth) Input.PathPointGrowth = PathPointGrowth;
+	if (!UCSMeshOps::EnsureTexCoordSets(Target, int32(Input.NumTexCoordSets))) return false;
+
+	// 几何在世界空间，宿主组件钉在恒等世界变换上（见头文件的警告）。两者必须一起动。
+	Input.VineWorldToLocal = FMatrix44f::Identity;
+
+	return BuildVineGeometryIntoMeshAsync(Target, MoveTemp(Input), MoveTemp(OnBuilt));
+}
 }

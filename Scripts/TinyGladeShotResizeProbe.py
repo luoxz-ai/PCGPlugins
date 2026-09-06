@@ -96,10 +96,10 @@ def note(name):
         if why:
             reasons.append("%s:%s" % (label, why))
     loc = h.get_actor_location()
-    unreal.log("PROBE %-12s size=(%.1f,%.1f) axis=%s loc=(%.2f,%.2f,%.2f) "
+    unreal.log("PROBE %-12s size=(%.1f,%.1f) loc=(%.2f,%.2f,%.2f) "
                "bounds_o=(%.1f,%.1f,%.1f) bounds_e=(%.1f,%.1f,%.1f) "
                "doors=%d openings=%d bricks=%d vines=%d leaves=%d decor=%d pillars=%d%s"
-               % (name, size.x, size.y, h.get_editor_property("RidgeAxis"),
+               % (name, size.x, size.y,
                   loc.x, loc.y, loc.z,
                   origin.x, origin.y, origin.z, extent.x, extent.y, extent.z,
                   h.get_open_door_count(), h.get_opening_count(), h.get_frame_brick_count(),
@@ -113,10 +113,8 @@ def reset_house():
     h.set_editor_property("bFrameEnabled", True)
     h.set_editor_property("bVineEnabled", True)
     h.set_editor_property("bDecorEnabled", True)
-    h.set_editor_property("FootprintBandFraction", 0.20)
     h.set_actor_location(unreal.Vector(home.x, home.y, h.get_actor_location().z), False, False)
     h.set_editor_property("FootprintSize", START)
-    h.set_editor_property("RidgeAxis", unreal.CSRidgeAxis.X)
     h.call_method("RebuildHouse")
 
 
