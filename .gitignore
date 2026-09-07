@@ -14,3 +14,28 @@ __pycache__/
 
 # 同上：从 Tiny Glade 提取的原始几何（岩壳 / 树叶卡片，约 105 MB），仅供本地对照
 Docs/TinyGlade/geo/
+
+# 大型测试 mesh（>=1 MB，2026-09-07 从库里删除；只是本地试验件，不随仓库分发）
+Content/MeshBoolean/SM_SM_MERGED_StaticMeshActor_10.uasset
+Content/MeshBoolean/SM_MERGED_StaticMeshActor_6.uasset
+Content/MeshBoolean/result/SM_BP_Boolean_C_0_20260803_173543.uasset
+Content/MeshBoolean/result/SM_BP_Boolean_C_0_2607201031.uasset
+Content/MeshBoolean/SM_ruins_001_brick_002_Var05_S.uasset
+Content/TreeWindData/SM_TestLeaf.uasset
+Content/TreeWindData/SM_TestLeaf_Test2.uasset
+Content/TreeWindData/SM_TestLeaf_Test3.uasset
+Content/TreeWindData/SM_TestLeaf_Test4.uasset
+Content/TreeWindData/SM_TestTree_6.uasset
+Content/TreeWindData/SM_TestNoLeaf.uasset
+Content/TreeWindData/SM_SM_Cypress_Var_001.uasset
+Content/TreeWindData/SM_Tree_Test_2.uasset
+Content/TreeWindData/TestTree.uasset
+Content/TreeWindData/Tree_Test_w.uasset
+Content/TreeWindData/Tree_Test_w2.uasset
+Content/TreeWindData/Tree_Test4/Tree_Test_4.uasset
+Content/TreeWindData/Tree_Test4/purtree.uasset
+Content/TreeWindData/Tree4/Tree_Test_8.uasset
+Content/TreeWindData/Tree3/Tree_03.uasset
+Content/TreeWindData/Tree_Test5/Tree_Test_5.uasset
+Content/TreeWindData/Tree_Test_2/Tree_Test_2.uasset
+Content/TreeWindData/Tree_Test3/Tree_Test_3.uasset
